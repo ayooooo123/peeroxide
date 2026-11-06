@@ -1126,6 +1126,13 @@ impl SwarmActor {
             remote_payload.firewall,
             is_forwarded,
         );
+        tracing::debug!(
+            ?path,
+            server_firewall = firewall_state,
+            client_firewall = remote_payload.firewall,
+            forwarded = is_forwarded,
+            "server handshake: path selected"
+        );
 
         // Try to stage the passive Holepuncher up front so the reply we
         // send in this handshake can advertise the puncher's bound port

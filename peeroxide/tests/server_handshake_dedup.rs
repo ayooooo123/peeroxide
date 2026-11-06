@@ -47,6 +47,9 @@ fn local_dht(bootstrap: Vec<String>, firewalled: bool) -> HyperDhtConfig {
     dht.port = 0;
     dht.host = "127.0.0.1".to_string();
     dht.firewalled = firewalled;
+    // On loopback every socket is reachable; a "firewalled" test node must
+    // not discover that at bootstrap and switch to the direct path.
+    dht.quick_firewall = false;
     if !firewalled {
         // A reachable node joins the routing table at once, as the Node
         // testnet nodes (`ephemeral: false`) do.

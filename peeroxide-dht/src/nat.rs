@@ -107,6 +107,26 @@ impl Nat {
         self.firewall == FIREWALL_CONSISTENT || self.firewall == FIREWALL_OPEN
     }
 
+    /// The most-reported `(host, port)` across all samples, like dht-rpc's
+    /// `NatSampler.host/port`; `None` before the first sample.
+    pub fn consensus(&self) -> Option<Ipv4Peer> {
+        self.samples_full.first().map(|s| Ipv4Peer {
+            host: s.host.clone(),
+            port: s.port,
+        })
+    }
+
+    /// Our address as other nodes see it: the sample consensus when the
+    /// server port is reachable (`FIREWALL_OPEN`), else the first settled
+    /// NAT address. Mirrors dht-rpc `remoteAddress()`.
+    pub fn public_address(&self) -> Option<Ipv4Peer> {
+        if self.firewall == FIREWALL_OPEN {
+            self.consensus()
+        } else {
+            self.addresses.as_ref().and_then(|a| a.first().cloned())
+        }
+    }
+
     pub fn analyzing(&self) -> impl std::future::Future<Output = ()> + 'static {
         let notify = Arc::clone(&self.analyzing_notify);
         let settled = Arc::clone(&self.analyzing_settled);

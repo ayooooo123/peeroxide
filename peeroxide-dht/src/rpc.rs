@@ -11,7 +11,7 @@ use tokio::time::{interval, Instant};
 
 use libudx::{UdxRuntime, UdxSocket};
 
-use crate::io::{Io, IoConfig, IoEvent, ReplyContext, RequestParams, TimeoutEvent};
+use crate::io::{Io, IoConfig, IoEvent, ReplyContext, RequestParams, SocketKind, TimeoutEvent};
 use crate::messages::{Command, Ipv4Peer};
 use crate::nat::Nat;
 use crate::peer::{peer_id, NodeId};
@@ -29,6 +29,9 @@ const RECENT_NODE: u64 = 12;
 const OLD_NODE: u64 = 360;
 const MAX_REPINGING: u32 = 3;
 const DOWN_HINTS_RATE_LIMIT: u32 = 50;
+/// Timeout of the single bootstrap-time PING_NAT; a NAT'd node waits at most
+/// this long (minus the bootstrap query's own duration) before `bootstrapped()`.
+const QUICK_NAT_PROBE_TIMEOUT_MS: u64 = 500;
 
 const CMD_PING: u64 = Command::Ping as u64;
 const CMD_PING_NAT: u64 = Command::PingNat as u64;
@@ -84,6 +87,10 @@ pub struct DhtConfig {
     pub ephemeral: Option<bool>,
     /// Whether to advertise as firewalled.
     pub firewalled: bool,
+    /// Probe at bootstrap whether the server socket is reachable and, if so,
+    /// run unfirewalled (dht-rpc `quickFirewall`). `false` keeps a
+    /// `firewalled` node firewalled even when it is reachable.
+    pub quick_firewall: bool,
     /// Query concurrency limit.
     pub concurrency: usize,
     /// Maximum query window size.
@@ -98,6 +105,7 @@ impl Default for DhtConfig {
             host: "0.0.0.0".to_string(),
             ephemeral: None,
             firewalled: true,
+            quick_firewall: true,
             concurrency: 10,
             max_window: 80,
         }
@@ -319,6 +327,35 @@ enum StandaloneRequest {
         node_id: NodeId,
         last_seen_tick: u64,
     },
+    /// PING_NAT asking the peer to answer on our server socket (dht-rpc
+    /// `_checkIfFirewalled`). `quick` is the single probe sent during the
+    /// bootstrap query that decides whether the full check runs at all.
+    NatProbe {
+        quick: bool,
+    },
+}
+
+/// dht-rpc `_bootstrap`'s `first`/`testNat`: one PING_NAT to the first node
+/// that answers the bootstrap query. Only a pong on the server socket earns
+/// the full five-probe check, so a NAT'd node pays nothing beyond this one
+/// short-lived request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuickProbe {
+    NotSent,
+    Sent,
+    Hit,
+    Miss,
+}
+
+/// The full firewall self-check: up to 5 PING_NATs whose pongs must land on
+/// the server socket and agree with the client socket's reflexive host.
+struct FirewallCheck {
+    /// `(to, from)` of pongs that arrived on the server socket.
+    hits: Vec<(Ipv4Peer, Ipv4Peer)>,
+    outstanding: usize,
+    need: usize,
+    /// Reflexive host of the client socket before the check started.
+    client_host: String,
 }
 
 struct DeferredReply {
@@ -683,6 +720,8 @@ struct DhtNode {
     needs_id_update: bool,
     addr_samples: Vec<Ipv4Peer>,
     nat: Nat,
+    quick_probe: QuickProbe,
+    firewall_check: Option<FirewallCheck>,
 }
 
 impl DhtNode {
@@ -800,14 +839,34 @@ impl DhtNode {
                 rtt,
                 request: _request,
                 to,
+                socket,
             } => {
                 self.add_node_from_network(from.clone(), id);
 
-                if to.port != 0 && !to.host.is_empty() {
+                // Only responses on the socket our requests leave from tell
+                // us how that socket is seen (dht-rpc `!external`); a pong
+                // on the server socket says nothing about the client socket.
+                let expected_socket = (socket == SocketKind::Client) == self.io.firewalled();
+                if to.port != 0 && !to.host.is_empty() && expected_socket {
                     if self.needs_id_update {
                         self.addr_samples.push(to.clone());
                     }
                     self.nat.add(&to, &from);
+                }
+
+                // dht-rpc `_bootstrap` `ondata`: ask the first node that
+                // answers the bootstrap query to ping our server socket.
+                let for_bootstrap = self
+                    .bootstrap_query_id
+                    .is_some_and(|b| self.tid_to_query.get(&tid).is_some_and(|(q, _)| *q == b));
+                if for_bootstrap
+                    && self.quick_probe == QuickProbe::NotSent
+                    && self.config.quick_firewall
+                    && self.io.firewalled()
+                    && self.io.ephemeral
+                    && self.send_nat_probe(&from, true)
+                {
+                    self.quick_probe = QuickProbe::Sent;
                 }
 
                 let data = IoResponseData {
@@ -858,7 +917,7 @@ impl DhtNode {
                         error,
                         value,
                         rtt,
-                    }, to);
+                    }, to, socket);
                 }
             }
         }
@@ -874,13 +933,16 @@ impl DhtNode {
                     self.handle_delayed_ping(req);
                 }
                 CMD_PING_NAT => {
-                    if let Some(ref val) = req.value {
-                        if val.len() >= 2 {
-                            let port = u16::from_le_bytes([val[0], val[1]]);
-                            if port != 0 {
-                                self.io.send_reply(&req, 0, None);
-                            }
-                        }
+                    // dht-rpc answers on the port the requester names so a
+                    // firewalled node can learn whether its server socket
+                    // is reachable.
+                    let port = match &req.value {
+                        Some(val) if val.len() >= 2 => u16::from_le_bytes([val[0], val[1]]),
+                        _ => 0,
+                    };
+                    if port != 0 {
+                        let to = Ipv4Peer { host: req.from.host.clone(), port };
+                        self.io.send_reply_deferred(&to, req.reply_ctx, req.tid, req.target, 0, None);
                     }
                 }
                 CMD_FIND_NODE => {
@@ -1057,6 +1119,7 @@ impl DhtNode {
         standalone: StandaloneRequest,
         resp: ResponseData,
         reflexive_addr: Ipv4Peer,
+        socket: SocketKind,
     ) {
         match standalone {
             StandaloneRequest::Ping(reply_tx) => {
@@ -1110,6 +1173,10 @@ impl DhtNode {
                         table.remove(&node_id);
                     }
                 }
+            }
+            StandaloneRequest::NatProbe { quick } => {
+                let hit = (socket == SocketKind::Server).then_some((reflexive_addr, resp.from));
+                self.on_nat_probe(quick, hit);
             }
         }
     }
@@ -1172,7 +1239,131 @@ impl DhtNode {
                     table.remove(&node_id);
                 }
             }
+            StandaloneRequest::NatProbe { quick } => self.on_nat_probe(quick, None),
         }
+    }
+
+    // ── Firewall self-check (dht-rpc `_updateNetworkState` / `_checkIfFirewalled`) ──
+
+    /// PING_NAT `to`, asking it to answer on our server socket. The quick
+    /// probe gets a short timeout: `bootstrapped()` may be waiting on it.
+    fn send_nat_probe(&mut self, to: &Ipv4Peer, quick: bool) -> bool {
+        let params = RequestParams {
+            to: to.clone(),
+            token: None,
+            internal: true,
+            command: CMD_PING_NAT,
+            target: None,
+            value: Some(self.local_port.to_le_bytes().to_vec()),
+            timeout_ms: quick.then_some(QUICK_NAT_PROBE_TIMEOUT_MS),
+            retries: Some(0),
+        };
+        match self.io.create_request(params) {
+            Some(tid) => {
+                self.standalone_tids.insert(tid, StandaloneRequest::NatProbe { quick });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Probe up to 5 known nodes (bootstrap nodes fill in when fewer are
+    /// known). Returns false when there is nobody to ask.
+    fn start_firewall_check(&mut self, client_host: String) -> bool {
+        let mut targets: Vec<Ipv4Peer> = match self.table.lock() {
+            Ok(table) => table
+                .closest(table.id(), 5)
+                .into_iter()
+                .map(|n| Ipv4Peer { host: n.host.clone(), port: n.port })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for (host, port) in self.config.bootstrap.iter().filter_map(|s| parse_bootstrap_str(s)) {
+            if targets.len() >= 5 {
+                break;
+            }
+            if !targets.iter().any(|t| t.host == host && t.port == port) {
+                targets.push(Ipv4Peer { host, port });
+            }
+        }
+        let need = if targets.len() >= 5 { 3 } else { 1 };
+        let outstanding = targets.iter().filter(|t| self.send_nat_probe(t, false)).count();
+        if outstanding == 0 {
+            return false;
+        }
+        self.firewall_check = Some(FirewallCheck {
+            hits: Vec::new(),
+            outstanding,
+            need,
+            client_host,
+        });
+        true
+    }
+
+    /// A probe settled: `hit` is `(to, from)` when its pong landed on the
+    /// server socket. The quick probe only records its outcome (and resumes
+    /// a bootstrap that was waiting for it). The full check decides
+    /// reachability once enough pongs are in or all probes are done, then
+    /// finishes bootstrapping.
+    fn on_nat_probe(&mut self, quick: bool, hit: Option<(Ipv4Peer, Ipv4Peer)>) {
+        if quick {
+            self.quick_probe = if hit.is_some() { QuickProbe::Hit } else { QuickProbe::Miss };
+            if self.bootstrap_query_id.is_none() && !self.bootstrapped {
+                self.finish_bootstrap();
+            }
+            return;
+        }
+        let Some(check) = &mut self.firewall_check else {
+            return;
+        };
+        check.outstanding -= 1;
+        check.hits.extend(hit);
+        if check.hits.len() < check.need && check.outstanding > 0 {
+            return;
+        }
+        let check = self.firewall_check.take().expect("checked above");
+        let open = check.hits.len() >= check.need
+            && check
+                .hits
+                .iter()
+                .all(|(to, _)| to.host == check.client_host && to.port == self.local_port);
+        if open {
+            self.io.set_firewalled(false);
+            let mut nat = Nat::new(false);
+            for (to, from) in &check.hits {
+                nat.add(to, from);
+            }
+            self.nat = nat;
+            tracing::info!(
+                target: "peeroxide::_events::dht::reachable",
+                host = %check.client_host,
+                port = self.local_port,
+                "server socket reachable: running unfirewalled"
+            );
+        }
+        self.mark_bootstrapped();
+    }
+
+    /// After the bootstrap query: if the quick probe showed our server socket
+    /// is reachable, run the full check before reporting `bootstrapped`, so
+    /// the swarm reads the right `firewalled()` and port right after. A quick
+    /// probe still in flight is waited for (at most its short timeout).
+    ///
+    /// shortcut: checked once at startup, not re-checked when the network
+    /// changes; add a periodic re-check when we support NAT rebinding.
+    fn finish_bootstrap(&mut self) {
+        match self.quick_probe {
+            QuickProbe::Sent => return,
+            QuickProbe::Hit => {
+                if let Some(consensus) = self.nat.consensus() {
+                    if self.start_firewall_check(consensus.host) {
+                        return;
+                    }
+                }
+            }
+            QuickProbe::NotSent | QuickProbe::Miss => {}
+        }
+        self.mark_bootstrapped();
     }
 
     fn handle_tick(&mut self) {
@@ -1444,11 +1635,7 @@ impl DhtNode {
             }
 
             DhtCommand::RemoteAddress { reply_tx } => {
-                let addr = self
-                    .nat
-                    .addresses
-                    .as_ref()
-                    .and_then(|addrs| addrs.first().cloned());
+                let addr = self.nat.public_address();
                 let firewall = self.nat.firewall;
                 let _ = reply_tx.send((addr, firewall));
             }
@@ -1708,7 +1895,7 @@ impl DhtNode {
     fn on_query_removed(&mut self, query_id: u64) {
         if self.bootstrap_query_id == Some(query_id) {
             self.bootstrap_query_id = None;
-            self.mark_bootstrapped();
+            self.finish_bootstrap();
         }
     }
 
@@ -1841,6 +2028,8 @@ pub async fn spawn(
         needs_id_update,
         addr_samples: Vec::new(),
         nat: Nat::new(firewalled),
+        quick_probe: QuickProbe::NotSent,
+        firewall_check: None,
     };
 
     let wire = node.io.wire_counters();

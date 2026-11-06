@@ -465,6 +465,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> crate::protomux::Framed
 // ── Framing helpers ──────────────────────────────────────────────────────────
 
 /// Write a length-prefixed frame: `[3B LE uint24 length][body]`.
+///
+/// Not flushed: `write_all` has handed the frame to the transport, and a
+/// flush on `UdxAsyncStream` waits for the peer's ACK, which would make every
+/// frame a round trip. `shutdown` still waits for everything to be ACKed.
 async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     data: &[u8],
@@ -476,7 +480,6 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     let header = [len as u8, (len >> 8) as u8, (len >> 16) as u8];
     w.write_all(&header).await?;
     w.write_all(data).await?;
-    w.flush().await?;
     Ok(())
 }
 

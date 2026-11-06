@@ -309,17 +309,19 @@ async fn run_interop() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[tokio::test]
+// Multi-thread: `JsSwarm::wait_data` blocks its thread while the UDX
+// processor task must still send the frame that `write` only queued.
+#[tokio::test(flavor = "multi_thread")]
 async fn hyperswarm_node_client_holepunches_to_rust_server() {
     node_client_interop(&["--remote-client"], ExpectedPath::Holepunch).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn hyperswarm_open_node_client_connects_to_rust_server() {
     node_client_interop(&["--open-client"], ExpectedPath::ServerDials).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn hyperswarm_direct_node_client_connects_to_rust_server() {
     node_client_interop(&["--direct-client"], ExpectedPath::Direct).await;
 }
@@ -382,12 +384,15 @@ async fn run_node_client_interop(
 
     // Firewalled like a peer behind a NAT: the server either stages a passive
     // holepunch that the Node client completes through the relays, or, for an
-    // open client, dials the client itself.
+    // open client, dials the client itself. On loopback the server socket is
+    // reachable, so the bootstrap reachability check is switched off to keep
+    // the server firewalled.
     let mut dht_config = DhtConfig::default();
     dht_config.bootstrap = vec![format!("127.0.0.1:{bs_port}")];
     dht_config.port = 0;
     dht_config.host = "127.0.0.1".to_string();
     dht_config.firewalled = true;
+    dht_config.quick_firewall = false;
 
     let mut hyper_config = HyperDhtConfig::default();
     hyper_config.dht = dht_config;

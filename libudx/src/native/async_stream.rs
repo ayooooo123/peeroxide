@@ -1,27 +1,33 @@
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-use crate::error::Result as UdxResult;
-use super::header::{Header, FLAG_END};
-use super::stream::{StreamEvent, StreamInner, DEFAULT_RWND, build_data_packet};
+use super::stream::{StreamEvent, StreamInner, build_data_packets, build_end_packet};
 
 /// Adapter that implements [`tokio::io::AsyncRead`] and [`tokio::io::AsyncWrite`]
 /// over a [`super::stream::UdxStream`].
 ///
 /// Created via [`super::stream::UdxStream::into_async_stream`]. Higher layers
 /// (e.g. SecretStream) wrap this for encrypted I/O.
+///
+/// Writes are pipelined: `poll_write` queues data and returns as soon as it
+/// is staged, applying back-pressure once about
+/// [`SEND_BUFFER_MAX`](super::stream::SEND_BUFFER_MAX) bytes are queued or in
+/// flight (the bound is checked against payload, so it can be exceeded by
+/// the packet headers and MTU-probe padding of one write). `poll_flush`
+/// resolves when the peer has ACKed everything; `poll_shutdown` queues the
+/// FIN behind the data and resolves when it is ACKed. Dropping the stream
+/// without `shutdown` abandons data the peer has not ACKed yet.
 pub struct UdxAsyncStream {
     inner: Arc<Mutex<StreamInner>>,
     read_rx: mpsc::UnboundedReceiver<StreamEvent>,
     read_buf: Vec<u8>,
     read_pos: usize,
     read_eof: bool,
-    pending_ack: Option<oneshot::Receiver<UdxResult<()>>>,
     processor: Option<tokio::task::JoinHandle<()>>,
     fin_queued: bool,
 }
@@ -38,11 +44,27 @@ impl UdxAsyncStream {
             read_buf: Vec::new(),
             read_pos: 0,
             read_eof: false,
-            pending_ack: None,
             processor,
             fin_queued: false,
         }
     }
+
+    fn lock(&self) -> MutexGuard<'_, StreamInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Ready once everything queued has been ACKed; an error once the stream died
+/// with data still outstanding.
+fn poll_all_acked(inner: &mut StreamInner, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    if inner.all_acked() {
+        return Poll::Ready(Ok(()));
+    }
+    if !inner.is_alive() {
+        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "UDX stream closed")));
+    }
+    inner.set_flush_waker(cx.waker());
+    Poll::Pending
 }
 
 impl AsyncRead for UdxAsyncStream {
@@ -88,187 +110,75 @@ impl AsyncRead for UdxAsyncStream {
 
 impl AsyncWrite for UdxAsyncStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if let Some(ref mut ack_rx) = self.pending_ack {
-            match Pin::new(ack_rx).poll(cx) {
-                Poll::Ready(Ok(result)) => {
-                    self.pending_ack = None;
-                    if let Err(e) = result {
-                        return Poll::Ready(Err(io::Error::other(e.to_string())));
-                    }
-                }
-                Poll::Ready(Err(_)) => {
-                    self.pending_ack = None;
+        let (prep, max_payload, len) = {
+            let mut inner = self.lock();
+            let max_payload = inner.max_payload();
+            // A partial write is only worth a whole packet: wait for room
+            // for one, then send full packets, so freed room is not spent
+            // on 20-byte tails (silly window).
+            let room = inner.send_buffer_room();
+            let len = if buf.len() <= room {
+                buf.len()
+            } else {
+                room / max_payload * max_payload
+            };
+            if len == 0 && !buf.is_empty() {
+                if !inner.is_alive() {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "UDX stream closed",
                     )));
                 }
-                Poll::Pending => return Poll::Pending,
+                inner.set_write_waker(cx.waker());
+                return Poll::Pending;
             }
-        }
-
-        let (prep, max_payload) = {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let p = inner
-                .prepare_write(buf.len())
+            let prep = inner
+                .prepare_write(len)
                 .map_err(|e| io::Error::other(e.to_string()))?;
-            let mp = inner.max_payload();
-            (p, mp)
+            (prep, max_payload, len)
         };
 
-        let data = buf.to_vec();
-        let len = data.len();
-        let remote_addr = prep.remote_addr;
-        let remote_id = prep.remote_id;
-        let first_seq = prep.first_seq;
-        let current_ack = prep.current_ack;
-
-        let chunks: Vec<Vec<u8>> = if data.is_empty() {
-            vec![vec![]]
-        } else {
-            data.chunks(max_payload).map(|c| c.to_vec()).collect()
-        };
-
-        let mut wire_packets: Vec<Vec<u8>> = Vec::with_capacity(chunks.len());
-        for (i, chunk) in chunks.iter().enumerate() {
-            let seq = first_seq + i as u32;
-            wire_packets.push(build_data_packet(remote_id, seq, current_ack, chunk));
-        }
-
-        {
-            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.send_idle() {
-                guard.congestion.on_transmit_start(std::time::Instant::now());
-            }
-
-            let packets: Vec<(u32, Vec<u8>)> = wire_packets
-                .into_iter()
-                .enumerate()
-                .map(|(i, pkt)| (first_seq + i as u32, pkt))
-                .collect();
-
-            guard.queue_for_send(packets, remote_addr);
-        }
-
-        self.pending_ack = Some(prep.ack_rx);
-
-        if let Some(ref mut ack) = self.pending_ack {
-            match Pin::new(ack).poll(cx) {
-                Poll::Ready(Ok(result)) => {
-                    self.pending_ack = None;
-                    if let Err(e) = result {
-                        return Poll::Ready(Err(io::Error::other(e.to_string())));
-                    }
-                    Poll::Ready(Ok(len))
-                }
-                Poll::Ready(Err(_)) => {
-                    self.pending_ack = None;
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "UDX stream closed",
-                    )))
-                }
-                Poll::Pending => Poll::Ready(Ok(len)),
-            }
-        } else {
-            Poll::Ready(Ok(len))
-        }
+        let packets = build_data_packets(&prep, &buf[..len], max_payload);
+        self.lock().queue_write(packets, prep.remote_addr);
+        Poll::Ready(Ok(len))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(ref mut ack_rx) = self.pending_ack {
-            match Pin::new(ack_rx).poll(cx) {
-                Poll::Ready(Ok(result)) => {
-                    self.pending_ack = None;
-                    if let Err(e) = result {
-                        return Poll::Ready(Err(io::Error::other(e.to_string())));
-                    }
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Err(_)) => {
-                    self.pending_ack = None;
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "UDX stream closed",
-                    )))
-                }
-                Poll::Pending => Poll::Pending,
-            }
-        } else {
-            Poll::Ready(Ok(()))
-        }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        poll_all_acked(&mut self.lock(), cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(ref mut ack_rx) = self.pending_ack {
-            match Pin::new(ack_rx).poll(cx) {
-                Poll::Ready(Ok(result)) => {
-                    self.pending_ack = None;
-                    if let Err(e) = result {
-                        return Poll::Ready(Err(io::Error::other(e.to_string())));
-                    }
-                    if self.fin_queued {
-                        return Poll::Ready(Ok(()));
-                    }
-                    // Write ACK resolved — fall through to queue FIN
-                }
-                Poll::Ready(Err(_)) => {
-                    self.pending_ack = None;
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if !inner.connected {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let mut inner = this.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !inner.is_alive() {
             return Poll::Ready(Ok(()));
         }
-        let remote_addr = inner.remote_addr;
-        if let Some(addr) = remote_addr {
-            let remote_id = inner.remote_id;
-            let seq = inner.next_seq;
-            inner.next_seq = seq + 1;
-            let ack = inner.next_remote_seq;
-
-            let header = Header {
-                type_flags: FLAG_END,
-                data_offset: 0,
-                remote_id,
-                recv_window: DEFAULT_RWND,
-                seq,
-                ack,
+        if !this.fin_queued {
+            // Not connected (firewall hook never fired): nothing to end.
+            let Ok(prep) = inner.prepare_end() else {
+                return Poll::Ready(Ok(()));
             };
-            let packet = header.encode().to_vec();
-
-            let (ack_tx, ack_rx) = oneshot::channel();
-            inner.pending_writes.push(super::stream::PendingWrite {
-                ack_threshold: seq + 1,
-                tx: Some(ack_tx),
-            });
-
-            inner.queue_for_send(vec![(seq, packet)], addr);
-            drop(inner);
-
-            self.fin_queued = true;
-            self.pending_ack = Some(ack_rx);
-            return self.as_mut().poll_shutdown(cx);
+            inner.queue_write(vec![(prep.first_seq, build_end_packet(&prep))], prep.remote_addr);
+            this.fin_queued = true;
         }
-        Poll::Ready(Ok(()))
+        poll_all_acked(&mut inner, cx)
     }
 }
 
 impl Unpin for UdxAsyncStream {}
 
 impl Drop for UdxAsyncStream {
+    /// The processor sends what is still queued, then exits without waiting
+    /// for ACKs: up to a send buffer of unacked data is lost if the network
+    /// drops it. Call `shutdown()` first when delivery matters.
     fn drop(&mut self) {
         let _ = self.processor.take();
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref tx) = guard.notify_tx {
+        let guard = self.lock();
+        if let Some(tx) = &guard.notify_tx {
             let _ = tx.send(super::stream::StreamNotify::Shutdown);
         }
     }

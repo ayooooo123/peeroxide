@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::task::Waker;
 use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot};
@@ -54,6 +55,10 @@ const MAX_RTT_MS: u32 = 30_000;
 
 /// Far-future duration used to effectively disable a timer.
 const FAR_FUTURE: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+/// Bytes one stream may hold queued plus sent-but-unacked before
+/// `UdxAsyncStream::poll_write` applies back-pressure.
+pub(crate) const SEND_BUFFER_MAX: usize = 1024 * 1024;
 
 // ── MTU Probing State ────────────────────────────────────────────────────────
 
@@ -179,11 +184,23 @@ pub(crate) struct StreamInner {
     pub(crate) pending_writes: Vec<PendingWrite>,
     /// Sent packets awaiting ACK, keyed by sequence number.
     outgoing: BTreeMap<u32, SentPacket>,
+    /// Bytes staged in `send_queue`, not yet sent.
+    queued_bytes: usize,
+    /// Bytes in `outgoing`, sent but not cumulatively ACKed.
+    unacked_bytes: usize,
+    /// Writer waiting for send-buffer room (see `SEND_BUFFER_MAX`).
+    write_waker: Option<Waker>,
+    /// Writer waiting for everything sent to be ACKed.
+    flush_waker: Option<Waker>,
 
     // ── Receive state ──
     pub(crate) next_remote_seq: u32,
     /// Highest cumulative ACK received from remote.
     remote_acked: u32,
+    /// Send time and seq of the most recently sent packet the peer has
+    /// delivered (RACK `rack.xmit_ts`/`rack.end_seq`). Retransmissions do
+    /// not count: their ACK could be for the original copy.
+    rack: Option<(Instant, u32)>,
     /// Out-of-order receive buffer, keyed by sequence number.
     recv_buf: BTreeMap<u32, RecvdPacket>,
 
@@ -231,9 +248,9 @@ pub(crate) struct StreamInner {
 impl StreamInner {
     // ── Stream termination ──────────────────────────────────────────────────
 
-    /// Drain all pending writes with `StreamClosed`, mark the stream
-    /// disconnected, and drop `notify_tx` so future sends fail fast.
-    /// Idempotent — safe to call more than once.
+    /// Drain all pending writes with `StreamClosed`, wake blocked writers,
+    /// mark the stream disconnected, and drop `notify_tx` so future sends
+    /// fail fast. Idempotent — safe to call more than once.
     fn terminate(&mut self) {
         self.connected = false;
         self.notify_tx = None;
@@ -242,6 +259,12 @@ impl StreamInner {
             if let Some(tx) = pw.tx.take() {
                 let _ = tx.send(Err(UdxError::StreamClosed));
             }
+        }
+        if let Some(w) = self.write_waker.take() {
+            w.wake();
+        }
+        if let Some(w) = self.flush_waker.take() {
+            w.wake();
         }
     }
 
@@ -309,6 +332,7 @@ impl StreamInner {
 
     // ── Write preparation ────────────────────────────────────────────────────
 
+    /// Reserve sequence numbers for a write of `data_len` bytes.
     pub(crate) fn prepare_write(
         &mut self,
         data_len: usize,
@@ -319,7 +343,10 @@ impl StreamInner {
         if self.ended {
             return Err(UdxError::Io(std::io::Error::other("stream already shut down")));
         }
-        let udp = self.udp.clone().ok_or(UdxError::StreamClosed)?;
+        // `terminate()` drops the processor's channel: nothing would ever send.
+        if self.udp.is_none() || self.notify_tx.is_none() {
+            return Err(UdxError::StreamClosed);
+        }
         // When the firewall hook hasn't fired yet, remote_addr is not known.
         // Use the unspecified sentinel (0.0.0.0:0); the processor will update
         // queued packets once the hook fires and remote_addr is resolved.
@@ -339,22 +366,16 @@ impl StreamInner {
         self.next_seq = ack_threshold;
         let current_ack = self.next_remote_seq;
 
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.pending_writes.push(PendingWrite {
-            ack_threshold,
-            tx: Some(ack_tx),
-        });
-
         Ok(WritePrep {
-            udp,
             remote_addr,
             remote_id,
             first_seq,
+            ack_threshold,
             current_ack,
-            ack_rx,
         })
     }
 
+    /// Reserve the sequence number of the FIN; later writes are refused.
     pub(crate) fn prepare_end(&mut self) -> Result<WritePrep> {
         if !self.connected {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
@@ -362,29 +383,58 @@ impl StreamInner {
         if self.ended {
             return Err(UdxError::Io(std::io::Error::other("stream already shut down")));
         }
-        self.ended = true;
-        let udp = self.udp.clone().ok_or(UdxError::StreamClosed)?;
+        if self.udp.is_none() || self.notify_tx.is_none() {
+            return Err(UdxError::StreamClosed);
+        }
         let remote_addr = self.remote_addr.ok_or(UdxError::StreamClosed)?;
+        self.ended = true;
         let remote_id = self.remote_id;
 
         let seq = self.next_seq;
         self.next_seq = seq + 1;
         let current_ack = self.next_remote_seq;
 
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.pending_writes.push(PendingWrite {
-            ack_threshold: seq + 1,
-            tx: Some(ack_tx),
-        });
-
         Ok(WritePrep {
-            udp,
             remote_addr,
             remote_id,
             first_seq: seq,
+            ack_threshold: seq + 1,
             current_ack,
-            ack_rx,
         })
+    }
+
+    /// Resolves once the remote has cumulatively ACKed every seq below
+    /// `ack_threshold`, or with `StreamClosed` when the stream dies first.
+    pub(crate) fn watch_ack(&mut self, ack_threshold: u32) -> oneshot::Receiver<Result<()>> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_writes.push(PendingWrite {
+            ack_threshold,
+            tx: Some(tx),
+        });
+        rx
+    }
+
+    /// Send-buffer bytes still free for `UdxAsyncStream::poll_write`.
+    pub(crate) fn send_buffer_room(&self) -> usize {
+        SEND_BUFFER_MAX.saturating_sub(self.queued_bytes + self.unacked_bytes)
+    }
+
+    pub(crate) fn set_write_waker(&mut self, waker: &Waker) {
+        self.write_waker = Some(waker.clone());
+    }
+
+    pub(crate) fn set_flush_waker(&mut self, waker: &Waker) {
+        self.flush_waker = Some(waker.clone());
+    }
+
+    /// True while the processor task is alive (not terminated).
+    pub(crate) fn is_alive(&self) -> bool {
+        self.notify_tx.is_some()
+    }
+
+    /// True once nothing is queued and everything sent has been ACKed.
+    pub(crate) fn all_acked(&self) -> bool {
+        self.send_queue.is_empty() && self.outgoing.is_empty()
     }
 
     // ── Outgoing packet registration ─────────────────────────────────────────
@@ -395,6 +445,7 @@ impl StreamInner {
         let inflight = self.inflight();
         let rate_info = self.congestion.on_packet_sent(seq, inflight, now);
         tracing::trace!(seq, is_mtu_probe, "register_sent: packet placed in outgoing");
+        self.unacked_bytes += packet.len();
         self.outgoing.insert(seq, SentPacket {
             packet,
             time_sent: now,
@@ -413,12 +464,29 @@ impl StreamInner {
     pub(crate) fn queue_for_send(&mut self, packets: Vec<(u32, Vec<u8>)>, remote_addr: SocketAddr) {
         let count = packets.len();
         for (seq, packet) in packets {
+            self.queued_bytes += packet.len();
             self.send_queue.push_back(QueuedPacket { packet, seq, remote_addr });
         }
         tracing::trace!(count, queue_len = self.send_queue.len(), "queue_for_send: packets staged");
-        if let Some(ref tx) = self.notify_tx {
+        if let Some(tx) = &self.notify_tx {
             let _ = tx.send(StreamNotify::DataQueued);
         }
+    }
+
+    /// Stage a write's packets, restarting the BBR transmit clock when the
+    /// stream was idle.
+    pub(crate) fn queue_write(&mut self, packets: Vec<(u32, Vec<u8>)>, remote_addr: SocketAddr) {
+        if self.send_idle() {
+            self.congestion.on_transmit_start(Instant::now());
+        }
+        self.queue_for_send(packets, remote_addr);
+    }
+
+    /// Take the next packet to send off the queue.
+    fn pop_queued(&mut self) -> Option<QueuedPacket> {
+        let queued = self.send_queue.pop_front()?;
+        self.queued_bytes = self.queued_bytes.saturating_sub(queued.packet.len());
+        Some(queued)
     }
 
     pub(crate) fn send_idle(&self) -> bool {
@@ -478,16 +546,31 @@ impl StreamInner {
         let mut rtt_measured = false;
         let mut acked_rate_info: Vec<(u32, super::congestion::rate::PacketRateInfo)> = Vec::new();
         for (&seq, pkt) in &removed {
-            if !rtt_measured && pkt.retransmit_count == 0 {
-                let elapsed = pkt.time_sent.elapsed().as_millis() as u32;
-                self.update_rtt(elapsed);
-                rtt_measured = true;
+            self.unacked_bytes = self.unacked_bytes.saturating_sub(pkt.packet.len());
+            if pkt.retransmit_count == 0 {
+                if !rtt_measured {
+                    let elapsed = pkt.time_sent.elapsed().as_millis() as u32;
+                    self.update_rtt(elapsed);
+                    rtt_measured = true;
+                }
+                self.rack_advance(pkt.time_sent, seq);
             }
-            if let Some(ref info) = pkt.rate_info {
+            if let Some(info) = &pkt.rate_info {
                 acked_rate_info.push((seq, *info));
             }
             if pkt.is_mtu_probe && self.mtu_state == MtuState::Search {
                 self.on_mtu_probe_acked();
+            }
+        }
+
+        if self.send_buffer_room() > 0 {
+            if let Some(w) = self.write_waker.take() {
+                w.wake();
+            }
+        }
+        if self.all_acked() {
+            if let Some(w) = self.flush_waker.take() {
+                w.wake();
             }
         }
 
@@ -511,48 +594,72 @@ impl StreamInner {
 
     /// Process SACK ranges from the remote peer. Marks selectively acknowledged
     /// packets and returns rate info from newly sacked packets for congestion control.
+    ///
+    /// Ranges are untrusted input: only packets actually in `outgoing` are
+    /// visited, so a block like `0..0xFFFFFFFF` costs one tree walk, not four
+    /// billion lookups (C `udx_sack_is_valid` rejects it outright).
     fn on_sack(&mut self, ranges: &[SackRange]) -> Vec<(u32, super::congestion::rate::PacketRateInfo)> {
         let mut sack_rate_info = Vec::new();
+        let mut delivered = Vec::new();
         for range in ranges {
-            for seq in range.start..range.end {
-                if let Some(pkt) = self.outgoing.get_mut(&seq) {
-                    if !pkt.sacked {
-                        pkt.sacked = true;
-                        if let Some(ref info) = pkt.rate_info {
-                            sack_rate_info.push((seq, *info));
-                        }
+            if range.start >= range.end {
+                continue;
+            }
+            for (&seq, pkt) in self.outgoing.range_mut(range.start..range.end) {
+                if !pkt.sacked {
+                    pkt.sacked = true;
+                    if pkt.retransmit_count == 0 {
+                        delivered.push((pkt.time_sent, seq));
+                    }
+                    if let Some(info) = &pkt.rate_info {
+                        sack_rate_info.push((seq, *info));
                     }
                 }
             }
         }
+        for (time_sent, seq) in delivered {
+            self.rack_advance(time_sent, seq);
+        }
         sack_rate_info
+    }
+
+    /// RACK §6.2 step 2: remember the delivered packet that was sent last.
+    fn rack_advance(&mut self, time_sent: Instant, seq: u32) {
+        let newer = match self.rack {
+            None => true,
+            Some((t, s)) => time_sent > t || (time_sent == t && seq_after(seq, s)),
+        };
+        if newer {
+            self.rack = Some((time_sent, seq));
+        }
     }
 
     // ── Loss detection ───────────────────────────────────────────────────────
 
-    /// Detect lost packets via SACK gap analysis: any non-sacked, non-lost
-    /// packet with a sequence number below the highest SACKed sequence is
-    /// declared lost. Returns the number of newly detected losses.
+    /// Detect lost packets with RACK's ordering rule (C `rack_detect_loss`,
+    /// RFC 8985 §6.2): an unacked packet is lost once the peer has delivered
+    /// a packet that was sent after it. A retransmission gets a fresh send
+    /// time, so it is not declared lost again until something sent after it
+    /// is delivered, about one RTT later; without that, every SACK arriving
+    /// during a retransmission's flight would retransmit it once more.
+    /// Returns the number of newly detected losses.
     ///
-    /// This is a simplified approximation of the C libudx RACK-based loss
-    /// detection. It captures the essential behavior (packets below the
-    /// highest SACK are considered lost) without the full timing state.
+    /// Simplification of C: no reordering window (`reo_wnd`) and no timer;
+    /// a packet is lost as soon as the ordering rule says so.
     fn detect_losses(&mut self) -> u32 {
-        let highest_sacked = self
-            .outgoing
-            .iter()
-            .filter(|(_, pkt)| pkt.sacked)
-            .map(|(&seq, _)| seq)
-            .max();
-
-        let Some(highest_sacked) = highest_sacked else {
+        let Some((rack_time_sent, rack_seq)) = self.rack else {
             return 0;
         };
 
         let lost_seqs: Vec<u32> = self
             .outgoing
             .iter()
-            .filter(|&(&seq, pkt)| !pkt.sacked && !pkt.lost && seq_after(highest_sacked, seq))
+            .filter(|&(&seq, pkt)| {
+                !pkt.sacked
+                    && !pkt.lost
+                    && (pkt.time_sent < rack_time_sent
+                        || (pkt.time_sent == rack_time_sent && seq_after(rack_seq, seq)))
+            })
             .map(|(&seq, _)| seq)
             .collect();
 
@@ -654,51 +761,21 @@ impl StreamInner {
 
     // ── Retransmission ───────────────────────────────────────────────────────
 
-    /// Collect packets that need retransmission (not SACKed, still in outgoing).
+    /// Collect packets to retransmit: every un-SACKed packet (RTO), or with
+    /// `only_lost` just the ones SACK gap analysis marked lost (fast retransmit).
     /// Updates retransmit_count and time_sent for each retransmitted packet.
     /// For MTU probes: strips padding, marks failure, and may transition to SearchComplete.
-    fn packets_to_retransmit(&mut self) -> Vec<Vec<u8>> {
+    fn collect_retransmits(&mut self, only_lost: bool) -> Vec<Vec<u8>> {
         let now = Instant::now();
         let mut retransmits = Vec::new();
         let mut probe_failed = false;
+        let mut stripped = 0;
         for pkt in self.outgoing.values_mut() {
-            if !pkt.sacked {
+            if !pkt.sacked && (pkt.lost || !only_lost) {
                 if pkt.is_mtu_probe {
+                    let before = pkt.packet.len();
                     strip_probe_padding(&mut pkt.packet);
-                    pkt.is_mtu_probe = false;
-                    probe_failed = true;
-                }
-                retransmits.push(pkt.packet.clone());
-                pkt.retransmit_count += 1;
-                pkt.time_sent = now;
-            }
-        }
-        if probe_failed {
-            self.mtu_probe_count += 1;
-            tracing::debug!(
-                failures = self.mtu_probe_count,
-                max = MTU_MAX_PROBES,
-                "mtu: probe failed (retransmit)"
-            );
-            if self.mtu_probe_count >= MTU_MAX_PROBES {
-                self.mtu_state = MtuState::SearchComplete;
-                self.mtu_probe_wanted = false;
-            } else {
-                self.mtu_probe_wanted = true;
-            }
-        }
-        retransmits
-    }
-
-    /// Fast retransmit: collect only packets marked as lost (SACK-detected).
-    fn fast_retransmit(&mut self) -> Vec<Vec<u8>> {
-        let now = Instant::now();
-        let mut retransmits = Vec::new();
-        let mut probe_failed = false;
-        for pkt in self.outgoing.values_mut() {
-            if pkt.lost && !pkt.sacked {
-                if pkt.is_mtu_probe {
-                    strip_probe_padding(&mut pkt.packet);
+                    stripped += before - pkt.packet.len();
                     pkt.is_mtu_probe = false;
                     probe_failed = true;
                 }
@@ -708,12 +785,14 @@ impl StreamInner {
                 pkt.lost = false;
             }
         }
+        self.unacked_bytes = self.unacked_bytes.saturating_sub(stripped);
         if probe_failed {
             self.mtu_probe_count += 1;
             tracing::debug!(
                 failures = self.mtu_probe_count,
                 max = MTU_MAX_PROBES,
-                "mtu: probe failed (fast retransmit)"
+                only_lost,
+                "mtu: probe failed (retransmit)"
             );
             if self.mtu_probe_count >= MTU_MAX_PROBES {
                 self.mtu_state = MtuState::SearchComplete;
@@ -767,13 +846,14 @@ fn push_events(events: &mut Vec<StreamEvent>, payload: Vec<u8>, flags: u8) {
 
 // ── WritePrep ────────────────────────────────────────────────────────────────
 
+/// Sequence numbers reserved for one write (or the FIN); `ack_threshold` is
+/// one past the last reserved seq.
 pub(crate) struct WritePrep {
-    pub udp: Arc<tokio::net::UdpSocket>,
     pub remote_addr: SocketAddr,
     pub remote_id: u32,
     pub first_seq: u32,
+    pub ack_threshold: u32,
     pub current_ack: u32,
-    pub ack_rx: oneshot::Receiver<Result<()>>,
 }
 
 // ── UdxStream ────────────────────────────────────────────────────────────────
@@ -809,8 +889,13 @@ impl UdxStream {
             next_seq: 0,
             pending_writes: Vec::new(),
             outgoing: BTreeMap::new(),
+            queued_bytes: 0,
+            unacked_bytes: 0,
+            write_waker: None,
+            flush_waker: None,
             next_remote_seq: 0,
             remote_acked: 0,
+            rack: None,
             recv_buf: BTreeMap::new(),
             srtt: 0,
             rttvar: 0,
@@ -927,23 +1012,19 @@ impl UdxStream {
 
     /// Write `data` reliably. Resolves when the remote peer ACKs all packets.
     pub async fn write(&self, data: &[u8]) -> Result<()> {
-        let prep = {
+        let (prep, max_payload, ack_rx) = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.prepare_write(data.len())?
+            let prep = inner.prepare_write(data.len())?;
+            let ack_rx = inner.watch_ack(prep.ack_threshold);
+            (prep, inner.max_payload(), ack_rx)
         };
+        let packets = build_data_packets(&prep, data, max_payload);
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .queue_write(packets, prep.remote_addr);
 
-        send_data_packets(
-            &self.inner,
-            &prep.udp,
-            prep.remote_addr,
-            prep.remote_id,
-            prep.first_seq,
-            prep.current_ack,
-            data,
-        )
-        .await?;
-
-        prep.ack_rx.await.map_err(|_| UdxError::StreamClosed)?
+        ack_rx.await.map_err(|_| UdxError::StreamClosed)?
     }
 
     /// Read the next message. Returns `None` on EOF or stream close.
@@ -964,27 +1045,15 @@ impl UdxStream {
 
     /// Send a write-end (FIN) and wait for the remote peer to ACK it.
     pub async fn shutdown(&self) -> Result<()> {
-        let prep = {
+        let ack_rx = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.prepare_end()?
+            let prep = inner.prepare_end()?;
+            let ack_rx = inner.watch_ack(prep.ack_threshold);
+            inner.queue_write(vec![(prep.first_seq, build_end_packet(&prep))], prep.remote_addr);
+            ack_rx
         };
 
-        let header = Header {
-            type_flags: FLAG_END,
-            data_offset: 0,
-            remote_id: prep.remote_id,
-            recv_window: DEFAULT_RWND,
-            seq: prep.first_seq,
-            ack: prep.current_ack,
-        };
-        let packet = header.encode();
-
-        {
-            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            guard.queue_for_send(vec![(prep.first_seq, packet.to_vec())], prep.remote_addr);
-        }
-
-        prep.ack_rx.await.map_err(|_| UdxError::StreamClosed)?
+        ack_rx.await.map_err(|_| UdxError::StreamClosed)?
     }
 
     /// Set up packet-level relay forwarding to `destination`.
@@ -1311,24 +1380,18 @@ async fn process_incoming(
 
                 // ── ACK + SACK processing ────────────────────────────
                 let has_ack = header.ack > 0;
-                let has_sack = header.has_flag(FLAG_SACK) && header.data_offset > 0;
+                // Decode SACK ranges from wire format (outside lock). C libudx
+                // sends them with data_offset = 0, so the region is derived
+                // from the packet length, not from data_offset alone.
+                let sack_ranges = header
+                    .sack_region(packet.data.len())
+                    .and_then(|region| decode_sack(&packet.data[region]).ok());
 
-                if has_ack || has_sack {
-                    // Decode SACK ranges from wire format (outside lock)
-                    let sack_ranges = if has_sack {
-                        let sack_end = header.payload_offset();
-                        if sack_end <= packet.data.len() {
-                            decode_sack(&packet.data[HEADER_SIZE..sack_end]).ok()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    let (completed, outgoing_empty, fast_retransmits, udp_for_retransmit, addr_for_retransmit) = {
+                if has_ack || sack_ranges.is_some() {
+                    let (completed, outgoing_empty, ack_advanced, fast_retransmits, udp_for_retransmit, addr_for_retransmit) = {
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                         guard.send_rwnd = header.recv_window;
+                        let prev_acked = guard.remote_acked;
 
                         let (write_completions, mut acked_rate_info) = if has_ack {
                             guard.on_cumulative_ack(header.ack)
@@ -1336,7 +1399,7 @@ async fn process_incoming(
                             (Vec::new(), Vec::new())
                         };
 
-                        if let Some(ref ranges) = sack_ranges {
+                        if let Some(ranges) = &sack_ranges {
                             let sack_info = guard.on_sack(ranges);
                             acked_rate_info.extend(sack_info);
                         }
@@ -1349,12 +1412,13 @@ async fn process_incoming(
                             guard.congestion.on_ack(&acked_rate_info, lost_count, inflight, now);
                         }
 
-                        let retransmits = guard.fast_retransmit();
+                        let retransmits = guard.collect_retransmits(true);
                         let udp = guard.udp.clone();
                         let addr = guard.remote_addr;
 
                         let empty = guard.outgoing.is_empty();
-                        (write_completions, empty, retransmits, udp, addr)
+                        let advanced = guard.remote_acked != prev_acked;
+                        (write_completions, empty, advanced, retransmits, udp, addr)
                     };
 
                     // Notify completed writes (outside lock)
@@ -1372,10 +1436,12 @@ async fn process_incoming(
                         }
                     }
 
-                    // Reset RTO timer based on outgoing state
+                    // Re-arm the RTO only when the cumulative ACK advanced
+                    // (C `arm_rto_or_tlp = ack_advanced && data_inflight`,
+                    // RFC 6298 5.3); dup/SACK-only/heartbeat ACKs leave it.
                     if outgoing_empty {
                         rto_sleep.as_mut().reset(TokioInstant::now() + FAR_FUTURE);
-                    } else {
+                    } else if ack_advanced {
                         let rto = inner.lock().unwrap_or_else(|e| e.into_inner()).rto as u64;
                         rto_sleep.as_mut().reset(
                             TokioInstant::now() + Duration::from_millis(rto),
@@ -1474,28 +1540,21 @@ async fn process_incoming(
 
                     while !guard.send_queue.is_empty() {
                         let inflight = guard.inflight() + batch.len() as u32;
-                        let queued_bytes = guard.send_queue.iter()
-                            .map(|q| q.packet.len())
-                            .sum::<usize>();
+                        let queued_bytes = guard.queued_bytes;
                         guard.congestion.check_app_limited(queued_bytes, inflight);
 
                         if !guard.congestion.can_send(inflight, guard.send_rwnd) {
                             break;
                         }
 
-                        let Some(front) = guard.send_queue.front() else {
-                            break;
-                        };
-                        let packet_len = front.packet.len() as u32;
-
                         let now = std::time::Instant::now();
-                        let delay = guard.congestion.pacing_delay(packet_len, now);
+                        let delay = guard.congestion.pacing_delay(now);
                         if delay > std::time::Duration::ZERO {
                             pacing_sleep.as_mut().reset(TokioInstant::now() + delay);
                             break;
                         }
 
-                        let Some(queued) = guard.send_queue.pop_front() else {
+                        let Some(queued) = guard.pop_queued() else {
                             break;
                         };
                         let mut packet = queued.packet;
@@ -1575,7 +1634,7 @@ async fn process_incoming(
                             guard.congestion.high_seq = max_seq;
                         }
                         guard.rto = (guard.rto * 2).min(MAX_RTO_MS);
-                        let retransmits = guard.packets_to_retransmit();
+                        let retransmits = guard.collect_retransmits(false);
                         let rto = guard.rto as u64;
                         (retransmits, guard.udp.clone(), guard.remote_addr, rto, false)
                     }
@@ -1685,51 +1744,50 @@ pub(crate) fn build_data_packet(
     packet
 }
 
-// ── send_data_packets ────────────────────────────────────────────────────────
-
-/// Build, register, and send DATA packets for a write.
-///
-/// Packets are stored in the outgoing buffer *before* being sent on the wire,
-/// ensuring the retransmission engine can resend them if ACKs don't arrive.
-pub(crate) async fn send_data_packets(
-    inner: &Arc<Mutex<StreamInner>>,
-    _udp: &tokio::net::UdpSocket,
-    remote_addr: SocketAddr,
-    remote_id: u32,
-    first_seq: u32,
-    current_ack: u32,
+/// Chunk `data` into the DATA packets reserved by `prep` (one empty packet
+/// for an empty write).
+pub(crate) fn build_data_packets(
+    prep: &WritePrep,
     data: &[u8],
-) -> Result<()> {
-    let max_payload = inner.lock().unwrap_or_else(|e| e.into_inner()).max_payload();
+    max_payload: usize,
+) -> Vec<(u32, Vec<u8>)> {
     let chunks: Vec<&[u8]> = if data.is_empty() {
         vec![&[]]
     } else {
         data.chunks(max_payload).collect()
     };
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let seq = prep.first_seq + i as u32;
+            (seq, build_data_packet(prep.remote_id, seq, prep.current_ack, chunk))
+        })
+        .collect()
+}
 
-    let mut packets: Vec<(u32, Vec<u8>)> = Vec::with_capacity(chunks.len());
-    for (i, chunk) in chunks.iter().enumerate() {
-        let seq = first_seq + i as u32;
-        packets.push((seq, build_data_packet(remote_id, seq, current_ack, chunk)));
+/// Build the FIN packet reserved by `prepare_end`.
+pub(crate) fn build_end_packet(prep: &WritePrep) -> Vec<u8> {
+    Header {
+        type_flags: FLAG_END,
+        data_offset: 0,
+        remote_id: prep.remote_id,
+        recv_window: DEFAULT_RWND,
+        seq: prep.first_seq,
+        ack: prep.current_ack,
     }
-
-    {
-        let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.outgoing.is_empty() && guard.send_queue.is_empty() {
-            guard.congestion.on_transmit_start(std::time::Instant::now());
-        }
-        guard.queue_for_send(packets, remote_addr);
-    }
-    Ok(())
+    .encode()
+    .to_vec()
 }
 
 // ── send_ack ─────────────────────────────────────────────────────────────────
 
 /// Send an ACK packet, optionally including SACK ranges.
 ///
-/// When `sack_ranges` is non-empty, the packet includes FLAG_SACK with
-/// the SACK data encoded after the header (using `data_offset` to indicate
-/// the extra bytes).
+/// SACK blocks follow the header. C libudx reads them from `data_offset`
+/// bytes when that is set, else from the whole body (it always sends
+/// `data_offset = 0`); we set `data_offset` while it fits in a byte so older
+/// Rust peers keep parsing, and fall back to `0` beyond 31 ranges.
 fn send_ack(
     udp: &Option<Arc<tokio::net::UdpSocket>>,
     remote_addr: Option<SocketAddr>,
@@ -1737,47 +1795,25 @@ fn send_ack(
     ack: u32,
     sack_ranges: &[SackRange],
 ) {
-    if let (Some(udp), Some(addr)) = (udp.as_ref(), remote_addr) {
-        let udp = Arc::clone(udp);
-
-        if sack_ranges.is_empty() {
-            // Pure ACK — just the 20-byte header
-            let header = Header {
-                type_flags: 0,
-                data_offset: 0,
-                remote_id,
-                recv_window: DEFAULT_RWND,
-                seq: 0,
-                ack,
-            };
-            let packet = header.encode();
-            tokio::spawn(async move {
-                let _ = udp.send_to(&packet, addr).await;
-            });
-        } else {
-            // ACK with SACK ranges
-            let sack_byte_len = sack_ranges.len() * 8;
-            let header = Header {
-                type_flags: FLAG_SACK,
-                data_offset: sack_byte_len as u8,
-                remote_id,
-                recv_window: DEFAULT_RWND,
-                seq: 0,
-                ack,
-            };
-
-            let mut packet = Vec::with_capacity(HEADER_SIZE + sack_byte_len);
-            let header_bytes = header.encode();
-            packet.extend_from_slice(&header_bytes);
-            let mut sack_buf = vec![0u8; sack_byte_len];
-            encode_sack(sack_ranges, &mut sack_buf);
-            packet.extend_from_slice(&sack_buf);
-
-            tokio::spawn(async move {
-                let _ = udp.send_to(&packet, addr).await;
-            });
-        }
-    }
+    let (Some(udp), Some(addr)) = (udp.as_ref(), remote_addr) else {
+        return;
+    };
+    let udp = Arc::clone(udp);
+    let sack_byte_len = sack_ranges.len() * 8;
+    let header = Header {
+        type_flags: if sack_ranges.is_empty() { 0 } else { FLAG_SACK },
+        data_offset: u8::try_from(sack_byte_len).unwrap_or(0),
+        remote_id,
+        recv_window: DEFAULT_RWND,
+        seq: 0,
+        ack,
+    };
+    let mut packet = vec![0u8; HEADER_SIZE + sack_byte_len];
+    header.encode_into(&mut packet[..HEADER_SIZE]);
+    encode_sack(sack_ranges, &mut packet[HEADER_SIZE..]);
+    tokio::spawn(async move {
+        let _ = udp.send_to(&packet, addr).await;
+    });
 }
 
 #[cfg(test)]
@@ -1793,8 +1829,13 @@ mod mtu_tests {
             next_seq: 0,
             pending_writes: Vec::new(),
             outgoing: BTreeMap::new(),
+            queued_bytes: 0,
+            unacked_bytes: 0,
+            write_waker: None,
+            flush_waker: None,
             next_remote_seq: 0,
             remote_acked: 0,
+            rack: None,
             recv_buf: BTreeMap::new(),
             srtt: 0,
             rttvar: 0,
@@ -1854,7 +1895,7 @@ mod mtu_tests {
             rate_info: None,
         });
 
-        let retransmits = inner.packets_to_retransmit();
+        let retransmits = inner.collect_retransmits(false);
         assert_eq!(retransmits.len(), 1);
         assert_eq!(inner.mtu_probe_count, 1);
         assert!(!inner.outgoing[&0].is_mtu_probe, "probe flag should be cleared after retransmit");
@@ -1882,6 +1923,29 @@ mod mtu_tests {
 
         let payload_start = HEADER_SIZE + MTU_STEP;
         assert_eq!(&packet[payload_start..], &payload[..], "original payload should be intact after padding");
+    }
+
+    /// A SACK block spanning the whole sequence space (one 28-byte packet
+    /// from anyone who knows the stream id) must cost work proportional to
+    /// the packets in flight, and inverted blocks must be ignored.
+    #[test]
+    fn sack_ranges_are_bounded_by_outgoing() {
+        let mut inner = make_stream_inner();
+        for seq in [5u32, 6, 9] {
+            inner.register_sent(seq, build_data_packet(0, seq, 0, b"x"), false);
+        }
+
+        let started = Instant::now();
+        let sacked = inner.on_sack(&[
+            SackRange { start: 9, end: 6 },
+            SackRange { start: 0, end: 0xFFFF_FFFF },
+        ]);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100), "SACK walk is not bounded");
+
+        let seqs: Vec<u32> = sacked.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![5, 6, 9]);
+        assert!(inner.outgoing.values().all(|p| p.sacked));
+        assert_eq!(inner.inflight(), 0);
     }
 
     // T7: Probe ACK advances MTU and scales congestion window
@@ -1921,7 +1985,7 @@ mod mtu_tests {
                 rate_info: None,
             });
 
-            let _ = inner.packets_to_retransmit();
+            let _ = inner.collect_retransmits(false);
         }
 
         assert_eq!(inner.mtu_state, MtuState::SearchComplete);

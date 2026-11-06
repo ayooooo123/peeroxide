@@ -5,6 +5,7 @@ mod common;
 use common::proxy::{DirectionConfig, ProxyConfig};
 use common::{create_lossy_pair, create_runtime, random_payload, verify_payload, with_timeout};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const LONG_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -125,6 +126,55 @@ async fn rtt_under_delay() {
             elapsed < Duration::from_secs(5),
             "write took too long ({elapsed:?}), expected <5s"
         );
+    })
+    .await;
+}
+
+/// Bulk transfer on a 100 ms RTT with 1% loss. BBR's pacing rate on such a
+/// path is far below one packet per millisecond; the pacer must still let
+/// one packet out per tick (C `stream_may_send`: `tb_available != 0`) or
+/// the sender stalls right after start-up.
+#[tokio::test(flavor = "multi_thread")]
+async fn bulk_transfer_over_long_rtt_with_loss() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    with_timeout(LONG_TIMEOUT, async {
+        let runtime = create_runtime();
+        let config = ProxyConfig {
+            a_to_b: DirectionConfig {
+                delay: Duration::from_millis(50),
+                loss_rate: 0.01,
+                ..Default::default()
+            },
+            b_to_a: DirectionConfig {
+                delay: Duration::from_millis(50),
+                ..Default::default()
+            },
+        };
+        let (stream_a, stream_b, _sa, _sb, _proxy) = create_lossy_pair(&runtime, config).await;
+
+        let total = 2 * 1024 * 1024;
+        let payload = random_payload(total);
+        let mut writer = stream_a.into_async_stream();
+        let mut reader = stream_b.into_async_stream();
+
+        let started = Instant::now();
+        let payload_clone = payload.clone();
+        let write_task = tokio::spawn(async move {
+            writer.write_all(&payload_clone).await.expect("write_all");
+            writer.shutdown().await.expect("shutdown");
+            writer
+        });
+
+        let mut received = Vec::with_capacity(total);
+        reader.read_to_end(&mut received).await.expect("read_to_end");
+        let _writer = write_task.await.expect("writer panicked");
+        let elapsed = started.elapsed();
+        eprintln!("2 MiB over 100 ms RTT, 1% loss: {elapsed:?}");
+
+        verify_payload(&payload, &received);
+        // One packet per ms would need ~1.8 s; a stalled pacer takes minutes.
+        assert!(elapsed < Duration::from_secs(30), "transfer took {elapsed:?}: pacer stalled");
     })
     .await;
 }

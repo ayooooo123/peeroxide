@@ -152,6 +152,8 @@ pub enum IoEvent {
         value: Option<Vec<u8>>,
         rtt: Duration,
         request: ResolvedRequest,
+        /// Socket the response arrived on.
+        socket: SocketKind,
     },
 }
 
@@ -369,6 +371,16 @@ impl Io {
         } else {
             self.server_socket.clone()
         }
+    }
+
+    /// Whether requests go out on the client socket (true) or the server
+    /// socket (false, once the server port proved reachable).
+    pub fn firewalled(&self) -> bool {
+        self.firewalled
+    }
+
+    pub fn set_firewalled(&mut self, firewalled: bool) {
+        self.firewalled = firewalled;
     }
 
     /// Receive and decode the next message from either socket.
@@ -1108,6 +1120,7 @@ impl Io {
                     value: res.value,
                     rtt,
                     request,
+                    socket: socket_kind,
                 })
             }
 

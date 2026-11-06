@@ -246,10 +246,10 @@ impl CongestionController {
         inflight < self.cwnd.min(rwnd_pkts)
     }
 
-    /// Computes pacing delay for the requested byte count.
-    pub(crate) fn pacing_delay(&mut self, bytes: u32, now: Instant) -> Duration {
+    /// Delay before the next packet may be sent (C `stream_may_send`).
+    pub(crate) fn pacing_delay(&mut self, now: Instant) -> Duration {
         self.pacing.refill(now);
-        self.pacing.delay_for(bytes, now)
+        self.pacing.delay()
     }
 
     /// Returns whether the sender is app-limited.
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn test_pacing_delay_default_zero() {
         let mut controller = CongestionController::new(1200, 50);
-        assert_eq!(controller.pacing_delay(1200, Instant::now()), Duration::ZERO);
+        assert_eq!(controller.pacing_delay(Instant::now()), Duration::ZERO);
     }
 
     #[test]

@@ -144,6 +144,21 @@ impl Header {
         HEADER_SIZE + self.data_offset as usize
     }
 
+    /// Byte range of the SACK blocks in a `packet_len`-byte packet, as C
+    /// libudx reads them: `data_offset` bytes when that is set and shorter
+    /// than the body, otherwise the whole body (C libudx always sends SACKs
+    /// with `data_offset = 0`). Trailing partial blocks are dropped.
+    pub fn sack_region(&self, packet_len: usize) -> Option<std::ops::Range<usize>> {
+        if !self.has_flag(FLAG_SACK) || packet_len < HEADER_SIZE {
+            return None;
+        }
+        let body = packet_len - HEADER_SIZE;
+        let off = self.data_offset as usize;
+        let len = if off > 0 && off < body { off } else { body };
+        let len = len - len % 8;
+        (len > 0).then_some(HEADER_SIZE..HEADER_SIZE + len)
+    }
+
     /// Returns `true` when `type_flags` shares any bits with `flag`.
     pub fn has_flag(&self, flag: u8) -> bool {
         self.type_flags & flag != 0
@@ -214,6 +229,30 @@ mod tests {
         let buf = header.encode();
         let decoded = Header::decode(&buf).unwrap();
         assert_eq!(header, decoded);
+    }
+
+    /// C libudx (`udx_write_header` + `send_ack`) sends SACK blocks with
+    /// `data_offset = 0`, filling the rest of the packet.
+    #[test]
+    fn sack_region_matches_c_libudx() {
+        let sack = |data_offset| Header {
+            type_flags: FLAG_SACK,
+            data_offset,
+            remote_id: 1,
+            recv_window: 0,
+            seq: 0,
+            ack: 3,
+        };
+        // Two C-style blocks after the header.
+        assert_eq!(sack(0).sack_region(HEADER_SIZE + 16), Some(HEADER_SIZE..HEADER_SIZE + 16));
+        // data_offset set: only that many bytes are SACK.
+        assert_eq!(sack(8).sack_region(HEADER_SIZE + 16), Some(HEADER_SIZE..HEADER_SIZE + 8));
+        // Partial trailing block is ignored, like C's integer division.
+        assert_eq!(sack(0).sack_region(HEADER_SIZE + 13), Some(HEADER_SIZE..HEADER_SIZE + 8));
+        assert_eq!(sack(0).sack_region(HEADER_SIZE), None);
+        assert_eq!(sack(0).sack_region(HEADER_SIZE + 7), None);
+        let plain = Header { type_flags: 0, ..sack(0) };
+        assert_eq!(plain.sack_region(HEADER_SIZE + 16), None);
     }
 
     #[test]
