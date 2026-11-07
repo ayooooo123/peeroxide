@@ -151,6 +151,56 @@ async fn lookup_contains(
 }
 
 #[tokio::test]
+async fn eager_spawn_queues_topics_until_bootstrap_completes() {
+    with_timeout("eager spawn", async {
+        let net = Testnet::start().await?;
+        let proxy = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let mut config = SwarmConfig::default();
+        config.eager = true;
+        config.dht = local_dht(vec![proxy.local_addr()?.to_string()], false);
+        let (_task, swarm, _rx) =
+            tokio::time::timeout(Duration::from_secs(1), spawn_swarm(config)).await??;
+        let mut packet = [0; 2048];
+        let (size, client) = proxy.recv_from(&mut packet).await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), swarm.dht().bootstrapped())
+                .await
+                .is_err(),
+            "spawn must return while the bootstrap response is still withheld",
+        );
+        let topic = [71; 32];
+        let mut opts = JoinOpts::default();
+        opts.client = false;
+        swarm.join(topic, opts).await?;
+        let target: std::net::SocketAddr = net.addrs[0].parse()?;
+        proxy.send_to(&packet[..size], target).await?;
+        let forwarder = tokio::spawn(async move {
+            loop {
+                let (size, from) = proxy.recv_from(&mut packet).await?;
+                let to = if from == target { client } else { target };
+                proxy.send_to(&packet[..size], to).await?;
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), std::io::Error>(())
+        });
+        swarm.dht().bootstrapped().await?;
+        swarm.flush().await?;
+        let (_looker_task, looker, _looker_rx) = net.swarm().await?;
+        wait_for("the topic queued before bootstrap", || async {
+            lookup_contains(looker.dht(), topic, swarm.key_pair().public_key)
+                .await
+                .then_some(())
+        })
+        .await?;
+        swarm.destroy().await?;
+        looker.destroy().await?;
+        forwarder.abort();
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn listen_registers_and_announces_without_a_topic() {
     with_timeout("listen", async {
         let net = Testnet::start().await?;

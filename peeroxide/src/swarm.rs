@@ -139,6 +139,9 @@ pub struct SwarmConfig {
     pub key_pair: Option<KeyPair>,
     /// Underlying HyperDHT configuration.
     pub dht: HyperDhtConfig,
+    /// Return after binding instead of waiting for bootstrap (default `false`).
+    /// Topic discovery still waits for bootstrap before its first announce or lookup.
+    pub eager: bool,
     /// Maximum total peer connections (default 64).
     pub max_peers: usize,
     /// Maximum concurrent outgoing connection attempts (default 3).
@@ -171,6 +174,7 @@ impl Default for SwarmConfig {
         Self {
             key_pair: None,
             dht: HyperDhtConfig::default(),
+            eager: false,
             max_peers: DEFAULT_MAX_PEERS,
             max_parallel: DEFAULT_MAX_PARALLEL,
             firewall: 0,
@@ -510,6 +514,7 @@ struct ActorConfig {
     max_parallel: usize,
     relay_through: Option<[u8; 32]>,
     local_connection: bool,
+    eager: bool,
 }
 
 struct SwarmActor {
@@ -591,7 +596,9 @@ pub async fn spawn(
     let runtime = UdxRuntime::new()?;
 
     let (dht_join, dht, _server_rx) = hyperdht::spawn(&runtime, config.dht).await?;
-    dht.bootstrapped().await?;
+    if !config.eager {
+        dht.bootstrapped().await?;
+    }
 
     let local_port = dht.dht().local_port().await?;
     // Fetch the actual port of the socket the server-side firewall hook
@@ -642,6 +649,7 @@ pub async fn spawn(
             max_parallel: config.max_parallel,
             relay_through: config.relay_through,
             local_connection: config.local_connection,
+            eager: config.eager,
         },
         runtime_handle: runtime.handle(),
         topics: HashMap::new(),
@@ -882,18 +890,30 @@ impl SwarmActor {
     /// can stop it.
     fn spawn_discovery(&mut self, topic: [u8; 32], server: bool, client: bool) {
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let task = tokio::spawn(run_discovery(
-            PeerDiscoveryConfig {
-                topic,
-                is_server: server,
-                is_client: client,
-            },
-            self.dht.clone(),
-            self.key_pair.clone(),
-            self.relay_addresses(),
-            self.discovery_event_tx.clone(),
-            cancel_rx,
-        ));
+        let config = PeerDiscoveryConfig {
+            topic,
+            is_server: server,
+            is_client: client,
+        };
+        let dht = self.dht.clone();
+        let key_pair = self.key_pair.clone();
+        let relays = self.relay_addresses();
+        let events = self.discovery_event_tx.clone();
+        let eager = self.config.eager;
+        let task = tokio::spawn(async move {
+            let mut cancel_rx = cancel_rx;
+            if eager {
+                tokio::select! {
+                    ready = dht.bootstrapped() => {
+                        if ready.is_err() {
+                            return;
+                        }
+                    }
+                    _ = &mut cancel_rx => return,
+                }
+            }
+            run_discovery(config, dht, key_pair, relays, events, cancel_rx).await;
+        });
 
         self.topics.insert(
             topic,
@@ -1956,6 +1976,7 @@ mod tests {
                 max_parallel: 3,
                 relay_through: None,
                 local_connection: true,
+                eager: false,
             },
             runtime_handle: runtime.handle(),
             topics: HashMap::new(),
