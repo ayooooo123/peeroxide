@@ -70,7 +70,7 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
     let server_kp = KeyPair::generate();
     let target = hash(&server_kp.public_key);
 
-    srv_handle.register_server(&target);
+    srv_handle.register_server(&server_kp.public_key);
 
     let server_config = ServerConfig::new(server_kp.clone(), 0);
     let server_rt = UdxRuntime::new()?;

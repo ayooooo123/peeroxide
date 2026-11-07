@@ -370,6 +370,26 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> SecretStream<T> {
     }
 }
 
+impl SecretStream<libudx::UdxAsyncStream> {
+    /// Take the notification for closure of the underlying UDX stream.
+    pub fn take_close_notification(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.raw.take_close_notification()
+    }
+
+    /// A handle that destroys the underlying UDX stream from another owner,
+    /// so a swarm can close connections it has already handed out
+    /// (Node `swarm.suspend()` → `connection.destroy()`).
+    pub fn abort_handle(&self) -> libudx::UdxStreamAbort {
+        self.raw.abort_handle()
+    }
+
+    /// A handle that moves the underlying UDX stream to another peer and
+    /// path (Node `rawStream.changeRemote`); the cipher state stays put.
+    pub fn remote_handle(&self) -> libudx::UdxStreamRemote {
+        self.raw.remote_handle()
+    }
+}
+
 /// Owned read half of a [`SecretStream`], produced by [`SecretStream::into_split`].
 ///
 /// Holds the decryptor and the read side of the underlying transport. Its

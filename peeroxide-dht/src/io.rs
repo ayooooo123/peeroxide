@@ -306,6 +306,12 @@ pub struct Io {
     pub wire: WireCounters,
     table: Arc<Mutex<RoutingTable>>,
     destroying: bool,
+    /// Addresses the two sockets were last bound to, kept so `resume` can
+    /// rebind the server socket to its advertised port (dht-rpc keeps the
+    /// previous port across a suspend/resume cycle).
+    server_bind: SocketAddr,
+    client_bind: SocketAddr,
+    suspended: bool,
 }
 
 impl Io {
@@ -349,6 +355,9 @@ impl Io {
             wire: WireCounters::default(),
             table,
             destroying: false,
+            server_bind: server_addr,
+            client_bind: client_addr,
+            suspended: false,
         })
     }
 
@@ -383,6 +392,60 @@ impl Io {
         self.firewalled = firewalled;
     }
 
+    /// Whether the sockets are closed pending a [`resume`](Self::resume).
+    pub fn suspended(&self) -> bool {
+        self.suspended
+    }
+
+    /// Close both sockets and fail every in-flight request (dht-rpc
+    /// `io.suspend()`): subsequent packets are neither sent nor received, and
+    /// the returned timeout events let the node fail the affected queries.
+    pub async fn suspend(&mut self) -> Vec<TimeoutEvent> {
+        if self.suspended {
+            return Vec::new();
+        }
+        self.suspended = true;
+
+        let entries = std::mem::take(&mut self.inflight);
+        self.pending.clear();
+        self.congestion.clear();
+        self.client_socket.shutdown().await;
+        self.server_socket.shutdown().await;
+
+        let mut events = Vec::with_capacity(entries.len());
+        for entry in entries {
+            self.stats.active = self.stats.active.saturating_sub(1);
+            self.stats.timeouts += 1;
+            events.push(TimeoutEvent {
+                tid: entry.tid,
+                to: entry.to,
+                command: entry.command,
+                internal: entry.internal,
+                target: entry.target,
+            });
+        }
+        events
+    }
+
+    /// Rebind both sockets and resume traffic (dht-rpc `io.resume()`). The
+    /// server socket retries its previous port first and falls back to an
+    /// ephemeral one, exactly like `_bindSockets`.
+    pub async fn resume(&mut self) -> IoResult<()> {
+        if !self.suspended {
+            return Ok(());
+        }
+        if self.server_socket.bind(self.server_bind).await.is_err() {
+            let fallback = SocketAddr::new(self.server_bind.ip(), 0);
+            tracing::debug!(%fallback, "resume: previous server port unavailable");
+            self.server_socket.bind(fallback).await?;
+        }
+        self.server_bind = self.server_socket.local_addr().await?;
+        self.client_socket.bind(self.client_bind).await?;
+        self.client_bind = self.client_socket.local_addr().await?;
+        self.suspended = false;
+        Ok(())
+    }
+
     /// Receive and decode the next message from either socket.
     /// Returns None only if both channels are closed.
     pub async fn recv(&mut self) -> Option<IoEvent> {
@@ -392,6 +455,12 @@ impl Io {
                 msg = self.client_rx.recv() => (msg?, SocketKind::Client),
                 msg = self.server_rx.recv() => (msg?, SocketKind::Server),
             };
+            if self.suspended {
+                // Sockets are closed; anything still queued predates the
+                // suspend and must not drive the node (dht-rpc `onmessage`
+                // returns early while suspended).
+                continue;
+            }
             self.wire
                 .bytes_received
                 .fetch_add(datagram.data.len() as u64, Ordering::Relaxed);
@@ -495,7 +564,7 @@ impl Io {
     /// Returns the assigned TID, or `None` if the IO is destroying or the
     /// destination address is invalid.
     pub fn create_request(&mut self, params: RequestParams) -> Option<u16> {
-        if self.destroying {
+        if self.destroying || self.suspended {
             return None;
         }
 
@@ -594,7 +663,7 @@ impl Io {
         params: RequestParams,
         socket: &UdxSocket,
     ) -> Option<u16> {
-        if self.destroying {
+        if self.destroying || self.suspended {
             return None;
         }
 
@@ -763,8 +832,9 @@ impl Io {
         value: Option<Vec<u8>>,
         to: &Ipv4Peer,
         preserve_tid: Option<u16>,
+        via: Option<&UdxSocket>,
     ) -> bool {
-        if self.destroying {
+        if self.destroying || self.suspended {
             return false;
         }
 
@@ -814,10 +884,12 @@ impl Io {
             }
         };
 
-        let socket = match socket_kind {
+        // dht-rpc `Request.relay(value, to, { socket })`: a server answering
+        // a relayed handshake sends from its puncher socket.
+        let socket = via.unwrap_or(match socket_kind {
             SocketKind::Client => &self.client_socket,
             SocketKind::Server => &self.server_socket,
-        };
+        });
 
         let buffer_len = buffer.len() as u64;
         if let Err(e) = socket.send_to(&buffer, addr) {
@@ -849,7 +921,7 @@ impl Io {
         to: &Ipv4Peer,
         value: Option<Vec<u8>>,
     ) -> bool {
-        if self.destroying {
+        if self.destroying || self.suspended {
             return false;
         }
 
@@ -903,6 +975,9 @@ impl Io {
         to: &Ipv4Peer,
         params: ReplyInternalParams,
     ) {
+        if self.suspended {
+            return;
+        }
         let include_id = !self.ephemeral && params.socket_kind == SocketKind::Server;
 
         let (id, closer_nodes) = match self.table.lock() {

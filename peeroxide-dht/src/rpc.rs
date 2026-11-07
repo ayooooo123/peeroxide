@@ -60,6 +60,10 @@ pub enum DhtError {
     /// The DHT node has been destroyed.
     #[error("node destroyed")]
     Destroyed,
+    /// The DHT node is suspended (dht-rpc `IO_SUSPENDED`): its sockets are
+    /// closed until [`DhtHandle::resume`] is called.
+    #[error("I/O suspended")]
+    Suspended,
     /// The internal command channel is closed.
     #[error("command channel closed")]
     ChannelClosed,
@@ -270,6 +274,7 @@ enum DhtCommand {
         value: Option<Vec<u8>>,
         to: Ipv4Peer,
         preserve_tid: Option<u16>,
+        via: Option<UdxSocket>,
     },
     SendReplyTo {
         tid: u16,
@@ -284,6 +289,12 @@ enum DhtCommand {
         reply_tx: oneshot::Sender<usize>,
     },
     Destroy {
+        reply_tx: oneshot::Sender<Result<(), DhtError>>,
+    },
+    Suspend {
+        reply_tx: oneshot::Sender<()>,
+    },
+    Resume {
         reply_tx: oneshot::Sender<Result<(), DhtError>>,
     },
     LocalPort {
@@ -436,6 +447,30 @@ impl DhtHandle {
 }
 
 impl DhtHandle {
+    /// Suspend the node (dht-rpc `suspend()`): close both sockets, fail every
+    /// in-flight request with [`DhtError::Suspended`] and stop ticking.
+    ///
+    /// Idempotent; a destroyed node is unaffected.
+    pub async fn suspend(&self) -> Result<(), DhtError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DhtCommand::Suspend { reply_tx: tx })
+            .map_err(|_| DhtError::ChannelClosed)?;
+        rx.await.map_err(|_| DhtError::ChannelClosed)
+    }
+
+    /// Resume a suspended node (dht-rpc `resume()`): rebind the sockets on
+    /// their previous ports and refresh the routing table.
+    ///
+    /// Resuming a node that is not suspended is a no-op.
+    pub async fn resume(&self) -> Result<(), DhtError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DhtCommand::Resume { reply_tx: tx })
+            .map_err(|_| DhtError::ChannelClosed)?;
+        rx.await.map_err(|_| DhtError::ChannelClosed)?
+    }
+
     /// Waits until the node has finished bootstrapping.
     pub async fn bootstrapped(&self) -> Result<(), DhtError> {
         let (tx, rx) = oneshot::channel();
@@ -443,6 +478,11 @@ impl DhtHandle {
             .send(DhtCommand::Bootstrapped { reply_tx: tx })
             .map_err(|_| DhtError::ChannelClosed)?;
         rx.await.map_err(|_| DhtError::ChannelClosed)?
+    }
+
+    /// Waits until the initial bootstrap query has completed.
+    pub async fn fully_bootstrapped(&self) -> Result<(), DhtError> {
+        self.bootstrapped().await
     }
 
     /// Sends a ping to `host:port`.
@@ -540,6 +580,7 @@ impl DhtHandle {
                 value,
                 to: to.clone(),
                 preserve_tid: None,
+                via: None,
             })
             .map_err(|_| DhtError::ChannelClosed)
     }
@@ -559,6 +600,22 @@ impl DhtHandle {
         to: &Ipv4Peer,
         tid: u16,
     ) -> Result<(), DhtError> {
+        self.relay_with_tid_via(command, target, value, to, tid, None)
+    }
+
+    /// [`Self::relay_with_tid`] sent from `via` instead of the DHT socket
+    /// (dht-rpc `Request.relay(value, to, { socket })`). A server that staged
+    /// a holepunch answers from its puncher socket so the relay tags the
+    /// reply with that socket's address.
+    pub fn relay_with_tid_via(
+        &self,
+        command: u64,
+        target: Option<NodeId>,
+        value: Option<Vec<u8>>,
+        to: &Ipv4Peer,
+        tid: u16,
+        via: Option<UdxSocket>,
+    ) -> Result<(), DhtError> {
         self.cmd_tx
             .send(DhtCommand::Relay {
                 command,
@@ -566,6 +623,7 @@ impl DhtHandle {
                 value,
                 to: to.clone(),
                 preserve_tid: Some(tid),
+                via,
             })
             .map_err(|_| DhtError::ChannelClosed)
     }
@@ -751,7 +809,9 @@ impl DhtNode {
                 },
 
                 _ = drain_interval.tick() => {
-                    self.io.drain();
+                    if !self.io.suspended() {
+                        self.io.drain();
+                    }
                 },
 
                 _ = tokio::time::sleep_until(timeout_at) => {
@@ -770,7 +830,7 @@ impl DhtNode {
                 },
 
                 Some(cmd) = self.cmd_rx.recv() => {
-                    if self.handle_command(cmd) {
+                    if self.handle_command(cmd).await {
                         break;
                     }
                 },
@@ -1367,6 +1427,10 @@ impl DhtNode {
     }
 
     fn handle_tick(&mut self) {
+        // dht-rpc clears its tick interval on suspend; `resume` refreshes.
+        if self.io.suspended() {
+            return;
+        }
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_tick_time).as_millis() as u64;
 
@@ -1500,7 +1564,63 @@ impl DhtNode {
         });
     }
 
-    fn handle_command(&mut self, cmd: DhtCommand) -> bool {
+    /// Error for a request the IO layer refused: suspended or destroyed.
+    fn io_unavailable(&self) -> DhtError {
+        if self.io.suspended() {
+            DhtError::Suspended
+        } else {
+            DhtError::Destroyed
+        }
+    }
+
+    /// dht-rpc `_suspend()`: stop the tick timer, close the sockets and fail
+    /// every in-flight request/query with `IO_SUSPENDED`.
+    async fn do_suspend(&mut self) {
+        if self.io.suspended() {
+            return;
+        }
+        for query in self.active_queries.values_mut() {
+            query.abort();
+        }
+        self.active_queries.clear();
+        self.tid_to_query.clear();
+        let standalone: Vec<StandaloneRequest> =
+            self.standalone_tids.drain().map(|(_, s)| s).collect();
+        for entry in standalone {
+            match entry {
+                StandaloneRequest::Ping(tx) => {
+                    let _ = tx.send(Err(DhtError::Suspended));
+                }
+                StandaloneRequest::UserRequest(tx) => {
+                    let _ = tx.send(Err(DhtError::Suspended));
+                }
+                StandaloneRequest::Reping { .. }
+                | StandaloneRequest::Check { .. }
+                | StandaloneRequest::NatProbe { .. } => {}
+            }
+        }
+        // Timeout events from the IO layer are irrelevant now that the
+        // queries owning them were aborted above.
+        let _ = self.io.suspend().await;
+        self.bootstrap_query_id = None;
+        self.quick_probe = QuickProbe::NotSent;
+        self.firewall_check = None;
+    }
+
+    /// dht-rpc `resume()`: rebind the sockets and refresh the routing table.
+    async fn do_resume(&mut self) -> Result<(), DhtError> {
+        if !self.io.suspended() {
+            return Ok(());
+        }
+        self.io.resume().await?;
+        self.local_port = self.io.server_local_addr().await?.port();
+        if self.bootstrapped {
+            self.run_refresh();
+        }
+        Ok(())
+    }
+
+    async fn handle_command(&mut self, cmd: DhtCommand) -> bool {
         match cmd {
             DhtCommand::Bootstrapped { reply_tx } => {
                 if self.bootstrapped {
@@ -1530,7 +1650,7 @@ impl DhtNode {
                     self.standalone_tids
                         .insert(tid, StandaloneRequest::Ping(reply_tx));
                 } else {
-                    let _ = reply_tx.send(Err(DhtError::Destroyed));
+                    let _ = reply_tx.send(Err(self.io_unavailable()));
                 }
             }
 
@@ -1571,7 +1691,7 @@ impl DhtNode {
                     self.standalone_tids
                         .insert(tid, StandaloneRequest::UserRequest(reply_tx));
                 } else {
-                    let _ = reply_tx.send(Err(DhtError::Destroyed));
+                    let _ = reply_tx.send(Err(self.io_unavailable()));
                 }
             }
 
@@ -1581,8 +1701,9 @@ impl DhtNode {
                 value,
                 to,
                 preserve_tid,
+                via,
             } => {
-                self.io.relay(command, target, value, &to, preserve_tid);
+                self.io.relay(command, target, value, &to, preserve_tid, via.as_ref());
             }
 
             DhtCommand::SendReplyTo {
@@ -1613,6 +1734,16 @@ impl DhtNode {
                 self.destroyed = true;
                 let _ = reply_tx.send(Ok(()));
                 return true;
+            }
+
+            DhtCommand::Suspend { reply_tx } => {
+                self.do_suspend().await;
+                let _ = reply_tx.send(());
+            }
+
+            DhtCommand::Resume { reply_tx } => {
+                let result = self.do_resume().await;
+                let _ = reply_tx.send(result);
             }
 
             DhtCommand::LocalPort { reply_tx } => {
@@ -1664,7 +1795,7 @@ impl DhtNode {
                     self.standalone_tids
                         .insert(tid, StandaloneRequest::Ping(reply_tx));
                 } else {
-                    let _ = reply_tx.send(Err(DhtError::Destroyed));
+                    let _ = reply_tx.send(Err(self.io_unavailable()));
                 }
             }
         }
@@ -1682,6 +1813,10 @@ impl DhtNode {
         concurrency: Option<usize>,
         reply_tx: oneshot::Sender<Result<Vec<QueryReply>, DhtError>>,
     ) {
+        if self.io.suspended() {
+            let _ = reply_tx.send(Err(DhtError::Suspended));
+            return;
+        }
         let own_id = {
             let table = match self.table.lock() {
                 Ok(t) => t,
@@ -1719,6 +1854,9 @@ impl DhtNode {
 
         tokio::spawn(async move {
             match result_rx.await {
+                Ok(result) if result.aborted => {
+                    let _ = reply_tx.send(Err(DhtError::Suspended));
+                }
                 Ok(result) => {
                     let _ = reply_tx.send(Ok(result.closest_replies));
                 }
@@ -2102,6 +2240,32 @@ mod tests {
         assert_eq!(REFRESH_TICKS, 60);
         assert_eq!(RECENT_NODE, 12);
         assert_eq!(OLD_NODE, 360);
+    }
+
+    #[tokio::test]
+    async fn isolated_nodes_bootstrap_and_ping() {
+        let runtime = libudx::UdxRuntime::new().expect("runtime");
+        let config = DhtConfig {
+            host: "127.0.0.1".into(),
+            ephemeral: Some(false),
+            firewalled: false,
+            ..DhtConfig::default()
+        };
+        let (first_task, first) = spawn(&runtime, config.clone()).await.expect("first node");
+        let (second_task, second) = spawn(&runtime, config).await.expect("second node");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            first.fully_bootstrapped().await.expect("first bootstrap");
+            second.fully_bootstrapped().await.expect("second bootstrap");
+            let port = first.local_port().await.expect("port");
+            let response = second.ping("127.0.0.1", port).await.expect("ping");
+            assert_eq!(response.id, Some(peer_id("127.0.0.1", port)));
+        })
+        .await
+        .expect("isolated DHT timed out");
+        first.destroy().await.expect("destroy first");
+        second.destroy().await.expect("destroy second");
+        first_task.await.expect("first task").expect("first node");
+        second_task.await.expect("second task").expect("second node");
     }
 
     #[tokio::test]

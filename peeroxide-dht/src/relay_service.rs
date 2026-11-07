@@ -116,7 +116,7 @@ pub fn run_relay_server(
     // `peeroxide::swarm`'s `do_join(server: true)` — without this, nothing
     // ever reaches this module's handshake handler at all).
     let self_target = crate::crypto::hash(&key_pair.public_key);
-    dht.register_server(&self_target);
+    dht.register_server(&key_pair.public_key);
 
     // Self-announce our identity (`hash(public_key)`) to the DHT, matching
     // Node's `Server.listen()` which internally starts an `Announcer` for
@@ -231,7 +231,7 @@ async fn handle_handshake(
     matched_tx: &mpsc::UnboundedSender<MatchedPairing>,
     msg: HandshakeMessage,
     peer_address: Option<crate::messages::Ipv4Peer>,
-    reply_tx: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+    reply_tx: tokio::sync::oneshot::Sender<Option<crate::hyperdht::ServerReply>>,
 ) {
     let noise_kp = NoiseKeypair {
         public_key: key_pair.public_key,
@@ -306,7 +306,7 @@ async fn handle_handshake(
         peer_address: reply_peer_address,
         relay_address: None,
     };
-    let _ = reply_tx.send(encode_handshake_to_bytes(&reply_msg).ok());
+    let _ = reply_tx.send(encode_handshake_to_bytes(&reply_msg).ok().map(Into::into));
 
     let Some(remote_udx) = remote_payload.udx else {
         tracing::debug!("relay: connecting peer advertised no UDX info");

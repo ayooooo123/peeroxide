@@ -195,7 +195,7 @@ async fn run_interop() -> Result<(), Box<dyn std::error::Error>> {
 
     let kp = KeyPair::generate();
     tracing::info!("Rust announcing topic {topic2_hex}");
-    handle.announce(topic2_raw, &kp, &[]).await?;
+    handle.announce_query(topic2_raw, &kp).finished().await?;
     tracing::info!("Rust announce complete");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -204,8 +204,11 @@ async fn run_interop() -> Result<(), Box<dyn std::error::Error>> {
     let js_peers = js.lookup(&topic2_hex);
     tracing::info!("JS lookup returned {} peers", js_peers.len());
 
-    assert!(!js_peers.is_empty(), "JS lookup found no peers after Rust announce");
-    tracing::info!("Test 2 passed: JS found Rust-announced peer");
+    let public_key = to_hex(&kp.public_key);
+    assert!(js_peers.contains(&public_key), "JS lookup missed Rust peer");
+    handle.unannounce(topic2_raw, &kp).await?;
+    let js_peers = js.lookup(&topic2_hex);
+    assert!(!js_peers.contains(&public_key), "JS lookup still found unannounced peer");
 
     // ── Cleanup ───────────────────────────────────────────────────────────
     handle.destroy().await?;

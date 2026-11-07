@@ -126,7 +126,7 @@ The sweep loop is what enforces `pairing_timeout` and `idle_session_timeout` in 
 
 One subtle but important implementation detail is that the relay must do more than call `register_server` locally.
 
-`register_server` only teaches the local DHT router to handle inbound `PEER_HANDSHAKE` requests for `hash(public_key)` if they somehow arrive. It does **not** tell the rest of the network that this relay exists.
+`register_server` teaches the local DHT router to handle inbound `PEER_HANDSHAKE` requests for `hash(public_key)` and makes this node answer `FIND_PEER`/`LOOKUP` for that key with its own record (Node `server.listen()` → `dht._router.set(target, { record })`). It does **not** tell the rest of the network that this relay exists.
 
 Peeroxide therefore self-announces the relay's own identity target, `hash(public_key)`, at startup and on a roughly 10-minute refresh loop. This mirrors Node's `Server.listen()` behavior.
 

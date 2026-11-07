@@ -155,3 +155,30 @@ async fn rust_node_detects_reachable_server_socket() {
     .await
     .expect("test timed out after 30s");
 }
+
+#[tokio::test]
+async fn isolated_js_node_pings_isolated_rust_node() {
+    let runtime = UdxRuntime::new().expect("runtime");
+    let mut config = DhtConfig::default();
+    config.host = "127.0.0.1".into();
+    config.ephemeral = Some(false);
+    config.firewalled = false;
+    let (task, handle) = peeroxide_dht::rpc::spawn(&runtime, config).await.expect("spawn");
+    handle.fully_bootstrapped().await.expect("bootstrap");
+    let port = handle.local_port().await.expect("port");
+    let script = format!("{}/../tests/node/isolated-ping.js", env!("CARGO_MANIFEST_DIR"));
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new("node")
+            .arg(script)
+            .arg(port.to_string())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("JS peer timed out")
+    .expect("start JS peer");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    handle.destroy().await.expect("destroy");
+    task.await.expect("task").expect("node");
+}

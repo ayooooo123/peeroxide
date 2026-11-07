@@ -67,6 +67,9 @@ pub struct QueryResult {
     pub successes: u32,
     /// Number of error / timeout replies.
     pub errors: u32,
+    /// `true` when the query was aborted by a DHT suspend rather than
+    /// completed; the caller should report [`crate::rpc::DhtError::Suspended`].
+    pub aborted: bool,
 }
 
 /// Response data forwarded from the IO layer to the query engine.
@@ -484,6 +487,24 @@ impl Query {
                 closest_replies: self.closest_replies.clone(),
                 successes: self.successes,
                 errors: self.errors,
+                aborted: false,
+            });
+        }
+    }
+
+    /// Finish the query as failed because the DHT was suspended (dht-rpc
+    /// destroys every in-flight request with `IO_SUSPENDED`).
+    pub(crate) fn abort(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(tx) = self.result_tx.take() {
+            let _ = tx.send(QueryResult {
+                closest_replies: Vec::new(),
+                successes: 0,
+                errors: 0,
+                aborted: true,
             });
         }
     }

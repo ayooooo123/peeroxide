@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `DhtHandle::fully_bootstrapped()` waits for initial bootstrap completion.
+- HyperDHT server handles, shared-server routing, and raw-stream allocation and connection.
+- `HyperDhtHandle::mutable_put_signed`: store a mutable record with a caller-supplied signature (Node `mutablePut` with a precomputed `opts.signMutable`), so a guard can forward an endpoint-signed record. `mutable_put` now queries with `seq = 0` like Node; the stored seq is unchanged.
+- `SecretStream::remote_handle` exposes libudx's `UdxStreamRemote` for the connection's UDX stream.
+
+### Changed
+
+- **Breaking:** `HyperDhtHandle::register_server` takes the server's public key instead of its target and also serves the server's own record to `FIND_PEER`/`LOOKUP` (Node `server.listen()` → `dht._router.set(target, { record })`). Previously a node that was itself the closest to its server — or the only DHT node, as a relay in a local testnet is — answered `PEER_NOT_FOUND` for its own key.
+
+### Fixed
+
+- `relay_service` could not pair two firewalled Node.js peers: the relay node did not resolve its own key (above), and the responder-side secret-stream header of a control connection was lost when it was queued before the peer's first packet arrived (libudx fix). The relay interop test now forces the relay path like hyperdht's own `test/relaying.js` and asserts the echo arrived from the relay's socket.
+
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.3...peeroxide-dht-v1.7.4) - 2026-11-02
 
 ### Fixed

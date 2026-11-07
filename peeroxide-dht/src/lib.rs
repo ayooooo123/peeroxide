@@ -48,6 +48,38 @@
 //! # }
 //! ```
 //!
+//! # Accepting connections
+//!
+//! [`hyperdht::spawn`] returns the DHT's server-event stream; hand it to
+//! [`hyperdht::HyperDhtServer`] to accept inbound peers the way Node's
+//! `dht.createServer()` → `server.listen()` → `'connection'` sequence does:
+//!
+//! ```rust,no_run
+//! use libudx::UdxRuntime;
+//! use peeroxide_dht::hyperdht::{
+//!     self, HyperDhtConfig, HyperDhtServer, KeyPair, ServerConfig,
+//! };
+//! use peeroxide_dht::hyperdht_messages::FIREWALL_UNKNOWN;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let runtime = UdxRuntime::new()?;
+//! let (_task, dht, events) = hyperdht::spawn(&runtime, HyperDhtConfig::with_public_bootstrap()).await?;
+//!
+//! let key_pair = KeyPair::generate();
+//! let config = ServerConfig::new(key_pair.clone(), FIREWALL_UNKNOWN);
+//! let mut server = HyperDhtServer::new(dht.clone(), &runtime, config, events);
+//! server.listen(&key_pair).await?;
+//!
+//! let address = server.address().expect("listening");
+//! let _ = (address.public_key, address.port);
+//!
+//! if let Some(peer) = server.accept().await {
+//!     let _ = peer.remote_public_key;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Interoperability
 //!
 //! Every protocol layer is validated against the Node.js reference via

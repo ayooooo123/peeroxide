@@ -22,11 +22,13 @@ use crate::holepuncher::{Holepuncher, HolepunchEvent};
 use crate::hyperdht_messages::{
     decode_hyper_peer_from_bytes,
     decode_lookup_raw_reply_from_bytes, decode_mutable_get_response_from_bytes,
-    encode_announce_to_bytes, encode_hyper_peer_to_bytes,
-    encode_mutable_put_request_to_bytes, AnnounceMessage, HandshakeMessage, HolepunchMessage,
-    HolepunchPayload, HyperPeer, MutablePutRequest, NoisePayload, RelayInfo, RelayThroughInfo,
-    SecretStreamInfo, UdxInfo, ANNOUNCE, ERROR_ABORTED, ERROR_NONE, ERROR_TRY_LATER, FIND_PEER,
-    FIREWALL_OPEN, FIREWALL_UNKNOWN, IMMUTABLE_GET, IMMUTABLE_PUT, LOOKUP, MUTABLE_GET,
+    encode_announce_to_bytes, encode_handshake_to_bytes, encode_hyper_peer_to_bytes,
+    encode_holepunch_msg_to_bytes,
+    encode_mutable_put_request_to_bytes, AnnounceMessage, HandshakeMessage, HolepunchInfo,
+    HolepunchMessage, HolepunchPayload, HyperPeer, MutablePutRequest, NoisePayload, RelayInfo,
+    RelayThroughInfo, SecretStreamInfo, UdxInfo, ANNOUNCE, ERROR_ABORTED, ERROR_NONE,
+    ERROR_TRY_LATER, FIND_PEER, FIREWALL_OPEN, FIREWALL_UNKNOWN, IMMUTABLE_GET, IMMUTABLE_PUT,
+    LOOKUP, MODE_FROM_RELAY, MODE_FROM_SECOND_RELAY, MODE_FROM_SERVER, MODE_REPLY, MUTABLE_GET,
     MUTABLE_PUT, PEER_HANDSHAKE, PEER_HOLEPUNCH, UNANNOUNCE,
 };
 use crate::messages::Ipv4Peer;
@@ -161,11 +163,18 @@ pub enum HyperDhtError {
     /// Error from the relay subsystem.
     #[error("relay error: {0}")]
     Relay(#[from] RelayError),
+    /// [`HyperDhtServer::listen`] was called on an already-listening server.
+    ///
+    /// [`HyperDhtServer::listen`]: HyperDhtServer::listen
+    #[error("already listening")]
+    AlreadyListening,
+    /// The [`HyperDhtServer`] has been closed or its accept task is gone.
+    #[error("server closed")]
+    ServerClosed,
 }
 
 // ── Server events (forwarded to listen() subscribers) ────────────────────────
 
-#[derive(Debug)]
 /// Events forwarded to server-side listeners.
 #[non_exhaustive]
 pub enum ServerEvent {
@@ -191,7 +200,7 @@ pub enum ServerEvent {
         /// Optional DHT target associated with the request.
         target: Option<NodeId>,
         /// Reply channel for the generated response.
-        reply_tx: oneshot::Sender<Option<Vec<u8>>>,
+        reply_tx: oneshot::Sender<Option<ServerReply>>,
     },
     /// A peer holepunch request that may need local server handling.
     PeerHolepunch {
@@ -204,8 +213,25 @@ pub enum ServerEvent {
         /// Optional DHT target associated with the request.
         target: Option<NodeId>,
         /// Reply channel for the generated response.
-        reply_tx: oneshot::Sender<Option<Vec<u8>>>,
+        reply_tx: oneshot::Sender<Option<ServerReply>>,
     },
+}
+
+/// A server's answer to a handshake or holepunch request.
+pub struct ServerReply {
+    /// Encoded handshake or holepunch message.
+    pub value: Vec<u8>,
+    /// Socket to send it from. A server that staged a holepunch answers
+    /// from the puncher socket, as hyperdht does (`{ socket: p.socket }`):
+    /// the relay tags the reply with that socket's address, which is the one
+    /// the client then punches toward. `None` sends from the DHT socket.
+    pub socket: Option<UdxSocket>,
+}
+
+impl From<Vec<u8>> for ServerReply {
+    fn from(value: Vec<u8>) -> Self {
+        Self { value, socket: None }
+    }
 }
 
 // ── KeyPair ───────────────────────────────────────────────────────────────────
@@ -277,6 +303,18 @@ pub struct LookupResult {
 pub struct AnnounceResult {
     /// Closest nodes contacted during the announce.
     pub closest_nodes: Vec<Ipv4Peer>,
+}
+
+/// An in-flight announce, completed with [`AnnounceQuery::finished`].
+pub struct AnnounceQuery {
+    task: JoinHandle<Result<AnnounceResult, HyperDhtError>>,
+}
+
+impl AnnounceQuery {
+    /// Wait for the announce query to finish.
+    pub async fn finished(self) -> Result<AnnounceResult, HyperDhtError> {
+        self.task.await.map_err(|_| HyperDhtError::ChannelClosed)?
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -412,6 +450,25 @@ impl PeerConnection {
             _relay_task: relay_task,
         }
     }
+
+    /// Whether this side dialled the peer (`false` for server-side
+    /// connections). Mirrors Node's `stream.isInitiator`.
+    pub fn is_initiator(&self) -> bool {
+        self.stream.is_initiator()
+    }
+
+    /// Connect a raw UDX stream over the same socket and peer address as this connection.
+    pub async fn connect_raw_stream(
+        &self,
+        stream: &libudx::UdxStream,
+        remote_id: u32,
+    ) -> Result<(), HyperDhtError> {
+        let addr = self.remote_addr.ok_or_else(|| {
+            HyperDhtError::StreamEstablishment("connection has no known remote address".into())
+        })?;
+        stream.connect(&self.socket, remote_id, addr).await?;
+        Ok(())
+    }
 }
 
 impl fmt::Debug for PeerConnection {
@@ -507,6 +564,129 @@ impl HyperDhtConfig {
 
 enum AdminRequest {
     PersistentStats { reply: oneshot::Sender<PersistentStats> },
+    /// Record FIND_PEER/LOOKUP serve for a local listener (`None` forgets it).
+    LocalRecord { target: [u8; 32], record: Option<Vec<u8>> },
+}
+
+// ── Raw streams (Node `HyperDHT#createRawStream`) ────────────────────────────
+
+/// Firewall callback for a raw stream, Node
+/// `createRawStream({ firewall(socket, port, host) })`.
+///
+/// Returning `true` rejects the packet; `false` accepts the source and
+/// connects the stream to it.
+pub type RawStreamFirewall =
+    Box<dyn FnMut(&UdxSocket, u16, std::net::IpAddr) -> bool + Send>;
+
+/// Options for [`HyperDhtHandle::create_raw_stream`].
+///
+/// Node's `framed: true` has no Rust equivalent — [`RawStream`] exposes the
+/// byte stream directly.
+#[non_exhaustive]
+pub struct RawStreamOptions {
+    /// Called for each packet that arrives before the stream is connected,
+    /// and afterwards for packets arriving on another socket than the
+    /// stream's (C `on_firewall`; hyperdht spots relay traffic this way).
+    pub firewall: Option<RawStreamFirewall>,
+}
+
+impl RawStreamOptions {
+    /// Options without a firewall hook.
+    pub fn new() -> Self {
+        Self { firewall: None }
+    }
+
+    /// Add the pre-connect firewall hook (Node `createRawStream({ firewall })`).
+    pub fn with_firewall<F>(mut self, firewall: F) -> Self
+    where
+        F: FnMut(&UdxSocket, u16, std::net::IpAddr) -> bool + Send + 'static,
+    {
+        self.firewall = Some(Box::new(firewall));
+        self
+    }
+}
+
+impl Default for RawStreamOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A raw UDX stream owned by the DHT, Node `dht.createRawStream()`.
+///
+/// The DHT keeps an abort handle for every raw stream it creates, so
+/// [`HyperDhtHandle::suspend`] and [`HyperDhtHandle::destroy`] close them
+/// (Node `rawStreams.clear()`), exactly as hyperdht does.
+pub struct RawStream {
+    id: u32,
+    stream: libudx::UdxStream,
+}
+
+impl RawStream {
+    /// The local UDX stream id (`rawStream.id`).
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// The underlying UDX stream.
+    pub fn stream(&self) -> &libudx::UdxStream {
+        &self.stream
+    }
+
+    /// Read the next chunk, or `None` once the stream is closed.
+    pub async fn read(&mut self) -> Result<Option<Vec<u8>>, HyperDhtError> {
+        Ok(self.stream.read().await?)
+    }
+
+    /// Write bytes, resolving once the peer ACKs them.
+    pub async fn write(&self, data: &[u8]) -> Result<(), HyperDhtError> {
+        Ok(self.stream.write(data).await?)
+    }
+
+    /// Forward every packet received on this stream to `destination`
+    /// (`rawStream.relayTo(other)`).
+    pub fn relay_to(&self, destination: &RawStream) -> Result<(), HyperDhtError> {
+        Ok(self.stream.relay_to(&destination.stream)?)
+    }
+
+    /// Connect this stream over `socket` (`rawStream.connect(socket, id, port, host)`).
+    ///
+    /// On a stream primed with a firewall hook this arms the identity the
+    /// stream will use once a packet is accepted, or fixes the peer id of a
+    /// stream the hook already committed. Use [`change_remote`](Self::change_remote)
+    /// to move a connected stream.
+    pub async fn connect(
+        &self,
+        socket: &UdxSocket,
+        remote_id: u32,
+        addr: std::net::SocketAddr,
+    ) -> Result<(), HyperDhtError> {
+        Ok(self.stream.connect(socket, remote_id, addr).await?)
+    }
+
+    /// Move the connected stream to another peer and socket
+    /// (`rawStream.changeRemote(socket, id, port, host)`); resolves once
+    /// everything sent before the change is ACKed.
+    pub async fn change_remote(
+        &self,
+        socket: &UdxSocket,
+        remote_id: u32,
+        addr: std::net::SocketAddr,
+    ) -> Result<(), HyperDhtError> {
+        Ok(self.stream.remote_handle().change_remote(socket, remote_id, addr).await?)
+    }
+
+    /// Take the id and underlying stream, leaving the DHT in charge of the
+    /// stream's lifetime (abort on suspend/destroy still applies).
+    pub fn into_stream(self) -> (u32, libudx::UdxStream) {
+        (self.id, self.stream)
+    }
+}
+
+impl fmt::Debug for RawStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawStream").field("id", &self.id).finish_non_exhaustive()
+    }
 }
 
 // ── HyperDhtHandle ────────────────────────────────────────────────────────────
@@ -517,8 +697,12 @@ pub struct HyperDhtHandle {
     dht: DhtHandle,
     router: Arc<Mutex<Router>>,
     server_tx: mpsc::UnboundedSender<ServerEvent>,
+    server_routes: Arc<Mutex<std::collections::HashMap<[u8; 32], mpsc::UnboundedSender<ServerEvent>>>>,
     admin_tx: mpsc::UnboundedSender<AdminRequest>,
     current_relays: Arc<Mutex<Vec<RelayInfo>>>,
+    /// Abort handles for every raw stream this DHT created
+    /// (Node `HyperDHT#rawStreams`).
+    raw_streams: Arc<Mutex<Vec<libudx::UdxStreamAbort>>>,
 }
 
 impl HyperDhtHandle {
@@ -575,6 +759,15 @@ impl HyperDhtHandle {
     }
 
     // ── ANNOUNCE ─────────────────────────────────────────────────────────────
+
+    /// Start an announce with no explicit relay addresses.
+    pub fn announce_query(&self, target: [u8; 32], key_pair: &KeyPair) -> AnnounceQuery {
+        let dht = self.clone();
+        let key_pair = key_pair.clone();
+        AnnounceQuery {
+            task: tokio::spawn(async move { dht.announce(target, &key_pair, &[]).await }),
+        }
+    }
 
     /// Announce this peer under the given target.
     pub async fn announce(
@@ -894,19 +1087,37 @@ impl HyperDhtHandle {
         value: &[u8],
         seq: u64,
     ) -> Result<MutablePutResult, HyperDhtError> {
-        let target = hash(&key_pair.public_key);
         let signable = mutable_signable(&NS_MUTABLE_PUT, seq, value);
         let signature = sign_detached(&signable, &key_pair.secret_key);
+        self.mutable_put_signed(&key_pair.public_key, value, seq, signature)
+            .await
+    }
+
+    /// Store a mutable record whose signature was produced elsewhere, such
+    /// as a guard forwarding an endpoint-signed record (Node `mutablePut`
+    /// with `opts.signMutable` returning the precomputed signature; only
+    /// `keyPair.publicKey` is used). The signature must be over
+    /// `mutable_signable(NS_MUTABLE_PUT, seq, value)`; storing nodes verify
+    /// it against `public_key`.
+    pub async fn mutable_put_signed(
+        &self,
+        public_key: &[u8; 32],
+        value: &[u8],
+        seq: u64,
+        signature: [u8; 64],
+    ) -> Result<MutablePutResult, HyperDhtError> {
+        let target = hash(public_key);
 
         let put = MutablePutRequest {
-            public_key: key_pair.public_key,
+            public_key: *public_key,
             seq,
             value: value.to_vec(),
             signature,
         };
         let put_bytes = encode_mutable_put_request_to_bytes(&put)?;
 
-        let seq_bytes = encode_compact_uint(seq);
+        // Node queries with seq 0: the lookup only collects tokens.
+        let seq_bytes = encode_compact_uint(0);
 
         let replies = self
             .dht
@@ -951,7 +1162,7 @@ impl HyperDhtHandle {
         }
 
         Ok(MutablePutResult {
-            public_key: key_pair.public_key,
+            public_key: *public_key,
             closest_nodes,
             seq,
             signature,
@@ -1007,9 +1218,89 @@ impl HyperDhtHandle {
         self.dht.bootstrapped().await.map_err(HyperDhtError::Dht)
     }
 
+    /// Wait until the initial bootstrap query has completed.
+    pub async fn fully_bootstrapped(&self) -> Result<(), HyperDhtError> {
+        self.dht.fully_bootstrapped().await.map_err(HyperDhtError::Dht)
+    }
+
+    /// Create a raw UDX stream owned by this DHT (Node
+    /// `dht.createRawStream({ framed, firewall })`).
+    ///
+    /// With a firewall hook the stream listens on the DHT's primary socket and
+    /// hands every packet that arrives before it is connected to the hook;
+    /// [`RawStream::connect`] or [`Self::connect_raw_stream`] then fixes the
+    /// peer. The DHT keeps the stream in its raw-stream set, so `suspend` and
+    /// `destroy` close it.
+    pub async fn create_raw_stream(
+        &self,
+        runtime: &UdxRuntime,
+        options: RawStreamOptions,
+    ) -> Result<RawStream, HyperDhtError> {
+        let id = alloc_stream_id();
+        let stream = runtime.create_stream(id).await?;
+        if let Some(firewall) = options.firewall {
+            let socket = self
+                .dht
+                .server_socket()
+                .await?
+                .ok_or(HyperDhtError::ChannelClosed)?;
+            // The remote id is not known until the stream is connected; the
+            // socket demux routes by this stream's local id.
+            stream.set_firewall_hook(&socket, 0, firewall)?;
+        }
+        if let Ok(mut streams) = self.raw_streams.lock() {
+            streams.push(stream.abort_handle());
+        }
+        Ok(RawStream { id, stream })
+    }
+
+    /// Connect `raw` over an established encrypted connection (Node
+    /// `HyperDHT.connectRawStream(encryptedStream, rawStream, remoteId)`).
+    ///
+    /// The raw stream reuses the connection's socket and remote address, as
+    /// `private-overlay` does when it opens a data circuit beside its control
+    /// connection.
+    pub async fn connect_raw_stream(
+        &self,
+        connection: &PeerConnection,
+        raw: &RawStream,
+        remote_id: u32,
+    ) -> Result<(), HyperDhtError> {
+        connection.connect_raw_stream(raw.stream(), remote_id).await
+    }
+
+    /// Suspend the node (Node `HyperDHT#suspend()`): close both sockets, fail
+    /// every in-flight query, drop raw streams and stop ticking.
+    ///
+    /// Listening servers keep their routing-table targets, but no packet can
+    /// be sent or received until [`Self::resume`].
+    pub async fn suspend(&self) -> Result<(), HyperDhtError> {
+        // Node clears the raw-stream set before and after suspending dht-rpc.
+        self.clear_raw_streams();
+        let result = self.dht.suspend().await.map_err(HyperDhtError::Dht);
+        self.clear_raw_streams();
+        result
+    }
+
+    /// Resume a suspended node (Node `HyperDHT#resume()`): rebind the sockets
+    /// on their previous ports and refresh the routing table.
+    pub async fn resume(&self) -> Result<(), HyperDhtError> {
+        self.dht.resume().await.map_err(HyperDhtError::Dht)
+    }
+
     /// Destroy the underlying DHT instance.
     pub async fn destroy(&self) -> Result<(), HyperDhtError> {
+        self.clear_raw_streams();
         self.dht.destroy().await.map_err(HyperDhtError::Dht)
+    }
+
+    /// Close every raw stream this DHT created (Node `rawStreams.clear()`).
+    fn clear_raw_streams(&self) {
+        if let Ok(mut streams) = self.raw_streams.lock() {
+            for handle in std::mem::take(&mut *streams) {
+                handle.abort();
+            }
+        }
     }
 
     /// Returns the number of nodes in the routing table.
@@ -1054,7 +1345,16 @@ impl HyperDhtHandle {
         if let Ok(Some(remote)) = self.remote_address().await {
             out.push(remote);
         }
-        out.extend(crate::holepuncher::Holepuncher::local_addresses(port));
+        let bound = match self.server_socket().await {
+            Ok(Some(socket)) => socket.local_addr().await.ok(),
+            _ => None,
+        };
+        match bound.map(|addr| addr.ip()) {
+            Some(std::net::IpAddr::V4(ip)) if !ip.is_unspecified() => {
+                out.push(Ipv4Peer { host: ip.to_string(), port });
+            }
+            _ => out.extend(crate::holepuncher::Holepuncher::local_addresses(port)),
+        }
         out
     }
 
@@ -1120,11 +1420,15 @@ impl HyperDhtHandle {
         rx.await.map_err(|_| HyperDhtError::Destroyed)
     }
 
-    /// Mark a target as having a local server available.
-    pub fn register_server(&self, target: &[u8; 32]) {
+    /// Mark `hash(public_key)` as served by a local server: inbound
+    /// `PEER_HANDSHAKE` for it is handled here, and FIND_PEER/LOOKUP answer
+    /// with our own record even when no other node stored our announce
+    /// (Node `server.listen()` → `dht._router.set(target, { record })`).
+    pub fn register_server(&self, public_key: &[u8; 32]) {
+        let target = hash(public_key);
         if let Ok(mut router) = self.router.lock() {
             router.set(
-                target,
+                &target,
                 ForwardEntry {
                     relay: None,
                     has_server: true,
@@ -1132,13 +1436,20 @@ impl HyperDhtHandle {
                 },
             );
         }
+        let record = encode_hyper_peer_to_bytes(&HyperPeer {
+            public_key: *public_key,
+            relay_addresses: Vec::new(),
+        })
+        .ok();
+        let _ = self.admin_tx.send(AdminRequest::LocalRecord { target, record });
     }
 
-    /// Remove the local-server marker for a target.
+    /// Remove the local-server marker and record for a target.
     pub fn unregister_server(&self, target: &[u8; 32]) {
         if let Ok(mut router) = self.router.lock() {
             router.delete(target);
         }
+        let _ = self.admin_tx.send(AdminRequest::LocalRecord { target: *target, record: None });
     }
 
     /// Access the server event sender.
@@ -2185,6 +2496,935 @@ pub async fn establish_stream_with_socket(
     })
 }
 
+// ── Server handle (Node `HyperDHT#createServer`) ─────────────────────────────
+
+/// Dial-able address of a listening [`HyperDhtServer`].
+///
+/// Returned by [`HyperDhtServer::address`], matching Node `server.address()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ServerAddress {
+    /// Server identity public key.
+    pub public_key: [u8; 32],
+    /// Host of the socket peers dial. This is the DHT bind host, so it can be
+    /// `0.0.0.0` when the node is bound wildcard.
+    pub host: String,
+    /// Port of the socket peers dial.
+    ///
+    /// The socket carrying inbound `PEER_HANDSHAKE` requests — the DHT server
+    /// socket when the node accepts unsolicited traffic, the ephemeral client
+    /// socket when it runs firewalled.
+    pub port: u16,
+}
+
+enum ServerCommand {
+    Listen {
+        key_pair: KeyPair,
+        reply: oneshot::Sender<()>,
+    },
+    Suspend(oneshot::Sender<()>),
+    Resume(oneshot::Sender<()>),
+    Close(oneshot::Sender<()>),
+}
+
+/// A node that accepts peer connections for a single key pair.
+///
+/// Mirrors Node `HyperDHT#createServer()` → `Server`. Build it from a
+/// [`HyperDhtHandle`] plus the DHT's server-event stream, then:
+///
+/// 1. [`listen`](Self::listen) registers `hash(public_key)` in the router so
+///    inbound `PEER_HANDSHAKE` requests reach this server
+///    (Node `server.listen(keyPair)`).
+/// 2. [`accept`](Self::accept) yields established [`PeerConnection`]s — the
+///    Rust equivalent of Node's `'connection'` event.
+/// 3. [`suspend`](Self::suspend) / [`resume`](Self::resume) gate handshakes
+///    without tearing down the DHT (Node parity).
+/// 4. [`close`](Self::close) stops listening and unregisters the target.
+///
+/// Dropping the server without [`close`](Self::close) has the same effect on
+/// the router; the accept task is aborted.
+pub struct HyperDhtServer {
+    dht: HyperDhtHandle,
+    commands: mpsc::UnboundedSender<ServerCommand>,
+    connections: mpsc::UnboundedReceiver<PeerConnection>,
+    target: Option<[u8; 32]>,
+    key_pair: Option<KeyPair>,
+    address: Option<ServerAddress>,
+    task: Option<JoinHandle<()>>,
+    announce_task: Option<JoinHandle<()>>,
+    suspended: bool,
+    route_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+}
+
+impl HyperDhtServer {
+    /// Create a server on `dht` and take ownership of its server-event stream.
+    ///
+    /// `events` is the receiver returned by [`spawn`]. Every server on one DHT
+    /// shares that single stream: this server answers only the events whose
+    /// target is its own `hash(public_key)` and rejects the rest, so one DHT
+    /// can drive several servers only by fanning the events out itself.
+    ///
+    /// `config.firewall` is the fallback advertised firewall classification,
+    /// used when the DHT cannot report its own (see [`listen`](Self::listen),
+    /// which supplies the real key pair).
+    pub fn new(
+        dht: HyperDhtHandle,
+        runtime: &UdxRuntime,
+        config: ServerConfig,
+        events: mpsc::UnboundedReceiver<ServerEvent>,
+    ) -> Self {
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (connection_tx, connections) = mpsc::unbounded_channel();
+
+        let task = tokio::spawn(run_hyperdht_server(
+            dht.clone(),
+            UdxRuntime::shared(runtime.handle()),
+            config,
+            events,
+            command_rx,
+            connection_tx,
+        ));
+
+        Self {
+            dht,
+            commands,
+            connections,
+            target: None,
+            key_pair: None,
+            address: None,
+            task: Some(task),
+            announce_task: None,
+            suspended: false,
+            route_sender: None,
+        }
+    }
+
+    /// Whether the server is listening (Node `server.listening`).
+    pub fn listening(&self) -> bool {
+        self.key_pair.is_some()
+    }
+
+    /// The listening identity's public key, or `None` before `listen`.
+    pub fn public_key(&self) -> Option<[u8; 32]> {
+        self.key_pair.as_ref().map(|kp| kp.public_key)
+    }
+
+    /// The router target this server answers for (`hash(public_key)`).
+    pub fn target(&self) -> Option<[u8; 32]> {
+        self.target
+    }
+
+    /// The dial-able address, or `None` before `listen` and after `close`
+    /// (Node `server.address()`).
+    pub fn address(&self) -> Option<ServerAddress> {
+        self.address.clone()
+    }
+
+    /// Start accepting connections for `key_pair` (Node `server.listen()`).
+    pub async fn listen(&mut self, key_pair: &KeyPair) -> Result<(), HyperDhtError> {
+        if self.key_pair.is_some() {
+            return Err(HyperDhtError::AlreadyListening);
+        }
+
+        // Peers dial the socket our handshake replies leave from, so report
+        // that one rather than the (possibly unused) bound server port.
+        let socket = self
+            .dht
+            .server_socket()
+            .await?
+            .ok_or(HyperDhtError::ChannelClosed)?;
+        let local = socket.local_addr().await?;
+
+        let (reply, reply_rx) = oneshot::channel();
+        self.commands
+            .send(ServerCommand::Listen {
+                key_pair: key_pair.clone(),
+                reply,
+            })
+            .map_err(|_| HyperDhtError::ServerClosed)?;
+        reply_rx.await.map_err(|_| HyperDhtError::ServerClosed)?;
+
+        let target = hash(&key_pair.public_key);
+        if let Some(sender) = &self.route_sender {
+            let mut routes = self.dht.server_routes.lock().map_err(|_| HyperDhtError::ChannelClosed)?;
+            if routes.contains_key(&target) {
+                return Err(HyperDhtError::AlreadyListening);
+            }
+            routes.insert(target, sender.clone());
+        }
+        self.dht.register_server(&key_pair.public_key);
+        self.target = Some(target);
+        self.key_pair = Some(key_pair.clone());
+        self.address = Some(ServerAddress {
+            public_key: key_pair.public_key,
+            host: local.ip().to_string(),
+            port: local.port(),
+        });
+        if !self.suspended {
+            self.start_announcing().await;
+        }
+        Ok(())
+    }
+
+    /// Wait for the next established connection (Node `'connection'` event).
+    ///
+    /// Returns `None` once the server is closed or the DHT has shut down.
+    pub async fn accept(&mut self) -> Option<PeerConnection> {
+        self.connections.recv().await
+    }
+
+    /// Stop accepting and unannounce this server.
+    pub async fn suspend(&mut self) -> Result<(), HyperDhtError> {
+        if self.suspended {
+            return Ok(());
+        }
+        self.suspended = true;
+        let (reply, reply_rx) = oneshot::channel();
+        self.commands
+            .send(ServerCommand::Suspend(reply))
+            .map_err(|_| HyperDhtError::ServerClosed)?;
+        reply_rx.await.map_err(|_| HyperDhtError::ServerClosed)?;
+        self.stop_announcing().await;
+        Ok(())
+    }
+
+    /// Resume answering handshakes (Node `server.resume()`).
+    pub async fn resume(&mut self) -> Result<(), HyperDhtError> {
+        if !self.suspended {
+            return Ok(());
+        }
+        let (reply, reply_rx) = oneshot::channel();
+        self.commands
+            .send(ServerCommand::Resume(reply))
+            .map_err(|_| HyperDhtError::ServerClosed)?;
+        reply_rx.await.map_err(|_| HyperDhtError::ServerClosed)?;
+        self.suspended = false;
+        self.start_announcing().await;
+        Ok(())
+    }
+
+    /// Stop listening: unregister the target, end the accept task, and release
+    /// buffered connections after they are drained (Node `server.close()`).
+    ///
+    /// Idempotent — closing an already-closed server is a no-op.
+    pub async fn close(&mut self) {
+        self.stop_announcing().await;
+        self.stop_routing();
+
+        if let Some(task) = self.task.take() {
+            let (reply, reply_rx) = oneshot::channel();
+            if self.commands.send(ServerCommand::Close(reply)).is_ok() {
+                // The loop breaks after acknowledging; the abort is a safety
+                // net for a loop stuck in a DHT round-trip.
+                let _ = reply_rx.await;
+            }
+            task.abort();
+        }
+        self.connections.close();
+    }
+
+    async fn start_announcing(&mut self) {
+        let (Some(target), Some(key_pair)) = (self.target, self.key_pair.clone()) else {
+            return;
+        };
+        let dht = self.dht.clone();
+        let first = dht.announce(target, &key_pair, &[]).await;
+        let empty = first.as_ref().map_or(true, |result| result.closest_nodes.is_empty());
+        // HyperDHT must refresh server records before they expire.
+        self.announce_task = Some(tokio::spawn(async move {
+            let mut empty = empty;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(if empty { 3 } else { 300 })).await;
+                empty = dht.announce(target, &key_pair, &[]).await
+                    .map_or(true, |result| result.closest_nodes.is_empty());
+            }
+        }));
+    }
+
+    async fn stop_announcing(&mut self) {
+        if let Some(task) = self.announce_task.take() {
+            task.abort();
+            let _ = task.await;
+            if let (Some(target), Some(key_pair)) = (self.target, &self.key_pair) {
+                let _ = self.dht.unannounce(target, key_pair).await;
+            }
+        }
+    }
+
+    /// Forget the listening identity and stop routing handshakes to it.
+    fn stop_routing(&mut self) {
+        if let Some(target) = self.target.take() {
+            if self.route_sender.is_some() {
+                if let Ok(mut routes) = self.dht.server_routes.lock() {
+                    routes.remove(&target);
+                }
+            }
+            self.dht.unregister_server(&target);
+        }
+        self.key_pair = None;
+        self.address = None;
+    }
+}
+
+impl Drop for HyperDhtServer {
+    fn drop(&mut self) {
+        if let Some(task) = self.announce_task.take() {
+            task.abort();
+        }
+        self.stop_routing();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl HyperDhtHandle {
+    /// Create a [`HyperDhtServer`] on this node (Node
+    /// `HyperDHT#createServer()`).
+    ///
+    /// `events` is the server-event receiver returned by [`spawn`]; the DHT
+    /// only has one, so the first server to claim it sees every handshake.
+    pub fn create_server(
+        &self,
+        runtime: &UdxRuntime,
+        config: ServerConfig,
+        events: mpsc::UnboundedReceiver<ServerEvent>,
+    ) -> HyperDhtServer {
+        HyperDhtServer::new(self.clone(), runtime, config, events)
+    }
+
+    /// Create a server sharing this DHT with other servers.
+    pub fn create_shared_server(&self, runtime: &UdxRuntime, config: ServerConfig) -> HyperDhtServer {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut server = HyperDhtServer::new(self.clone(), runtime, config, receiver);
+        server.route_sender = Some(sender);
+        server
+    }
+}
+
+/// One accepted handshake waiting for its passive holepunch to land.
+///
+/// Mirrors Node `lib/server.js::_addHandshake`'s `hs`: the puncher, the
+/// SecurePayload and the listening UDX stream all persist across
+/// PEER_HOLEPUNCH rounds so the same socket and NAT mapping keep probing.
+struct ServerPassivePunch {
+    remote_pk: [u8; 32],
+    payload: SecurePayload,
+    /// Moved into the probe task on the first round that asks us to punch.
+    puncher: Option<Holepuncher>,
+    /// The puncher's primary socket, kept after `puncher` is moved out.
+    socket: UdxSocket,
+    /// Socket our handshake and holepunch replies leave from: the puncher
+    /// socket when the client is on another host, so the relay tags our
+    /// replies with the address the client must punch (Node
+    /// `replyFromPuncher`); `None` (the DHT socket) for a same-host client,
+    /// whose LAN shortcut dials the DHT socket we advertised.
+    reply_socket: Option<UdxSocket>,
+    stream: libudx::UdxStream,
+    noise_result: NoiseWrapResult,
+    round: u64,
+    addresses: Vec<Ipv4Peer>,
+    abort: tokio::task::JoinHandle<()>,
+}
+
+enum ServerPunchEvent {
+    /// The firewall hook accepted a packet: the punch landed at `addr` on
+    /// `socket` (the puncher socket, or the DHT socket when the client took
+    /// hyperdht's LAN shortcut or dialled us directly).
+    Punched { id: u64, addr: std::net::SocketAddr, socket: UdxSocket },
+    /// The 10 s handshake window elapsed.
+    Abort { id: u64 },
+}
+
+/// Stage the passive side of a holepunch for one accepted handshake
+/// (Node `setupHolepuncher` plus the listening `rawStream` on the puncher's
+/// socket).
+#[allow(clippy::too_many_arguments)]
+async fn stage_server_punch(
+    runtime: &UdxRuntime,
+    dht: &DhtHandle,
+    dht_socket: Option<&UdxSocket>,
+    noise_result: &NoiseWrapResult,
+    client_host: &str,
+    remote_firewall: u64,
+    id: u64,
+    local_stream_id: u32,
+    remote_id: u32,
+    events: &mpsc::UnboundedSender<ServerPunchEvent>,
+) -> Result<ServerPassivePunch, HyperDhtError> {
+    let pool = SocketPool::new("0.0.0.0".into());
+    // The passive side's punch-landed signal is the firewall hook below, not
+    // the puncher's Connected event.
+    let (hp_tx, _hp_rx) = mpsc::unbounded_channel::<HolepunchEvent>();
+    let mut puncher =
+        Holepuncher::new(&pool, runtime, true, false, remote_firewall, hp_tx)
+            .await
+            .map_err(|e| {
+                HyperDhtError::StreamEstablishment(format!("puncher setup: {e}"))
+            })?;
+    // Seeds the NAT classifier from this socket before `punch()` can run.
+    puncher.auto_sample(dht).await;
+
+    let socket = puncher
+        .primary_socket()
+        .ok_or_else(|| HyperDhtError::StreamEstablishment("puncher has no primary socket".into()))?
+        .socket
+        .clone();
+    let puncher_port = socket
+        .local_addr()
+        .await
+        .map_err(|e| HyperDhtError::StreamEstablishment(format!("puncher local_addr: {e}")))?
+        .port();
+
+    let stream = runtime.create_stream(local_stream_id).await?;
+    let punched = events.clone();
+    stream.set_firewall_hook(&socket, remote_id, move |socket, port, ip| {
+        let _ = punched.send(ServerPunchEvent::Punched {
+            id,
+            addr: std::net::SocketAddr::new(ip, port),
+            socket: socket.clone(),
+        });
+        true
+    })?;
+    // The client may skip the punch and dial the address we advertised (the
+    // DHT socket): hyperdht's same-host LAN shortcut, or a client told we
+    // are open. Node's raw stream hears every socket of its UDX instance.
+    if let Some(dht_socket) = dht_socket {
+        stream.listen_on(dht_socket)?;
+    }
+
+    let timed_out = events.clone();
+    let abort = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let _ = timed_out.send(ServerPunchEvent::Abort { id });
+    });
+
+    // Advertise the puncher's reachable addresses (Node
+    // `holepuncher.js:221-227`), seeded before `punch()` can move the puncher.
+    let addresses = puncher.punch_addresses(puncher_port);
+    let same_host = addresses.iter().any(|a| a.host == client_host);
+
+    Ok(ServerPassivePunch {
+        remote_pk: noise_result.remote_public_key,
+        payload: SecurePayload::new(noise_result.holepunch_secret),
+        puncher: Some(puncher),
+        reply_socket: (!same_host).then(|| socket.clone()),
+        socket,
+        stream,
+        noise_result: noise_result.clone(),
+        round: 0,
+        addresses,
+        abort,
+    })
+}
+
+/// Answer one PEER_HOLEPUNCH round for a staged handshake
+/// (Node `Server#_onpeerholepunch`).
+async fn server_punch_round(
+    runtime: &UdxRuntime,
+    state: &mut ServerPassivePunch,
+    msg: &HolepunchMessage,
+    peer_address: &Ipv4Peer,
+    server_firewall: u64,
+) -> Option<ServerReply> {
+    let remote_hp = state.payload.decrypt(&msg.payload).ok()?;
+
+    if let Some(puncher) = state.puncher.as_mut() {
+        let addrs = remote_hp.addresses.clone().unwrap_or_default();
+        puncher.update_remote(
+            remote_hp.punching,
+            remote_hp.firewall,
+            &addrs,
+            Some(peer_address.host.as_str()),
+        );
+        state.addresses = puncher.punch_addresses(
+            state
+                .socket
+                .local_addr()
+                .await
+                .ok()
+                .map(|a| a.port())
+                .unwrap_or(0),
+        );
+    }
+
+    if remote_hp.round > state.round {
+        state.round = remote_hp.round;
+    }
+
+    // `punch()` owns the puncher for the rest of the exchange; later rounds
+    // only rebuild the reply, as Node does once its probe loop is running.
+    if remote_hp.punching && state.puncher.is_some() {
+        if let Some(mut puncher) = state.puncher.take() {
+            let runtime = UdxRuntime::shared(runtime.handle());
+            tokio::spawn(async move {
+                let pool = SocketPool::new("0.0.0.0".into());
+                puncher.punch(&pool, &runtime).await;
+            });
+        }
+    }
+
+    let reply = HolepunchPayload {
+        error: 0,
+        firewall: server_firewall,
+        round: remote_hp.round,
+        connected: false,
+        punching: remote_hp.punching,
+        addresses: Some(state.addresses.clone()),
+        remote_address: Some(peer_address.clone()),
+        token: Some(state.payload.token(&peer_address.host)),
+        remote_token: remote_hp.token,
+    };
+    let encrypted = state.payload.encrypt(&reply).ok()?;
+    let reply_mode = match msg.mode {
+        MODE_FROM_RELAY | MODE_FROM_SECOND_RELAY => MODE_FROM_SERVER,
+        _ => MODE_REPLY,
+    };
+    let value = encode_holepunch_msg_to_bytes(&HolepunchMessage {
+        mode: reply_mode,
+        id: msg.id,
+        payload: encrypted,
+        peer_address: Some(peer_address.clone()),
+    })
+    .ok()?;
+    Some(ServerReply { value, socket: state.reply_socket.clone() })
+}
+
+/// Accept loop behind [`HyperDhtServer`].
+///
+/// Owns the DHT's server-event stream, so it also answers holepunches for the
+/// listening key pair; established connections go to the server's `accept()`.
+async fn run_hyperdht_server(
+    dht: HyperDhtHandle,
+    runtime: UdxRuntime,
+    mut config: ServerConfig,
+    mut events: mpsc::UnboundedReceiver<ServerEvent>,
+    mut commands: mpsc::UnboundedReceiver<ServerCommand>,
+    connection_tx: mpsc::UnboundedSender<PeerConnection>,
+) {
+    /// Node `server._connects`: one handshake reaches us through several
+    /// relays; every copy gets the reply (and stream id) of the first.
+    const HANDSHAKE_CLEAR_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    let mut replies: std::collections::HashMap<Vec<u8>, (Vec<u8>, Option<UdxSocket>, std::time::Instant)> =
+        std::collections::HashMap::new();
+    let mut punches: std::collections::HashMap<u64, ServerPassivePunch> =
+        std::collections::HashMap::new();
+    let (punch_tx, mut punch_rx) = mpsc::unbounded_channel::<ServerPunchEvent>();
+    let mut target: Option<[u8; 32]> = None;
+    let mut suspended = false;
+    let mut next_holepunch_id: u64 = 0;
+    let mut accepts = tokio::task::JoinSet::new();
+
+    loop {
+        tokio::select! {
+            command = commands.recv() => match command {
+                Some(ServerCommand::Listen { key_pair, reply }) => {
+                    target = Some(hash(&key_pair.public_key));
+                    config.key_pair = key_pair;
+                    let _ = reply.send(());
+                }
+                Some(ServerCommand::Suspend(reply)) => {
+                    suspended = true;
+                    accepts.abort_all();
+                    while accepts.join_next().await.is_some() {}
+                    for (_, mut punch) in punches.drain() {
+                        punch.abort.abort();
+                        if let Some(mut puncher) = punch.puncher.take() {
+                            puncher.destroy();
+                        }
+                    }
+                    let _ = reply.send(());
+                }
+                Some(ServerCommand::Resume(reply)) => {
+                    suspended = false;
+                    let _ = reply.send(());
+                }
+                Some(ServerCommand::Close(reply)) => {
+                    let _ = reply.send(());
+                    break;
+                }
+                None => break,
+            },
+            event = events.recv() => match event {
+                Some(ServerEvent::PeerHandshake {
+                    msg,
+                    from,
+                    peer_address,
+                    target: event_target,
+                    reply_tx,
+                }) => {
+                    replies.retain(|_, (_, _, at)| at.elapsed() < HANDSHAKE_CLEAR_WAIT);
+                    let reply = if suspended || target.is_none() || event_target != target {
+                        None
+                    } else if let Some((noise, socket, _)) = replies.get(&msg.noise) {
+                        Some((noise.clone(), socket.clone()))
+                    } else {
+                        let reply = accept_server_handshake(
+                            &dht,
+                            &runtime,
+                            &config,
+                            &mut punches,
+                            &punch_tx,
+                            &mut next_holepunch_id,
+                            &connection_tx,
+                            &mut accepts,
+                            &msg,
+                            &from,
+                            peer_address.as_ref(),
+                        )
+                        .await;
+                        if let Some((noise, socket)) = &reply {
+                            replies.insert(
+                                msg.noise.clone(),
+                                (noise.clone(), socket.clone(), std::time::Instant::now()),
+                            );
+                        }
+                        reply
+                    };
+                    let reply = reply.and_then(|(noise, socket)| {
+                        let value = encode_server_handshake_reply(msg.mode, peer_address, noise)?;
+                        Some(ServerReply { value, socket })
+                    });
+                    let _ = reply_tx.send(reply);
+                }
+                Some(ServerEvent::PeerHolepunch {
+                    msg,
+                    peer_address,
+                    target: event_target,
+                    reply_tx,
+                    ..
+                }) => {
+                    let reply = if suspended || event_target != target {
+                        None
+                    } else {
+                        let firewall = dht.firewalled().await.unwrap_or(config.firewall);
+                        match punches.get_mut(&msg.id) {
+                            Some(state) => {
+                                server_punch_round(
+                                    &runtime,
+                                    state,
+                                    &msg,
+                                    &peer_address,
+                                    firewall,
+                                )
+                                .await
+                            }
+                            None => None,
+                        }
+                    };
+                    let _ = reply_tx.send(reply);
+                }
+                None => break,
+            },
+            Some(event) = punch_rx.recv() => match event {
+                ServerPunchEvent::Punched { id, addr, socket } => {
+                    let Some(punch) = punches.remove(&id) else { continue };
+                    punch.abort.abort();
+                    let session = SecretStream::from_session(
+                        false,
+                        punch.stream.into_async_stream(),
+                        punch.noise_result.tx,
+                        punch.noise_result.rx,
+                        punch.noise_result.handshake_hash,
+                        punch.noise_result.remote_public_key,
+                    )
+                    .await;
+                    match session {
+                        Ok(ss) => {
+                            let connection = PeerConnection::with_remote_addr(
+                                ss,
+                                punch.remote_pk,
+                                addr,
+                                socket,
+                                None,
+                            );
+                            let _ = connection_tx.send(connection);
+                        }
+                        Err(err) => tracing::debug!(err = %err, "server: holepunched stream setup failed"),
+                    }
+                }
+                ServerPunchEvent::Abort { id } => {
+                    if let Some(mut punch) = punches.remove(&id) {
+                        punch.abort.abort();
+                        if let Some(mut puncher) = punch.puncher.take() {
+                            puncher.destroy();
+                        }
+                    }
+                }
+            },
+            _ = accepts.join_next(), if !accepts.is_empty() => {}
+        }
+    }
+}
+
+/// Answer one inbound `PEER_HANDSHAKE` as a server: complete the Noise IK
+/// handshake, advertise the accept socket, and spawn the stream setup that
+/// produces the [`PeerConnection`] for [`HyperDhtServer::accept`].
+///
+/// Mirrors Node `lib/server.js::_addHandshake`: a rejected or suspended
+/// handshake yields no reply (`None`), which the RPC layer sends as an empty
+/// REPLY; an accepted one replies with our UDX stream id before the stream is
+/// established, because the client dials that id as soon as the reply lands.
+/// Returns the Noise reply and the socket it must be sent from.
+#[allow(clippy::too_many_arguments)]
+async fn accept_server_handshake(
+    dht: &HyperDhtHandle,
+    runtime: &UdxRuntime,
+    config: &ServerConfig,
+    punches: &mut std::collections::HashMap<u64, ServerPassivePunch>,
+    punch_tx: &mpsc::UnboundedSender<ServerPunchEvent>,
+    next_holepunch_id: &mut u64,
+    connection_tx: &mpsc::UnboundedSender<PeerConnection>,
+    accepts: &mut tokio::task::JoinSet<()>,
+    msg: &HandshakeMessage,
+    from: &Ipv4Peer,
+    peer_address: Option<&Ipv4Peer>,
+) -> Option<(Vec<u8>, Option<UdxSocket>)> {
+    let mut nw = NoiseWrap::new_responder(config.key_pair.to_noise_keypair());
+    let remote_payload = nw.recv(&msg.noise).ok()?;
+
+    if remote_payload.error != 0 || remote_payload.version != 1 {
+        return None;
+    }
+
+    let socket = dht.server_socket().await.ok().flatten()?;
+    let port = socket.local_addr().await.ok()?.port();
+    let firewall = dht.firewalled().await.unwrap_or(config.firewall);
+
+    let local_stream_id = next_stream_id();
+    let addresses4 = dht.noise_addresses4(port).await;
+
+    // Node advertises a holepunch session only while it cannot be dialled
+    // directly (`ourRemoteAddr ? null : { id, relays }`).
+    let holepunch = if firewall == FIREWALL_OPEN {
+        None
+    } else {
+        let id = *next_holepunch_id;
+        *next_holepunch_id = (*next_holepunch_id).wrapping_add(1);
+        Some(HolepunchInfo {
+            id,
+            relays: dht.current_relays(),
+        })
+    };
+
+    let reply_payload = NoisePayload {
+        version: 1,
+        error: ERROR_NONE,
+        firewall,
+        holepunch,
+        addresses4,
+        addresses6: vec![],
+        udx: Some(UdxInfo {
+            version: 1,
+            reusable_socket: true,
+            id: u64::from(local_stream_id),
+            seq: 0,
+        }),
+        secret_stream: Some(SecretStreamInfo { version: 1 }),
+        relay_through: None,
+        relay_addresses: None,
+    };
+
+    let holepunch_id = reply_payload.holepunch.as_ref().map(|h| h.id);
+    let noise_reply = nw.send(&reply_payload).ok()?;
+    let noise_result = nw.finalize().ok()?;
+
+    let mut reply_socket = None;
+    if let Some(remote_udx) = remote_payload.udx.clone() {
+        // A relayed handshake from a firewalled client cannot be dialled:
+        // stage the passive punch now and advertise its stream id, exactly as
+        // Node's `_addHandshake` does before replying.
+        let passive = peer_address.is_some() && remote_payload.firewall != FIREWALL_OPEN;
+        if passive {
+            let id = holepunch_id?;
+            let remote_id = u32::try_from(remote_udx.id).ok()?;
+            match stage_server_punch(
+                runtime,
+                dht.dht(),
+                Some(&socket),
+                &noise_result,
+                &peer_address?.host,
+                remote_payload.firewall,
+                id,
+                local_stream_id,
+                remote_id,
+                punch_tx,
+            )
+            .await
+            {
+                Ok(punch) => {
+                    reply_socket = punch.reply_socket.clone();
+                    punches.insert(id, punch);
+                }
+                Err(err) => {
+                    tracing::debug!(err = %err, "server: passive holepunch setup failed");
+                    return None;
+                }
+            }
+        } else {
+            // A non-relayed handshake means the client reached us directly,
+            // so it is reachable from where its request came from; a relayed
+            // one only dials when the client reports itself unfirewalled.
+            let dial = peer_address.is_none() || remote_payload.firewall == FIREWALL_OPEN;
+            let client = peer_address.cloned().unwrap_or_else(|| from.clone());
+            let dht = dht.clone();
+            let runtime = UdxRuntime::shared(runtime.handle());
+            let connection_tx = connection_tx.clone();
+
+            accepts.spawn(async move {
+                match server_accept_connection(
+                    &dht,
+                    &runtime,
+                    &noise_result,
+                    local_stream_id,
+                    remote_udx.id,
+                    &client,
+                    dial,
+                )
+                .await
+                {
+                    Ok(connection) => {
+                        let _ = connection_tx.send(connection);
+                    }
+                    Err(err) => tracing::debug!(err = %err, "server: connection setup failed"),
+                }
+            });
+        }
+    }
+
+    Some((noise_reply, reply_socket))
+}
+
+/// Establish the server side of an accepted handshake: create the UDX stream
+/// with the id the reply advertised, pair it with the client's stream (dial
+/// when `dial`, else wait on a firewall hook), and wrap it in a
+/// [`SecretStream`] using the Noise session keys.
+async fn server_accept_connection(
+    dht: &HyperDhtHandle,
+    runtime: &UdxRuntime,
+    noise_result: &NoiseWrapResult,
+    local_stream_id: u32,
+    remote_stream_id: u64,
+    client: &Ipv4Peer,
+    dial: bool,
+) -> Result<PeerConnection, HyperDhtError> {
+    /// Node drops unused handshake state after `handshakeClearWait`; matching
+    /// that keeps a stalled peer from pinning a task and a stream forever.
+    const ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let remote_id = u32::try_from(remote_stream_id)
+        .map_err(|_| HyperDhtError::StreamEstablishment("remote UDX id out of u32 range".into()))?;
+
+    let socket = dht
+        .server_socket()
+        .await?
+        .ok_or_else(|| HyperDhtError::StreamEstablishment("no DHT server socket".into()))?;
+
+    let stream = runtime.create_stream(local_stream_id).await?;
+    let remote_addr = Arc::new(Mutex::new(None));
+    if dial {
+        let ip = client.host.parse().map_err(|e| {
+            HyperDhtError::StreamEstablishment(format!("invalid client address {}: {e}", client.host))
+        })?;
+        let addr = SocketAddr::new(ip, client.port);
+        stream.connect(&socket, remote_id, addr).await?;
+        *remote_addr.lock().map_err(|_| HyperDhtError::ChannelClosed)? = Some(addr);
+    } else {
+        // shortcut: passive NAT traversal needs a puncher socket, not the DHT socket.
+        let observed = Arc::clone(&remote_addr);
+        stream.set_firewall_hook(&socket, remote_id, move |_, port, ip| {
+            if let Ok(mut addr) = observed.lock() {
+                *addr = Some(SocketAddr::new(ip, port));
+                true
+            } else {
+                false
+            }
+        })?;
+    }
+
+    let init = SecretStream::from_session(
+        false,
+        stream.into_async_stream(),
+        noise_result.tx,
+        noise_result.rx,
+        noise_result.handshake_hash,
+        noise_result.remote_public_key,
+    );
+
+    let ss = tokio::time::timeout(ACCEPT_TIMEOUT, init)
+        .await
+        .map_err(|_| HyperDhtError::StreamEstablishment("accept timed out".into()))??;
+
+    let addr = remote_addr.lock().map_err(|_| HyperDhtError::ChannelClosed)?
+        .ok_or_else(|| HyperDhtError::StreamEstablishment("missing peer address".into()))?;
+    Ok(PeerConnection::with_remote_addr(ss, noise_result.remote_public_key, addr, socket, None))
+}
+
+/// Encode a handshake reply, choosing the routing mode from the inbound one.
+///
+/// `peer_address` is echoed only on the relayed path (`FROM_RELAY` /
+/// `FROM_SECOND_RELAY` → `FROM_SERVER`); a direct reply stays `MODE_REPLY`
+/// with no peer address, which is how the client distinguishes a direct
+/// connection from a relayed one.
+fn encode_server_handshake_reply(
+    inbound_mode: u64,
+    peer_address: Option<Ipv4Peer>,
+    noise: Vec<u8>,
+) -> Option<Vec<u8>> {
+    let (mode, peer_address) = match inbound_mode {
+        MODE_FROM_RELAY | MODE_FROM_SECOND_RELAY => (MODE_FROM_SERVER, peer_address),
+        _ => (MODE_REPLY, None),
+    };
+
+    encode_handshake_to_bytes(&HandshakeMessage {
+        mode,
+        noise,
+        peer_address,
+        relay_address: None,
+    })
+    .ok()
+}
+
+/// Build the reply to a server-side `PEER_HOLEPUNCH` and start punching when
+/// the remote asked for it. Shared by [`run_server`] and the
+/// [`HyperDhtServer`] accept loop.
+async fn passive_holepunch_reply(
+    dht: &DhtHandle,
+    runtime: &UdxRuntime,
+    pool: &SocketPool,
+    firewall: u64,
+    msg: &HolepunchMessage,
+    peer_address: &Ipv4Peer,
+    secret: [u8; 32],
+) -> Option<Vec<u8>> {
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let result = build_passive_holepunch_reply(
+        firewall,
+        pool,
+        runtime,
+        peer_address,
+        secret,
+        &msg.payload,
+        msg.id,
+        event_tx,
+        Some(dht),
+    )
+    .await
+    .ok()?;
+
+    if result.remote_hp.punching {
+        let pool_clone = SocketPool::new("0.0.0.0".into());
+        let mut puncher = result.puncher;
+        tokio::spawn(async move {
+            if let Ok(rt) = UdxRuntime::new() {
+                puncher.punch(&pool_clone, &rt).await;
+            }
+        });
+    }
+
+    Some(result.reply_bytes)
+}
+
 // ── Server-side event handler ─────────────────────────────────────────────────
 
 /// Per-server state for pending handshake and holepunch exchanges.
@@ -2230,7 +3470,7 @@ pub async fn run_server(
                     &from,
                     target.as_ref(),
                 );
-                let _ = reply_tx.send(reply);
+                let _ = reply_tx.send(reply.map(Into::into));
             }
             ServerEvent::PeerHolepunch {
                 msg,
@@ -2248,39 +3488,22 @@ pub async fn run_server(
                             None
                         }
                     });
-                let reply: Option<Vec<u8>> = if let Some(secret) = holepunch_secret {
-                    let (event_tx, _event_rx) = mpsc::unbounded_channel();
-                    match build_passive_holepunch_reply(
-                        config.firewall,
-                        &pool,
-                        &runtime,
-                        &peer_address,
-                        secret,
-                        &msg.payload,
-                        msg.id,
-                        event_tx,
-                        Some(&dht),
-                    )
-                    .await
-                    {
-                        Ok(result) => {
-                            if result.remote_hp.punching {
-                                let pool_clone = SocketPool::new("0.0.0.0".into());
-                                let mut puncher = result.puncher;
-                                tokio::spawn(async move {
-                                    if let Ok(rt) = UdxRuntime::new() {
-                                        puncher.punch(&pool_clone, &rt).await;
-                                    }
-                                });
-                            }
-                            Some(result.reply_bytes)
-                        }
-                        Err(_) => None,
+                let reply = match holepunch_secret {
+                    Some(secret) => {
+                        passive_holepunch_reply(
+                            &dht,
+                            &runtime,
+                            &pool,
+                            config.firewall,
+                            &msg,
+                            &peer_address,
+                            secret,
+                        )
+                        .await
                     }
-                } else {
-                    None
+                    None => None,
                 };
-                let _ = reply_tx.send(reply);
+                let _ = reply_tx.send(reply.map(Into::into));
             }
         }
     }
@@ -2480,7 +3703,28 @@ pub async fn spawn(
         .ok_or(HyperDhtError::ChannelClosed)?;
 
     let router = Arc::new(Mutex::new(Router::new()));
-    let (server_tx, server_rx) = mpsc::unbounded_channel();
+    let (server_tx, mut incoming_servers) = mpsc::unbounded_channel::<ServerEvent>();
+    let (fallback_tx, server_rx) = mpsc::unbounded_channel();
+    let server_routes = Arc::new(Mutex::new(std::collections::HashMap::<
+        [u8; 32],
+        mpsc::UnboundedSender<ServerEvent>,
+    >::new()));
+    let routes = Arc::clone(&server_routes);
+    let dispatch = tokio::spawn(async move {
+        while let Some(event) = incoming_servers.recv().await {
+            let target = match &event {
+                ServerEvent::PeerHandshake { target, .. } | ServerEvent::PeerHolepunch { target, .. } => *target,
+            };
+            let sender = target.and_then(|key| routes.lock().ok()?.get(&key).cloned());
+            if let Some(sender) = sender {
+                if let Err(error) = sender.send(event) {
+                    let _ = fallback_tx.send(error.0);
+                }
+            } else {
+                let _ = fallback_tx.send(event);
+            }
+        }
+    });
     let (admin_tx, admin_rx) = mpsc::unbounded_channel::<AdminRequest>();
 
     let request_task = tokio::spawn(run_request_handler(
@@ -2493,7 +3737,7 @@ pub async fn spawn(
     ));
 
     let join = tokio::spawn(async move {
-        tokio::select! {
+        let result = tokio::select! {
             res = dht_join => {
                 match res {
                     Ok(Ok(())) => Ok(()),
@@ -2507,15 +3751,19 @@ pub async fn spawn(
                     Err(_) => Err(HyperDhtError::ChannelClosed),
                 }
             }
-        }
+        };
+        dispatch.abort();
+        result
     });
 
     let handle = HyperDhtHandle {
         dht: dht_handle,
         router,
         server_tx,
+        server_routes,
         admin_tx,
         current_relays: Arc::new(Mutex::new(Vec::new())),
+        raw_streams: Arc::new(Mutex::new(Vec::new())),
     };
     Ok((join, handle, server_rx))
 }
@@ -2537,6 +3785,9 @@ async fn run_request_handler(
                 match admin_req {
                     AdminRequest::PersistentStats { reply } => {
                         let _ = reply.send(storage.stats());
+                    }
+                    AdminRequest::LocalRecord { target, record } => {
+                        storage.set_local_record(&target, record);
                     }
                 }
                 continue;
@@ -2786,16 +4037,17 @@ fn handle_peer_handshake(
                 let dht = dht.clone();
                 tokio::spawn(async move {
                     match reply_rx.await {
-                        Ok(Some(value)) => match inbound_mode {
-                            crate::hyperdht_messages::MODE_FROM_CLIENT => req.reply(Some(value)),
+                        Ok(Some(reply)) => match inbound_mode {
+                            crate::hyperdht_messages::MODE_FROM_CLIENT => req.reply(Some(reply.value)),
                             crate::hyperdht_messages::MODE_FROM_RELAY
                             | crate::hyperdht_messages::MODE_FROM_SECOND_RELAY => {
-                                if let Err(e) = dht.relay_with_tid(
+                                if let Err(e) = dht.relay_with_tid_via(
                                     PEER_HANDSHAKE,
                                     target,
-                                    Some(value),
+                                    Some(reply.value),
                                     &req.from,
                                     inbound_tid,
+                                    reply.socket,
                                 ) {
                                     tracing::debug!(err = %e, "relay_with_tid send failed");
                                 }
@@ -2808,7 +4060,7 @@ fn handle_peer_handshake(
                                 // chain's tail.
                                 req.release();
                             }
-                            _ => req.reply(Some(value)),
+                            _ => req.reply(Some(reply.value)),
                         },
                         Ok(None) => req.reply(None),
                         Err(_) => req.error(1),
@@ -2976,16 +4228,17 @@ fn handle_peer_holepunch(
                 let dht = dht.clone();
                 tokio::spawn(async move {
                     match reply_rx.await {
-                        Ok(Some(value)) => match inbound_mode {
-                            crate::hyperdht_messages::MODE_FROM_CLIENT => req.reply(Some(value)),
+                        Ok(Some(reply)) => match inbound_mode {
+                            crate::hyperdht_messages::MODE_FROM_CLIENT => req.reply(Some(reply.value)),
                             crate::hyperdht_messages::MODE_FROM_RELAY
                             | crate::hyperdht_messages::MODE_FROM_SECOND_RELAY => {
-                                if let Err(e) = dht.relay_with_tid(
+                                if let Err(e) = dht.relay_with_tid_via(
                                     PEER_HOLEPUNCH,
                                     target,
-                                    Some(value),
+                                    Some(reply.value),
                                     &req.from,
                                     inbound_tid,
+                                    reply.socket,
                                 ) {
                                     tracing::debug!(err = %e, "relay_with_tid send failed");
                                 }
@@ -2998,7 +4251,7 @@ fn handle_peer_holepunch(
                                 // chain's tail.
                                 req.release();
                             }
-                            _ => req.reply(Some(value)),
+                            _ => req.reply(Some(reply.value)),
                         },
                         Ok(None) => req.reply(None),
                         Err(_) => req.error(1),

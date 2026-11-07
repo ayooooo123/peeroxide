@@ -317,14 +317,6 @@ impl LruCache {
     }
 }
 
-// ── RouterEntry ───────────────────────────────────────────────────────────────
-
-struct RouterEntry {
-    #[allow(dead_code)]
-    relay: Ipv4Peer,
-    record: Vec<u8>,
-}
-
 // ── PersistentStats ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
@@ -346,7 +338,8 @@ pub struct Persistent {
     refreshes: LruCache,
     mutables: LruCache,
     immutables: LruCache,
-    router: HashMap<String, RouterEntry>,
+    /// Self-announce records keyed by hex target (Node `dht._router` records).
+    router: HashMap<String, Vec<u8>>,
 }
 
 impl Persistent {
@@ -365,6 +358,16 @@ impl Persistent {
         }
     }
 
+    /// Serve `record` for a local listener on `target`, or forget it
+    /// (Node `server.listen()` → `dht._router.set(target, { record })`).
+    pub fn set_local_record(&mut self, target: &[u8; 32], record: Option<Vec<u8>>) {
+        let key = to_hex(target);
+        match record {
+            Some(record) => self.router.insert(key, record),
+            None => self.router.remove(&key),
+        };
+    }
+
     // ── FIND_PEER ─────────────────────────────────────────────────────────────
 
     /// Handle an incoming FIND_PEER request.
@@ -374,12 +377,7 @@ impl Persistent {
             None => return HandlerReply::Silent,
         };
 
-        let key = to_hex(target);
-        if let Some(entry) = self.router.get(&key) {
-            HandlerReply::Value(Some(entry.record.clone()))
-        } else {
-            HandlerReply::Value(None)
-        }
+        HandlerReply::Value(self.router.get(&to_hex(target)).cloned())
     }
 
     // ── LOOKUP ────────────────────────────────────────────────────────────────
@@ -403,9 +401,9 @@ impl Persistent {
 
         // Append self-announce from router if we haven't hit the max.
         if peers.len() < MAX_RECORDS_PER_LOOKUP {
-            if let Some(entry) = self.router.get(&key) {
+            if let Some(record) = self.router.get(&key) {
                 if let Ok(peer) =
-                    crate::hyperdht_messages::decode_hyper_peer_from_bytes(&entry.record)
+                    crate::hyperdht_messages::decode_hyper_peer_from_bytes(record)
                 {
                     peers.push(peer);
                 }
@@ -516,13 +514,7 @@ impl Persistent {
                 Ok(b) => b,
                 Err(_) => return HandlerReply::Silent,
             };
-            self.router.insert(
-                target_key.clone(),
-                RouterEntry {
-                    relay: req.from.clone(),
-                    record: encoded,
-                },
-            );
+            self.router.insert(target_key.clone(), encoded);
             self.records.remove(&target_key, &stored_peer.public_key);
         } else {
             let encoded = match encode_hyper_peer_to_bytes(&stored_peer) {
