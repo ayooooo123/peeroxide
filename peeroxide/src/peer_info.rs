@@ -39,7 +39,7 @@ pub struct PeerInfo {
     pub relay_addresses: Vec<Ipv4Peer>,
     /// Whether we are reconnecting after a proven connection dropped.
     pub reconnecting: bool,
-    /// Whether this peer has had a successful connection lasting ≥ 15 seconds.
+    /// Whether this peer has established a connection before.
     pub proven: bool,
     /// Whether this peer has been banned.
     pub banned: bool,
@@ -104,17 +104,16 @@ impl PeerInfo {
 
     /// Record that a connection to this peer has been established.
     pub fn connected(&mut self) {
-        self.reconnecting = false;
+        self.proven = true;
         self.connected_at = Some(Instant::now());
     }
 
-    /// If the connection lasted ≥ 15s, mark as proven and reset attempts.
+    /// Reset the retry tier after a connection lasting at least 15 seconds.
     pub fn disconnected(&mut self) {
-        if let Some(at) = self.connected_at {
+        if let Some(at) = self.connected_at.take() {
+            self.reconnecting = true;
             if at.elapsed().as_secs() >= PROVEN_THRESHOLD_SECS {
-                self.reconnecting = true;
                 self.attempts = 0;
-                self.proven = true;
             }
         }
     }
@@ -146,6 +145,15 @@ mod tests {
     fn priority_initial() {
         let info = PeerInfo::new([0u8; 32], vec![]);
         assert_eq!(info.get_priority(), Priority::Normal);
+    }
+
+    #[test]
+    fn successful_connection_is_proven_before_disconnect() {
+        let mut info = PeerInfo::new([0u8; 32], vec![]);
+        info.connected();
+        assert!(info.proven);
+        info.disconnected();
+        assert!(info.reconnecting);
     }
 
     #[test]

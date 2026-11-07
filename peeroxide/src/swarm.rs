@@ -8,13 +8,13 @@ use rand::Rng;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use libudx::{RuntimeHandle, UdxRuntime, UdxSocket, UdxStream};
 use peeroxide_dht::crypto::hash;
 use peeroxide_dht::holepuncher::{HolepunchEvent, Holepuncher};
 use peeroxide_dht::hyperdht::{
-    self, HyperDhtConfig, HyperDhtHandle, KeyPair, PeerConnection, ServerEvent,
+    self, HyperDhtConfig, HyperDhtHandle, KeyPair, PeerConnection, ServerEvent, ServerReply,
 };
 use peeroxide_dht::hyperdht_messages::{
     encode_handshake_to_bytes, encode_holepunch_msg_to_bytes, HandshakeMessage, HolepunchInfo,
@@ -43,6 +43,16 @@ fn next_stream_id() -> u32 {
 const DEFAULT_MAX_PEERS: usize = 64;
 const DEFAULT_MAX_PARALLEL: usize = 3;
 
+/// HyperDHT refreshes server announcements approximately every five minutes.
+const ANNOUNCE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const ANNOUNCE_REFRESH_JITTER_MS: u64 = 500;
+
+/// How long a graceful destroy waits for one discovery/announcer task to
+/// stop announcing before aborting it anyway. Node's `clear()` awaits the
+/// same tasks without a bound; a bound keeps `destroy()` from hanging on an
+/// unreachable DHT.
+const STOP_TASK_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How long the reply to a server-side PEER_HANDSHAKE is kept for duplicates
 /// of the same request: the passive holepunch window (10 s) plus the 10 s
 /// Node hyperdht keeps a settled handshake around (`HANDSHAKE_CLEAR_WAIT` in
@@ -56,31 +66,21 @@ const HANDSHAKE_REPLY_TTL: Duration = Duration::from_secs(20);
 /// handshakes. Legitimate traffic stays far below it (each entry lives 20 s).
 const HANDSHAKE_REPLY_CACHE_CAPACITY: usize = 1024;
 
-// ── Retry backoff tiers (matching Node.js lib/retry-timer.js) ────────────────
-// Each tier: [base_ms, jitter1, jitter2, jitter3]
-// Delay = base + rand(0..j1) + rand(0..j2) + rand(0..j3)
-const BACKOFF_S: [u64; 4] = [1000, 250, 100, 50];
-const BACKOFF_M: [u64; 4] = [5000, 1000, 500, 250];
-const BACKOFF_L: [u64; 4] = [15000, 5000, 2500, 1000];
-const BACKOFF_X: [u64; 4] = [600_000, 60_000, 30_000, 15_000];
+// Node's retry timer adds up to 500 ms of timer jitter to each tier.
+const BACKOFF_S: [u64; 2] = [1000, 500];
+const BACKOFF_M: [u64; 2] = [5000, 1000];
+const BACKOFF_L: [u64; 2] = [15000, 2000];
+const BACKOFF_X: [u64; 2] = [600_000, 120_000];
 
 fn retry_delay(info: &PeerInfo) -> Duration {
-    let idx = if info.proven {
-        (info.attempts as usize).min(3)
-    } else {
-        ((info.attempts + 1) as usize).min(3)
-    };
-    let tier = match idx {
-        0 => &BACKOFF_S,
-        1 => &BACKOFF_M,
-        2 => &BACKOFF_L,
+    let tier = match (info.attempts, info.proven) {
+        (0, _) | (1, true) => &BACKOFF_S,
+        (1, false) | (2, true) => &BACKOFF_M,
+        (2 | 3, false) | (3, true) => &BACKOFF_L,
         _ => &BACKOFF_X,
     };
     let mut rng = rand::rng();
-    let jitter = rng.random_range(0..tier[1])
-        + rng.random_range(0..tier[2])
-        + rng.random_range(0..tier[3]);
-    Duration::from_millis(tier[0] + jitter)
+    Duration::from_millis(tier[0] + rng.random_range(0..=tier[1]) + rng.random_range(0..=500))
 }
 
 fn short_hex(bytes: &[u8]) -> String {
@@ -287,10 +287,115 @@ impl SwarmHandle {
 
     /// Destroy the swarm, cancelling all discovery and closing connections.
     pub async fn destroy(&self) -> Result<(), SwarmError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(SwarmCommand::Destroy { reply_tx }).await;
-        let _ = reply_rx.await;
+        let _ = self.destroy_with_force(false).await;
         Ok(())
+    }
+
+    /// Destroy the swarm, optionally skipping the graceful shutdown.
+    ///
+    /// Mirrors Node `swarm.destroy({ force })`: without `force`, every joined
+    /// topic stops announcing and the server stops before the DHT is torn
+    /// down (`clear()` + `server.close()`); with `force` those tasks are
+    /// aborted instead of awaited. Destroying an already-destroyed swarm is a
+    /// no-op, as in Node.
+    ///
+    /// Connections already handed out through the connection channel are
+    /// owned by the caller and are dropped by the caller, not here.
+    pub async fn destroy_with_force(&self, force: bool) -> Result<(), SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(SwarmCommand::Destroy { force, reply_tx })
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Start accepting connections for this swarm's own public key.
+    ///
+    /// Mirrors Node `swarm.listen()`: registers the DHT server on
+    /// `hash(public_key)` and announces that key so peers that only know the
+    /// key (see [`SwarmHandle::join_peer`]) can find us. Resolves once the
+    /// first announce has completed. Calling it again is a no-op.
+    pub async fn listen(&self) -> Result<(), SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::Listen { reply_tx })
+            .await
+            .map_err(|_| SwarmError::Destroyed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
+    }
+
+    /// Connect to a specific peer, without joining any topic.
+    ///
+    /// Mirrors Node `swarm.joinPeer(publicKey)`: the peer is queued for an
+    /// immediate dial and, when the attempt fails, retried with the same
+    /// backoff as a topic-discovered peer. Joining our own key, an
+    /// already-connected peer, or the same peer twice is a no-op.
+    pub async fn join_peer(&self, public_key: [u8; 32]) -> Result<(), SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::JoinPeer {
+                public_key,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| SwarmError::Destroyed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
+    }
+
+    /// Stop treating a peer as explicitly joined.
+    ///
+    /// Mirrors Node `swarm.leavePeer(publicKey)`: the peer stops being
+    /// retried once it has no remaining topics. An established connection is
+    /// not closed. Unknown peers are ignored.
+    pub async fn leave_peer(&self, public_key: [u8; 32]) -> Result<(), SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::LeavePeer {
+                public_key,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| SwarmError::Destroyed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
+    }
+
+    /// Suspend the swarm: stop discovery, the server announcer and all
+    /// pending dials, and forget every tracked connection, so no further
+    /// connection attempts are made until [`SwarmHandle::resume`].
+    ///
+    /// Mirrors Node `swarm.suspend()`. Node also destroys the established
+    /// connections it holds; here each connection has already been moved to
+    /// the caller through the connection channel, so callers that want them
+    /// closed must drop their [`SwarmConnection`]s.
+    pub async fn suspend(&self) -> Result<(), SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::Suspend { reply_tx })
+            .await
+            .map_err(|_| SwarmError::Destroyed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
+    }
+
+    /// Resume a suspended swarm: restart discovery for every joined topic,
+    /// the server announcer, and the queued connection attempts.
+    ///
+    /// Mirrors Node `swarm.resume()`. Resuming a swarm that is not suspended
+    /// is a no-op.
+    pub async fn resume(&self) -> Result<(), SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::Resume { reply_tx })
+            .await
+            .map_err(|_| SwarmError::Destroyed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
     }
 }
 
@@ -307,20 +412,40 @@ enum SwarmCommand {
         topic: [u8; 32],
         reply_tx: oneshot::Sender<Result<(), SwarmError>>,
     },
+    Listen {
+        reply_tx: oneshot::Sender<Result<(), SwarmError>>,
+    },
+    JoinPeer {
+        public_key: [u8; 32],
+        reply_tx: oneshot::Sender<Result<(), SwarmError>>,
+    },
+    LeavePeer {
+        public_key: [u8; 32],
+        reply_tx: oneshot::Sender<Result<(), SwarmError>>,
+    },
+    Suspend {
+        reply_tx: oneshot::Sender<Result<(), SwarmError>>,
+    },
+    Resume {
+        reply_tx: oneshot::Sender<Result<(), SwarmError>>,
+    },
     Flush {
         reply_tx: oneshot::Sender<Result<(), SwarmError>>,
     },
     Destroy {
+        force: bool,
         reply_tx: oneshot::Sender<Result<(), SwarmError>>,
     },
 }
 
-#[allow(dead_code)] // Fields read during leave/unannounce (future)
 struct TopicState {
     is_server: bool,
     is_client: bool,
     cancel_tx: Option<oneshot::Sender<()>>,
     refreshed: bool,
+    /// Discovery task for this topic. Kept so a suspend/destroy can stop it
+    /// instead of letting it keep announcing.
+    task: Option<JoinHandle<()>>,
 }
 
 struct ActorConfig {
@@ -344,7 +469,28 @@ struct SwarmActor {
 
     peers: HashMap<[u8; 32], PeerInfo>,
     connections: ConnectionSet,
+    /// Abort handles for every connection this swarm has produced, including
+    /// the ones already handed to the caller through `conn_tx`. Node keeps
+    /// `_allConnections` and destroys them on suspend/destroy.
+    aborts: Arc<Mutex<Vec<libudx::UdxStreamAbort>>>,
     queue: Vec<[u8; 32]>,
+
+    /// In-flight dials, so a suspend or destroy can abort them. The attempt's
+    /// result arrives through `connect_result_tx`; an aborted one never does.
+    connect_tasks: HashMap<[u8; 32], JoinHandle<()>>,
+    connect_result_tx: mpsc::UnboundedSender<ConnectAttemptResult>,
+    /// Fires when a failed peer's retry backoff elapses (`lib/retry-timer.js`).
+    retry_tx: mpsc::UnboundedSender<[u8; 32]>,
+
+    /// `true` between [`SwarmHandle::suspend`] and [`SwarmHandle::resume`]:
+    /// no dials, no announces, no new connections.
+    suspended: bool,
+    /// `true` once [`SwarmHandle::listen`] has been called. The DHT server
+    /// stays registered across suspend/resume, but the announcer does not.
+    listening: bool,
+    /// Announces `hash(public_key)` and refreshes it, as Node's
+    /// `Server.listen()` announcer does.
+    announcer: Option<ServerAnnouncer>,
 
     conn_tx: mpsc::Sender<SwarmConnection>,
 
@@ -354,6 +500,9 @@ struct SwarmActor {
     active_connects: usize,
     flush_waiters: Vec<oneshot::Sender<Result<(), SwarmError>>>,
     server_failure_tx: Option<mpsc::UnboundedSender<[u8; 32]>>,
+    outgoing_closed_tx: Option<mpsc::UnboundedSender<([u8; 32], u64)>>,
+    outgoing_generations: HashMap<[u8; 32], u64>,
+    next_generation: u64,
 
     // Passive-holepunch state. When the server is firewalled, each accepted
     // handshake stages an InFlightHolepunch entry instead of immediately
@@ -370,6 +519,53 @@ struct SwarmActor {
     // message. A Node client sends the same message through up to two relays
     // in parallel and keeps the first reply; every copy must get that reply.
     handshake_replies: HandshakeReplyCache,
+}
+
+/// The `hash(public_key)` announcer started by [`SwarmHandle::listen`].
+struct ServerAnnouncer {
+    cancel_tx: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+/// Announce `hash(public_key)`, the record peers look up to reach a listening
+/// swarm. Mirrors the announcer Node's `Server.listen()` starts.
+async fn announce_self(dht: &HyperDhtHandle, key_pair: &KeyPair, relays: &[Ipv4Peer]) {
+    match dht.announce(hash(&key_pair.public_key), key_pair, relays).await {
+        Ok(r) => tracing::debug!(closest = r.closest_nodes.len(), "server self-announce complete"),
+        Err(e) => tracing::warn!(err = %e, "server self-announce failed"),
+    }
+}
+
+/// Refresh the self-announcement until cancelled.
+async fn run_server_announcer(
+    dht: HyperDhtHandle,
+    key_pair: KeyPair,
+    relays: Vec<Ipv4Peer>,
+    announce_now: bool,
+    mut cancel_rx: oneshot::Receiver<()>,
+) {
+    // `listen()` has just announced; a resume has not, and must not wait a
+    // full refresh interval to be discoverable again.
+    if announce_now {
+        announce_self(&dht, &key_pair, &relays).await;
+    }
+    loop {
+        let jitter_ms = rand::rng().random_range(0..ANNOUNCE_REFRESH_JITTER_MS);
+        let delay = ANNOUNCE_REFRESH_INTERVAL + Duration::from_millis(jitter_ms);
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => announce_self(&dht, &key_pair, &relays).await,
+            _ = &mut cancel_rx => break,
+        }
+    }
+}
+
+/// Stop a discovery/announcer task: give it a bounded chance to finish its
+/// current announce when graceful, abort it otherwise.
+async fn stop_task(task: Option<JoinHandle<()>>, graceful: bool) {
+    let Some(mut task) = task else { return };
+    if !graceful || tokio::time::timeout(STOP_TASK_TIMEOUT, &mut task).await.is_err() {
+        task.abort();
+    }
 }
 
 /// Noise replies to recent server-side PEER_HANDSHAKE requests, keyed by the
@@ -442,6 +638,13 @@ impl HandshakeReplyCache {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Drop every cached reply, releasing its storage. Used when the server
+    /// is suspended: replies for pre-suspend handshakes must not be reused.
+    fn clear(&mut self) {
+        self.entries = HashMap::new();
+        self.order = VecDeque::new();
     }
 }
 
@@ -573,6 +776,8 @@ pub async fn spawn(
     let (conn_tx, conn_rx) = mpsc::channel(64);
     let (discovery_event_tx, discovery_event_rx) = mpsc::unbounded_channel();
     let (passive_hp_event_tx, passive_hp_event_rx) = mpsc::unbounded_channel();
+    let (connect_result_tx, connect_result_rx) = mpsc::unbounded_channel::<ConnectAttemptResult>();
+    let (retry_tx, retry_rx) = mpsc::unbounded_channel::<[u8; 32]>();
 
     let handle_dht = dht.clone();
     let handle_key_pair = key_pair.clone();
@@ -594,7 +799,14 @@ pub async fn spawn(
         discovery_event_tx,
         peers: HashMap::new(),
         connections: ConnectionSet::new(),
+        aborts: Arc::new(Mutex::new(Vec::new())),
         queue: Vec::new(),
+        connect_tasks: HashMap::new(),
+        connect_result_tx,
+        retry_tx,
+        suspended: false,
+        listening: false,
+        announcer: None,
         conn_tx,
         server_registered: false,
         relay_address: config.relay_address.map(|addr| Ipv4Peer {
@@ -604,6 +816,9 @@ pub async fn spawn(
         active_connects: 0,
         flush_waiters: Vec::new(),
         server_failure_tx: None,
+        outgoing_closed_tx: None,
+        outgoing_generations: HashMap::new(),
+        next_generation: 0,
         connects: HashMap::new(),
         pending_handshakes: HashMap::new(),
         next_holepunch_id: 0,
@@ -618,7 +833,16 @@ pub async fn spawn(
     // We must await dht_join AFTER actor.run() (which calls dht.destroy()),
     // so the DhtNode finishes closing its IO sockets before we drop the runtime.
     let join = tokio::spawn(async move {
-        actor.run(cmd_rx, discovery_event_rx, server_rx, passive_hp_event_rx).await;
+        actor
+            .run(
+                cmd_rx,
+                discovery_event_rx,
+                server_rx,
+                passive_hp_event_rx,
+                connect_result_rx,
+                retry_rx,
+            )
+            .await;
         let _ = dht_join.await;
         drop(runtime);
     });
@@ -640,9 +864,9 @@ impl SwarmActor {
         mut discovery_rx: mpsc::UnboundedReceiver<DiscoveryEvent>,
         mut server_rx: mpsc::UnboundedReceiver<ServerEvent>,
         mut passive_hp_event_rx: mpsc::UnboundedReceiver<PassiveHolepunchEvent>,
+        mut connect_result_rx: mpsc::UnboundedReceiver<ConnectAttemptResult>,
+        mut retry_rx: mpsc::UnboundedReceiver<[u8; 32]>,
     ) {
-        let (connect_result_tx, mut connect_result_rx) =
-            mpsc::unbounded_channel::<ConnectAttemptResult>();
         // Reverse channel: spawned create_server_connection tasks signal back
         // on failure so the actor can release the pre-emptively reserved
         // `connections` slot. Without this, a single failed handshake stream
@@ -651,6 +875,8 @@ impl SwarmActor {
         let (server_failure_tx, mut server_failure_rx) =
             mpsc::unbounded_channel::<[u8; 32]>();
         self.server_failure_tx = Some(server_failure_tx);
+        let (outgoing_closed_tx, mut outgoing_closed_rx) = mpsc::unbounded_channel();
+        self.outgoing_closed_tx = Some(outgoing_closed_tx);
 
         let mut reply_sweep = tokio::time::interval(HANDSHAKE_REPLY_TTL);
         reply_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -659,13 +885,13 @@ impl SwarmActor {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     let Some(cmd) = cmd else { break };
-                    if self.handle_command(cmd) {
+                    if self.handle_command(cmd).await {
                         break;
                     }
                 }
                 event = discovery_rx.recv() => {
                     if let Some(event) = event {
-                        self.handle_discovery_event(event, &connect_result_tx);
+                        self.handle_discovery_event(event);
                     }
                 }
                 event = server_rx.recv() => {
@@ -675,7 +901,26 @@ impl SwarmActor {
                 }
                 result = connect_result_rx.recv() => {
                     if let Some(result) = result {
-                        self.handle_connect_result(result, &connect_result_tx);
+                        self.handle_connect_result(result);
+                    }
+                }
+                pk = retry_rx.recv() => {
+                    if let Some(pk) = pk {
+                        self.handle_retry(pk);
+                    }
+                }
+                closed = outgoing_closed_rx.recv() => {
+                    if let Some((pk, generation)) = closed {
+                        if self.outgoing_generations.get(&pk) == Some(&generation) {
+                            self.outgoing_generations.remove(&pk);
+                            if self.connections.get(&pk).is_some_and(|info| info.is_initiator) {
+                                self.connections.remove(&pk);
+                                if let Some(info) = self.peers.get_mut(&pk) {
+                                    info.disconnected();
+                                }
+                                self.schedule_retry(pk);
+                            }
+                        }
                     }
                 }
                 pk = server_failure_rx.recv() => {
@@ -700,6 +945,13 @@ impl SwarmActor {
             if let Some(cancel) = state.cancel_tx {
                 let _ = cancel.send(());
             }
+            if let Some(task) = state.task {
+                task.abort();
+            }
+        }
+        if let Some(announcer) = self.announcer.take() {
+            let _ = announcer.cancel_tx.send(());
+            announcer.task.abort();
         }
 
         if self.server_registered {
@@ -712,7 +964,7 @@ impl SwarmActor {
     }
 
     /// Returns `true` when the actor should shut down.
-    fn handle_command(&mut self, cmd: SwarmCommand) -> bool {
+    async fn handle_command(&mut self, cmd: SwarmCommand) -> bool {
         match cmd {
             SwarmCommand::Join {
                 topic,
@@ -729,15 +981,47 @@ impl SwarmActor {
                 let _ = reply_tx.send(result);
                 false
             }
+            SwarmCommand::Listen { reply_tx } => {
+                let result = self.do_listen().await;
+                let _ = reply_tx.send(result);
+                false
+            }
+            SwarmCommand::JoinPeer {
+                public_key,
+                reply_tx,
+            } => {
+                let result = self.do_join_peer(public_key);
+                let _ = reply_tx.send(result);
+                false
+            }
+            SwarmCommand::LeavePeer {
+                public_key,
+                reply_tx,
+            } => {
+                let result = self.do_leave_peer(&public_key);
+                let _ = reply_tx.send(result);
+                false
+            }
+            SwarmCommand::Suspend { reply_tx } => {
+                let result = self.do_suspend().await;
+                let _ = reply_tx.send(result);
+                false
+            }
+            SwarmCommand::Resume { reply_tx } => {
+                let result = self.do_resume().await;
+                let _ = reply_tx.send(result);
+                false
+            }
             SwarmCommand::Flush { reply_tx } => {
-                if self.all_topics_refreshed() {
+                if self.suspended || self.all_topics_refreshed() {
                     let _ = reply_tx.send(Ok(()));
                 } else {
                     self.flush_waiters.push(reply_tx);
                 }
                 false
             }
-            SwarmCommand::Destroy { reply_tx } => {
+            SwarmCommand::Destroy { force, reply_tx } => {
+                self.do_destroy(force).await;
                 if self.server_registered {
                     let target = hash(&self.key_pair.public_key);
                     self.dht.unregister_server(&target);
@@ -749,25 +1033,47 @@ impl SwarmActor {
         }
     }
 
+    fn relay_addresses(&self) -> Vec<Ipv4Peer> {
+        self.relay_address
+            .as_ref()
+            .map_or_else(Vec::new, |a| vec![a.clone()])
+    }
+
     fn do_join(&mut self, topic: [u8; 32], server: bool, client: bool) -> Result<(), SwarmError> {
         if self.topics.contains_key(&topic) {
             return Ok(());
         }
 
         if server && !self.server_registered {
-            let target = hash(&self.key_pair.public_key);
-            self.dht.register_server(&target);
+            self.dht.register_server(&self.key_pair.public_key);
             self.server_registered = true;
             tracing::debug!(pk = %short_hex(&self.key_pair.public_key), "server registered");
         }
 
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let relay_addresses = self
-            .relay_address
-            .as_ref()
-            .map_or_else(Vec::new, |a| vec![a.clone()]);
+        if self.suspended {
+            // Node creates the discovery in a suspended state and only starts
+            // it on resume; keep the join so resume can start it.
+            self.topics.insert(
+                topic,
+                TopicState {
+                    is_server: server,
+                    is_client: client,
+                    cancel_tx: None,
+                    refreshed: false,
+                    task: None,
+                },
+            );
+        } else {
+            self.spawn_discovery(topic, server, client);
+        }
+        Ok(())
+    }
 
-        tokio::spawn(run_discovery(
+    /// Start discovery for one topic and remember its task so suspend/destroy
+    /// can stop it.
+    fn spawn_discovery(&mut self, topic: [u8; 32], server: bool, client: bool) {
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let task = tokio::spawn(run_discovery(
             PeerDiscoveryConfig {
                 topic,
                 is_server: server,
@@ -775,7 +1081,7 @@ impl SwarmActor {
             },
             self.dht.clone(),
             self.key_pair.clone(),
-            relay_addresses,
+            self.relay_addresses(),
             self.discovery_event_tx.clone(),
             cancel_rx,
         ));
@@ -787,9 +1093,266 @@ impl SwarmActor {
                 is_client: client,
                 cancel_tx: Some(cancel_tx),
                 refreshed: false,
+                task: Some(task),
             },
         );
+    }
+
+    /// Node `swarm.listen()`: register the server for `hash(public_key)` and
+    /// announce that key, so peers that know only the key can find us.
+    async fn do_listen(&mut self) -> Result<(), SwarmError> {
+        if !self.server_registered {
+            self.dht.register_server(&self.key_pair.public_key);
+            self.server_registered = true;
+            tracing::debug!(
+                pk = %short_hex(&self.key_pair.public_key),
+                "server registered (listen)"
+            );
+        }
+        if !self.listening {
+            let target = hash(&self.key_pair.public_key);
+            self.dht
+                .announce(target, &self.key_pair, &self.relay_addresses())
+                .await?;
+            self.listening = true;
+        }
+        if self.suspended {
+            return Ok(());
+        }
+        self.start_announcer(false);
         Ok(())
+    }
+
+    fn start_announcer(&mut self, announce_now: bool) {
+        if self.announcer.is_some() {
+            return;
+        }
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let task = tokio::spawn(run_server_announcer(
+            self.dht.clone(),
+            self.key_pair.clone(),
+            self.relay_addresses(),
+            announce_now,
+            cancel_rx,
+        ));
+        self.announcer = Some(ServerAnnouncer { cancel_tx, task });
+    }
+
+    /// Node `swarm.joinPeer(publicKey)`: queue a peer that was named
+    /// explicitly instead of discovered on a topic.
+    fn do_join_peer(&mut self, public_key: [u8; 32]) -> Result<(), SwarmError> {
+        if public_key == self.key_pair.public_key {
+            return Ok(());
+        }
+
+        // Node marks the peer explicit before the already-connected check, so
+        // it is still retried if that connection later closes.
+        let enqueue = {
+            let info = self
+                .peers
+                .entry(public_key)
+                .or_insert_with(|| PeerInfo::new(public_key, vec![]));
+            info.explicit = true;
+            let enqueue = !self.connections.has(&public_key)
+                && !info.banned
+                && !info.queued
+                && !info.connecting;
+            if enqueue {
+                info.priority = info.get_priority();
+                info.queued = true;
+            }
+            enqueue
+        };
+        if enqueue {
+            self.queue.push(public_key);
+            // Node queues the peer and calls _attemptClientConnections, which
+            // does nothing while suspended; resume drains the queue.
+            self.attempt_connections();
+        }
+        Ok(())
+    }
+
+    /// Node `swarm.leavePeer(publicKey)`: drop the explicit flag and garbage
+    /// collect the peer when it has no topics left. A connection is not
+    /// closed, as in Node.
+    fn do_leave_peer(&mut self, public_key: &[u8; 32]) -> Result<(), SwarmError> {
+        if let Some(info) = self.peers.get_mut(public_key) {
+            info.explicit = false;
+        }
+        self.maybe_delete_peer(public_key);
+        Ok(())
+    }
+
+    fn maybe_delete_peer(&mut self, public_key: &[u8; 32]) {
+        let gc = self
+            .peers
+            .get(public_key)
+            .is_some_and(|info| info.should_gc());
+        if gc && !self.connections.has(public_key) {
+            self.peers.remove(public_key);
+        }
+    }
+
+    /// Node `_shouldRequeue`: an explicit peer is always retried; a
+    /// discovered peer only while one of its topics is still joined.
+    fn should_requeue(&self, public_key: &[u8; 32]) -> bool {
+        self.peers.get(public_key).is_some_and(|info| {
+            info.explicit || info.topics.iter().any(|t| self.topics.contains_key(t))
+        })
+    }
+
+    /// Node `swarm.suspend()`: stop everything the swarm drives, close the
+    /// DHT sockets and forget the connections it handed out.
+    async fn do_suspend(&mut self) -> Result<(), SwarmError> {
+        if self.suspended {
+            return Ok(());
+        }
+        self.suspended = true;
+
+        for state in self.topics.values_mut() {
+            if let Some(cancel) = state.cancel_tx.take() {
+                let _ = cancel.send(());
+            }
+            if let Some(task) = state.task.take() {
+                task.abort();
+            }
+            state.refreshed = false;
+        }
+
+        if let Some(announcer) = self.announcer.take() {
+            let _ = announcer.cancel_tx.send(());
+            announcer.task.abort();
+        }
+
+        for (_, task) in self.connect_tasks.drain() {
+            task.abort();
+        }
+        self.active_connects = 0;
+        self.queue.clear();
+        for info in self.peers.values_mut() {
+            info.queued = false;
+            info.connecting = false;
+            info.set_waiting(false);
+        }
+
+        // Node `for (const connection of this._allConnections) connection.destroy()`.
+        if let Ok(mut aborts) = self.aborts.lock() {
+            for handle in std::mem::take(&mut *aborts) {
+                handle.abort();
+            }
+        }
+        self.connections = ConnectionSet::new();
+
+        for (_, mut entry) in self.connects.drain() {
+            if let Some(task) = entry.abort_task.take() {
+                task.abort();
+            }
+            if let Some(mut puncher) = entry.puncher.take() {
+                puncher.destroy();
+            }
+        }
+        self.pending_handshakes.clear();
+        self.handshake_replies.clear();
+
+        for waiter in self.flush_waiters.drain(..) {
+            let _ = waiter.send(Ok(()));
+        }
+
+        // Node suspends the DHT last, after the server and discovery.
+        self.dht.suspend().await?;
+        Ok(())
+    }
+
+    /// Node `swarm.resume()`: resume the DHT, then restart discovery, the
+    /// announcer and the queued connection attempts.
+    async fn do_resume(&mut self) -> Result<(), SwarmError> {
+        if !self.suspended {
+            return Ok(());
+        }
+        self.suspended = false;
+        self.dht.resume().await?;
+
+        let topics: Vec<([u8; 32], bool, bool)> = self
+            .topics
+            .iter()
+            .map(|(topic, state)| (*topic, state.is_server, state.is_client))
+            .collect();
+        for (topic, server, client) in topics {
+            self.spawn_discovery(topic, server, client);
+        }
+
+        if self.listening {
+            self.start_announcer(true);
+        }
+
+        let requeue: Vec<[u8; 32]> = self
+            .peers
+            .iter()
+            .filter(|(pk, info)| {
+                let still_joined =
+                    info.explicit || info.topics.iter().any(|t| self.topics.contains_key(t));
+                !info.banned && !self.connections.has(pk) && still_joined
+            })
+            .map(|(pk, _)| *pk)
+            .collect();
+        for public_key in requeue {
+            if let Some(info) = self.peers.get_mut(&public_key) {
+                if info.queued || info.connecting {
+                    continue;
+                }
+                info.priority = info.get_priority();
+                info.queued = true;
+            }
+            self.queue.push(public_key);
+        }
+
+        self.attempt_connections();
+        Ok(())
+    }
+
+    /// Node `swarm.destroy({ force })`: stop discovery and the announcer, then
+    /// abort the remaining work. Without `force`, tasks get a bounded chance
+    /// to finish their current announce instead of being cut off.
+    async fn do_destroy(&mut self, force: bool) {
+        let graceful = !force;
+        for (_, mut state) in self.topics.drain() {
+            if let Some(cancel) = state.cancel_tx.take() {
+                let _ = cancel.send(());
+            }
+            stop_task(state.task.take(), graceful).await;
+        }
+        if let Some(announcer) = self.announcer.take() {
+            let _ = announcer.cancel_tx.send(());
+            stop_task(Some(announcer.task), graceful).await;
+        }
+
+        for (_, task) in self.connect_tasks.drain() {
+            task.abort();
+        }
+        self.active_connects = 0;
+        self.queue.clear();
+
+        for (_, mut entry) in self.connects.drain() {
+            if let Some(task) = entry.abort_task.take() {
+                task.abort();
+            }
+            if let Some(mut puncher) = entry.puncher.take() {
+                puncher.destroy();
+            }
+        }
+        self.pending_handshakes.clear();
+        self.handshake_replies.clear();
+
+        // Node closes the swarm's server and every connection on destroy.
+        if let Ok(mut aborts) = self.aborts.lock() {
+            for handle in std::mem::take(&mut *aborts) {
+                handle.abort();
+            }
+        }
+
+        for waiter in self.flush_waiters.drain(..) {
+            let _ = waiter.send(Err(SwarmError::Destroyed));
+        }
     }
 
     fn do_leave(&mut self, topic: [u8; 32]) -> Result<(), SwarmError> {
@@ -797,11 +1360,16 @@ impl SwarmActor {
             if let Some(cancel) = state.cancel_tx {
                 let _ = cancel.send(());
             }
+            if let Some(task) = state.task {
+                task.abort();
+            }
             for peer in self.peers.values_mut() {
                 peer.topics.retain(|t| *t != topic);
             }
 
-            if state.is_server && self.server_registered {
+            // `listen()` owns the server independently of topics, as Node's
+            // `Server.listen()` does; only a join-registered server goes away.
+            if state.is_server && self.server_registered && !self.listening {
                 let has_remaining_server_topics =
                     self.topics.values().any(|t| t.is_server);
                 if !has_remaining_server_topics {
@@ -818,11 +1386,10 @@ impl SwarmActor {
         Ok(())
     }
 
-    fn handle_discovery_event(
-        &mut self,
-        event: DiscoveryEvent,
-        connect_result_tx: &mpsc::UnboundedSender<ConnectAttemptResult>,
-    ) {
+    fn handle_discovery_event(&mut self, event: DiscoveryEvent) {
+        if self.suspended {
+            return;
+        }
         match event {
             DiscoveryEvent::PeerFound {
                 public_key,
@@ -870,16 +1437,16 @@ impl SwarmActor {
                 if let Some(state) = self.topics.get_mut(&topic) {
                     state.refreshed = true;
                 }
-                self.attempt_connections(connect_result_tx);
+                self.attempt_connections();
                 self.check_flush_waiters();
             }
         }
     }
 
-    fn attempt_connections(
-        &mut self,
-        connect_result_tx: &mpsc::UnboundedSender<ConnectAttemptResult>,
-    ) {
+    fn attempt_connections(&mut self) {
+        if self.suspended {
+            return;
+        }
         while self.active_connects < self.config.max_parallel && !self.queue.is_empty() {
             // Sort by priority descending
             self.queue.sort_by(|a, b| {
@@ -907,12 +1474,12 @@ impl SwarmActor {
             self.active_connects += 1;
             let dht = self.dht.clone();
             let key_pair = self.key_pair.clone();
-            let result_tx = connect_result_tx.clone();
+            let result_tx = self.connect_result_tx.clone();
             let rh = self.runtime_handle.clone();
             let mut connect_opts = peeroxide_dht::hyperdht::ConnectOpts::default();
             connect_opts.local_connection = self.config.local_connection;
 
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let conn_runtime = UdxRuntime::shared(rh);
                 tracing::debug!(pk = %short_hex(&pk), "connecting to peer");
                 match dht
@@ -944,22 +1511,31 @@ impl SwarmActor {
                     }
                 }
             });
+            self.connect_tasks.insert(pk, task);
         }
     }
 
-    fn handle_connect_result(
-        &mut self,
-        result: ConnectAttemptResult,
-        connect_result_tx: &mpsc::UnboundedSender<ConnectAttemptResult>,
-    ) {
+    fn handle_connect_result(&mut self, result: ConnectAttemptResult) {
         self.active_connects = self.active_connects.saturating_sub(1);
+        self.connect_tasks.remove(&result.public_key);
 
         if let Some(info) = self.peers.get_mut(&result.public_key) {
             info.connecting = false;
         }
 
+        if self.suspended {
+            // Node destroys a connection that lands after suspend.
+            if result.result.is_ok() {
+                tracing::debug!(
+                    pk = %short_hex(&result.public_key),
+                    "swarm suspended: dropping a connection that landed during suspend"
+                );
+            }
+            return;
+        }
+
         match result.result {
-            Ok((conn, runtime)) => {
+            Ok((mut conn, runtime)) => {
                 let pk = result.public_key;
 
                 // Dedup: compare public keys to decide tie-break
@@ -976,6 +1552,17 @@ impl SwarmActor {
 
                 self.connections
                     .add(pk, ConnectionInfo { is_initiator: true });
+                self.next_generation = self.next_generation.wrapping_add(1);
+                let generation = self.next_generation;
+                self.outgoing_generations.insert(pk, generation);
+                if let (Some(closed), Some(sender)) =
+                    (conn.stream.take_close_notification(), self.outgoing_closed_tx.clone())
+                {
+                    tokio::spawn(async move {
+                        let _ = closed.await;
+                        let _ = sender.send((pk, generation));
+                    });
+                }
 
                 let topics = if let Some(info) = self.peers.get_mut(&pk) {
                     info.connected();
@@ -984,6 +1571,9 @@ impl SwarmActor {
                     vec![]
                 };
 
+                if let Ok(mut aborts) = self.aborts.lock() {
+                    aborts.push(conn.stream.abort_handle());
+                }
                 let swarm_conn = SwarmConnection {
                     peer: conn,
                     is_initiator: true,
@@ -1000,35 +1590,52 @@ impl SwarmActor {
             }
         }
 
-        self.attempt_connections(connect_result_tx);
+        self.attempt_connections();
+    }
+
+    /// Node `swarm._requeue`: a failed peer comes back after its backoff. Runs
+    /// for topic-discovered peers and, unlike the previous topic-only retry,
+    /// for explicit peers that have no topic at all.
+    fn handle_retry(&mut self, pk: [u8; 32]) {
+        if self.suspended {
+            return;
+        }
+        let connected = self.connections.has(&pk);
+        let should_requeue = self.should_requeue(&pk);
+        let Some(info) = self.peers.get_mut(&pk) else {
+            return;
+        };
+        info.set_waiting(false);
+        if !connected && should_requeue && !info.banned && !info.queued && !info.connecting {
+            info.priority = info.get_priority();
+            info.queued = true;
+            self.queue.push(pk);
+        }
+        self.attempt_connections();
     }
 
     fn schedule_retry(&mut self, pk: [u8; 32]) {
         let Some(info) = self.peers.get_mut(&pk) else {
             return;
         };
-        if info.banned || info.topics.is_empty() {
+        if info.banned || (!info.explicit && (info.topics.is_empty() || info.attempts > 3)) {
             return;
         }
 
         let delay = retry_delay(info);
         info.set_waiting(true);
 
-        let relay_addresses = info.relay_addresses.clone();
-        let topic = info.topics[0];
-        let event_tx = self.discovery_event_tx.clone();
+        let retry_tx = self.retry_tx.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            let _ = event_tx.send(DiscoveryEvent::PeerFound {
-                public_key: pk,
-                relay_addresses,
-                topic,
-            });
+            let _ = retry_tx.send(pk);
         });
     }
 
     async fn handle_server_event(&mut self, event: ServerEvent) {
+        // Node `_handleServerConnection` destroys a connection that arrives
+        // while suspended; with no reply the DHT layer drops it.
         match event {
             ServerEvent::PeerHandshake {
                 msg,
@@ -1037,6 +1644,10 @@ impl SwarmActor {
                 target: _,
                 reply_tx,
             } => {
+                if self.suspended {
+                    let _ = reply_tx.send(None);
+                    return;
+                }
                 self.handle_server_handshake(msg, from, peer_address, reply_tx).await;
             }
             ServerEvent::PeerHolepunch {
@@ -1046,6 +1657,10 @@ impl SwarmActor {
                 target: _,
                 reply_tx,
             } => {
+                if self.suspended {
+                    let _ = reply_tx.send(None);
+                    return;
+                }
                 self.handle_peer_holepunch(msg, peer_address, reply_tx).await;
             }
             _ => {}
@@ -1057,7 +1672,7 @@ impl SwarmActor {
         msg: HandshakeMessage,
         from: Ipv4Peer,
         peer_address: Option<Ipv4Peer>,
-        reply_tx: oneshot::Sender<Option<Vec<u8>>>,
+        reply_tx: oneshot::Sender<Option<ServerReply>>,
     ) {
         let initial_client_address = peer_address.clone().unwrap_or_else(|| from.clone());
         let is_forwarded = peer_address.is_some();
@@ -1077,7 +1692,7 @@ impl SwarmActor {
                 "server handshake: duplicate of an answered handshake, resending its reply"
             );
             let reply = encode_server_handshake_reply(msg.mode, peer_address, noise_reply);
-            let _ = reply_tx.send(reply);
+            let _ = reply_tx.send(reply.map(Into::into));
             return;
         }
 
@@ -1262,11 +1877,9 @@ impl SwarmActor {
         if eligible {
             self.handshake_replies.insert(&msg.noise, noise_reply.clone());
         }
-        let _ = reply_tx.send(encode_server_handshake_reply(
-            msg.mode,
-            peer_address.clone(),
-            noise_reply,
-        ));
+        let _ = reply_tx.send(
+            encode_server_handshake_reply(msg.mode, peer_address.clone(), noise_reply).map(Into::into),
+        );
 
         // If we staged a passive holepunch above, hand ownership of the
         // staged state into the actor's `connects` map and return. Slot
@@ -1298,6 +1911,7 @@ impl SwarmActor {
             .add(remote_pk, ConnectionInfo { is_initiator: false });
 
         let conn_tx = self.conn_tx.clone();
+        let aborts = Arc::clone(&self.aborts);
 
         if let (Some(relay_pk), Some(token)) = (self.config.relay_through, relay_token) {
             let dht = self.dht.clone();
@@ -1305,6 +1919,7 @@ impl SwarmActor {
             let relay_addr = self.config.relay_address;
             let rh = self.runtime_handle.clone();
             let failure_tx = self.server_failure_tx.clone();
+            let aborts = Arc::clone(&aborts);
             tokio::spawn(async move {
                 match create_server_relay_connection(
                     rh,
@@ -1318,6 +1933,9 @@ impl SwarmActor {
                 .await
                 {
                     Ok((conn, runtime)) => {
+                        if let Ok(mut aborts) = aborts.lock() {
+                            aborts.push(conn.stream.abort_handle());
+                        }
                         let swarm_conn = SwarmConnection {
                             peer: conn,
                             is_initiator: false,
@@ -1341,6 +1959,7 @@ impl SwarmActor {
             let dht = self.dht.clone();
             let client_addr_for_task = client_address.clone();
             let failure_tx = self.server_failure_tx.clone();
+            let aborts = Arc::clone(&aborts);
             tokio::spawn(async move {
                 match create_server_connection(
                     rh,
@@ -1354,6 +1973,9 @@ impl SwarmActor {
                 .await
                 {
                     Ok((conn, runtime)) => {
+                        if let Ok(mut aborts) = aborts.lock() {
+                            aborts.push(conn.stream.abort_handle());
+                        }
                         let swarm_conn = SwarmConnection {
                             peer: conn,
                             is_initiator: false,
@@ -1455,11 +2077,7 @@ impl SwarmActor {
         let holepunch_id = self.next_holepunch_id;
         self.next_holepunch_id = self.next_holepunch_id.wrapping_add(1);
 
-        // Single-fire hook: the FIRST inbound packet whose 4-tuple matches
-        // (local_id == this stream, source is currently unknown) commits
-        // the remote address and unblocks the connection. The closure must
-        // be FnOnce + Send + 'static, so we send the result to the actor
-        // through an mpsc channel rather than awaiting anything inline.
+        // The first accepted packet commits the remote address and notifies the actor.
         let event_tx = self.passive_hp_event_tx.clone();
         udx_stream.set_firewall_hook(&socket, remote_id, move |_sock, port, ip| {
             let addr = SocketAddr::new(ip, port);
@@ -1538,7 +2156,7 @@ impl SwarmActor {
         &mut self,
         msg: HolepunchMessage,
         peer_address: Ipv4Peer,
-        reply_tx: oneshot::Sender<Option<Vec<u8>>>,
+        reply_tx: oneshot::Sender<Option<ServerReply>>,
     ) {
         let Some(entry) = self.connects.get_mut(&msg.id) else {
             tracing::debug!(id = msg.id, "peer holepunch: unknown id");
@@ -1644,7 +2262,7 @@ impl SwarmActor {
             peer_address: Some(peer_address),
         };
 
-        let _ = reply_tx.send(encode_holepunch_msg_to_bytes(&reply_msg).ok());
+        let _ = reply_tx.send(encode_holepunch_msg_to_bytes(&reply_msg).ok().map(Into::into));
     }
 
     async fn handle_passive_holepunch_event(&mut self, event: PassiveHolepunchEvent) {
@@ -1683,6 +2301,7 @@ impl SwarmActor {
                 let runtime = UdxRuntime::shared(self.runtime_handle.clone());
                 let conn_tx = self.conn_tx.clone();
                 let failure_tx = self.server_failure_tx.clone();
+                let aborts = Arc::clone(&self.aborts);
                 let remote_pk = entry.remote_pk;
 
                 tokio::spawn(async move {
@@ -1707,7 +2326,10 @@ impl SwarmActor {
                         }
                     };
 
-                    let conn = PeerConnection::new(ss, remote_pk, entry.udx_socket, None);
+                    let conn = PeerConnection::with_remote_addr(ss, remote_pk, addr, entry.udx_socket, None);
+                    if let Ok(mut aborts) = aborts.lock() {
+                        aborts.push(conn.stream.abort_handle());
+                    }
                     let swarm_conn = SwarmConnection {
                         peer: conn,
                         is_initiator: false,
@@ -1846,17 +2468,26 @@ async fn create_server_connection(
         })?;
 
     let stream = runtime.create_stream(local_stream_id).await?;
+    let remote_addr = Arc::new(std::sync::Mutex::new(None));
     if dial {
         let ip = client_address.host.parse().map_err(|e| {
             SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::StreamEstablishment(
                 format!("invalid client address {}: {e}", client_address.host),
             ))
         })?;
-        stream
-            .connect(&socket, remote_id, SocketAddr::new(ip, client_address.port))
-            .await?;
+        let addr = SocketAddr::new(ip, client_address.port);
+        stream.connect(&socket, remote_id, addr).await?;
+        *remote_addr.lock().map_err(|_| SwarmError::ChannelClosed)? = Some(addr);
     } else {
-        stream.set_firewall_hook(&socket, remote_id, |_, _, _| true)?;
+        let observed = Arc::clone(&remote_addr);
+        stream.set_firewall_hook(&socket, remote_id, move |_, port, ip| {
+            if let Ok(mut addr) = observed.lock() {
+                *addr = Some(SocketAddr::new(ip, port));
+                true
+            } else {
+                false
+            }
+        })?;
     }
 
     let async_stream = stream.into_async_stream();
@@ -1871,7 +2502,9 @@ async fn create_server_connection(
     .await
     .map_err(|e| SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::SecretStream(e)))?;
 
-    let conn = PeerConnection::new(ss, noise_result.remote_public_key, socket, None);
+    let addr = remote_addr.lock().map_err(|_| SwarmError::ChannelClosed)?
+        .ok_or(SwarmError::ChannelClosed)?;
+    let conn = PeerConnection::with_remote_addr(ss, noise_result.remote_public_key, addr, socket, None);
     Ok((conn, runtime))
 }
 
@@ -1995,9 +2628,8 @@ mod tests {
         let mut info = PeerInfo::new([0u8; 32], vec![]);
         info.attempts = 0;
         let d = retry_delay(&info);
-        // Tier M: 5000..6750 ms (unproven, idx = min(0+1, 3) = 1)
-        assert!(d.as_millis() >= 5000);
-        assert!(d.as_millis() < 7000);
+        assert!(d.as_millis() >= 1000);
+        assert!(d.as_millis() <= 2000);
     }
 
     #[test]
@@ -2006,9 +2638,8 @@ mod tests {
         info.attempts = 0;
         info.proven = true;
         let d = retry_delay(&info);
-        // Tier S: 1000..1400 ms (proven, idx = min(0, 3) = 0)
         assert!(d.as_millis() >= 1000);
-        assert!(d.as_millis() < 1500);
+        assert!(d.as_millis() <= 2000);
     }
 
     #[test]
@@ -2016,9 +2647,8 @@ mod tests {
         let mut info = PeerInfo::new([0u8; 32], vec![]);
         info.attempts = 10;
         let d = retry_delay(&info);
-        // Tier X: 600_000..705_000 ms (idx capped at 3)
         assert!(d.as_millis() >= 600_000);
-        assert!(d.as_millis() < 710_000);
+        assert!(d.as_millis() <= 720_500);
     }
 
     #[test]
