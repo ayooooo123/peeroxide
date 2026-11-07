@@ -1875,11 +1875,8 @@ async fn process_incoming(
                 let is_end = header.has_flag(FLAG_END);
                 if is_data || is_end {
                     let payload_start = header.payload_offset();
-                    let payload = if payload_start <= packet.data.len() {
-                        packet.data[payload_start..].to_vec()
-                    } else {
-                        Vec::new()
-                    };
+                    let mut payload = packet.data;
+                    drop(payload.drain(..payload_start.min(payload.len())));
                     let recv_flags = (if is_data { FLAG_DATA } else { 0 })
                         | (if is_end { FLAG_END } else { 0 });
 
@@ -2215,7 +2212,6 @@ fn send_ack(
     let (Some(udp), Some(addr)) = (udp.as_ref(), remote_addr) else {
         return;
     };
-    let udp = Arc::clone(udp);
     let sack_byte_len = sack_ranges.len() * 8;
     let header = Header {
         type_flags: if sack_ranges.is_empty() { 0 } else { FLAG_SACK },
@@ -2228,6 +2224,12 @@ fn send_ack(
     let mut packet = vec![0u8; HEADER_SIZE + sack_byte_len];
     header.encode_into(&mut packet[..HEADER_SIZE]);
     encode_sack(sack_ranges, &mut packet[HEADER_SIZE..]);
+    // The common ACK needs no task or scheduler round trip.
+    if !matches!(udp.try_send_to(&packet, addr), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    {
+        return;
+    }
+    let udp = Arc::clone(udp);
     tokio::spawn(async move {
         let _ = udp.send_to(&packet, addr).await;
     });

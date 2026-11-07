@@ -86,6 +86,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 All layers are validated via golden byte fixtures and live cross-language interop tests against Node.js reference implementations. The stack uses pure Rust crypto (RustCrypto) and excludes C dependencies. It targets the Rust 2024 edition and uses the tokio async runtime.
 
+The local PearTube fork reuses the received packet allocation for its payload,
+and sends ready ACKs without spawning a task per datagram. ACK contents,
+congestion control, pacing,
+retransmission and the wire format are unchanged.
+
 ## Reference Implementations
 
 This work implements the protocols defined in the following reference projects:
