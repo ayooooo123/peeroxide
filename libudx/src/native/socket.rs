@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
@@ -16,7 +16,7 @@ pub struct Datagram {
 }
 
 struct UdxSocketInner {
-    udp: OnceLock<Arc<tokio::net::UdpSocket>>,
+    udp: Mutex<Option<Arc<tokio::net::UdpSocket>>>,
     recv_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     streams: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<super::stream::IncomingPacket>>>>,
     fallback_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Datagram>>>>,
@@ -25,7 +25,7 @@ struct UdxSocketInner {
 impl UdxSocketInner {
     fn new() -> Self {
         Self {
-            udp: OnceLock::new(),
+            udp: Mutex::new(None),
             recv_task: Mutex::new(None),
             streams: Arc::new(Mutex::new(HashMap::new())),
             fallback_tx: Arc::new(Mutex::new(None)),
@@ -33,14 +33,15 @@ impl UdxSocketInner {
     }
 
     fn udp_arc(&self) -> Result<Arc<tokio::net::UdpSocket>> {
-        Ok(Arc::clone(
-            self.udp
-                .get()
-                .ok_or_else(|| UdxError::Io(std::io::Error::other("socket not bound")))?,
-        ))
+        self.udp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| UdxError::Io(std::io::Error::other("socket not bound")))
     }
 
-    fn ensure_recv_loop(&self) -> Result<()> {
+    fn ensure_recv_loop(&self, handle: &UdxSocket) -> Result<()> {
         let mut guard = self.recv_task.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref handle) = *guard {
             if !handle.is_finished() {
@@ -51,6 +52,10 @@ impl UdxSocketInner {
         let udp = self.udp_arc()?;
         let streams = Arc::clone(&self.streams);
         let fallback_tx = Arc::clone(&self.fallback_tx);
+        // Identify the arrival socket on every demultiplexed packet so a
+        // stream mid-`change_remote` can answer on the path the packet came
+        // from (C libudx routes by the `udx_socket_t` it arrived on).
+        let socket = handle.clone();
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -64,6 +69,7 @@ impl UdxSocketInner {
                             let _ = tx.send(super::stream::IncomingPacket {
                                 data: packet,
                                 addr,
+                                socket: socket.clone(),
                             });
                             continue;
                         }
@@ -82,11 +88,15 @@ impl UdxSocketInner {
     }
 
     fn close_impl(&self) {
-        if let Ok(mut guard) = self.recv_task.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
+        if let Some(handle) = self
+            .recv_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
         }
+        *self.udp.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -119,22 +129,25 @@ impl UdxSocket {
 
     /// Bind the socket to a local address. Returns an error if already bound.
     pub async fn bind(&self, addr: SocketAddr) -> Result<()> {
-        let socket = tokio::net::UdpSocket::bind(addr).await?;
-        self.inner
+        if self
+            .inner
             .udp
-            .set(Arc::new(socket))
-            .map_err(|_| UdxError::Io(std::io::Error::other("socket already bound")))?;
-        Ok(())
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return Err(UdxError::Io(std::io::Error::other("socket already bound")));
+        }
+        let socket = tokio::net::UdpSocket::bind(addr).await?;
+        *self.inner.udp.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(socket));
+        // A rebind after `shutdown` restarts the demux loop for the same
+        // stream map and datagram channel.
+        self.inner.ensure_recv_loop(self)
     }
 
     /// Return the local address this socket is bound to.
     pub async fn local_addr(&self) -> Result<SocketAddr> {
-        let udp = self
-            .inner
-            .udp
-            .get()
-            .ok_or_else(|| UdxError::Io(std::io::Error::other("socket not bound")))?;
-        Ok(udp.local_addr()?)
+        Ok(self.inner.udp_arc()?.local_addr()?)
     }
 
     /// Set the IP time-to-live (IPv4 `IP_TTL` / IPv6 hop limit) used for
@@ -171,7 +184,7 @@ impl UdxSocket {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(local_id, tx);
-        self.inner.ensure_recv_loop()?;
+        self.inner.ensure_recv_loop(self)?;
         Ok(())
     }
 
@@ -199,21 +212,46 @@ impl UdxSocket {
             .fallback_tx
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(tx);
-        self.inner.ensure_recv_loop()?;
+        self.inner.ensure_recv_loop(self)?;
         Ok(rx)
     }
 
     /// Close the socket and stop the receive loop.
     ///
-    /// Consumes `self`. Because `UdxSocket` is a clone handle, the socket is
-    /// only actually closed when every clone has either been dropped or
-    /// `close`d and the internal `Arc` reaches zero.
+    /// Because `UdxSocket` is a clone handle, this closes the shared socket
+    /// for every clone. The handle can be bound again with [`Self::bind`].
     pub async fn close(self) -> Result<()> {
-        let inner = self.inner.clone();
-        drop(self);
-        if Arc::strong_count(&inner) == 0 {
-            inner.close_impl();
-        }
+        self.inner.close_impl();
         Ok(())
+    }
+
+    /// Close the underlying UDP socket and stop the receive loop without
+    /// consuming the handle.
+    ///
+    /// Any send attempted afterwards fails (`socket not bound`), and the
+    /// handle can be bound again with [`Self::bind`] — the UDX stream map and
+    /// datagram channel survive, which is what a DHT suspend/resume cycle
+    /// needs (dht-rpc `io.suspend()` closes both sockets and rebinds on
+    /// `io.resume()`).
+    ///
+    /// Resolves once the receive task has dropped its reference to the OS
+    /// socket, so the port can be rebound immediately (dht-rpc awaits both
+    /// `close()` calls before rebinding for the same reason).
+    pub async fn shutdown(&self) {
+        let handle = self
+            .inner
+            .recv_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        self.inner
+            .udp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 }

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `UdxStreamRemote` (`UdxStream::remote_handle` / `UdxAsyncStream::remote_handle`): `change_remote` moves a connected stream to another peer and socket with C libudx semantics (in-flight packets keep their destination, completion once they are ACKed, MTU search restarted, no MTU probes while changing); `remote_observed` resolves when the peer reaches us on the new path; `try_send` sends an unreliable message (Node `rawStream.trySend`).
+
+### Changed
+
+- Firewall hooks can reject a packet without closing the listening stream.
+- Firewall hooks stay armed after the stream connects and run for packets arriving on another socket than the stream's, as C `on_firewall` does; a connected stream only gates the packet.
+
+### Fixed
+
+- Packets queued on a firewall-hooked stream before its first packet arrived were sent to `0.0.0.0:0` and lost for good (retransmits included); they now wait for the hook to commit a peer.
+
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/libudx-v1.7.3...libudx-v1.7.4) - 2026-11-02
 
 ### Fixed

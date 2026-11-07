@@ -11,7 +11,7 @@ use crate::error::{Result, UdxError};
 use super::congestion::CaState;
 use super::header::{
     Header, SackRange,
-    FLAG_DATA, FLAG_END, FLAG_DESTROY, FLAG_SACK, FLAG_HEARTBEAT,
+    FLAG_DATA, FLAG_END, FLAG_DESTROY, FLAG_MESSAGE, FLAG_SACK, FLAG_HEARTBEAT,
     HEADER_SIZE, encode_sack, decode_sack,
 };
 
@@ -77,35 +77,6 @@ fn seq_after(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b)) as i32 > 0
 }
 
-/// Decide whether a UDX packet is plausible as the *first* arrival on an
-/// unconnected stream awaiting its firewall-hook 4-tuple commit.
-///
-/// This is a defence-in-depth check; the socket-layer demux already enforces
-/// header magic + version. Here we additionally reject flag combinations that
-/// no legitimate fresh stream would lead with:
-/// - `type_flags == 0`: a flagless packet carries no meaningful UDX intent
-///   and looks like an unauthenticated probe.
-/// - `FLAG_DESTROY`: a peer cannot legitimately tear down a stream that has
-///   not yet been agreed (no prior packets, no negotiated state).
-/// - `FLAG_SACK` in isolation: SACK ranges are meaningless before we have
-///   sent any data to be selectively acknowledged.
-///
-/// Returns `false` to indicate "drop this packet, leave the hook armed for
-/// the next inbound arrival". Returns `true` to permit hook firing and
-/// 4-tuple commit.
-#[inline]
-fn is_plausible_first_packet(header: &Header) -> bool {
-    if header.type_flags == 0 {
-        return false;
-    }
-    if header.has_flag(FLAG_DESTROY) {
-        return false;
-    }
-    if header.type_flags == FLAG_SACK {
-        return false;
-    }
-    true
-}
 
 // ── Packet types ─────────────────────────────────────────────────────────────
 
@@ -113,6 +84,11 @@ pub(crate) struct IncomingPacket {
     pub data: Vec<u8>,
     #[allow(dead_code)]
     pub addr: SocketAddr,
+    /// The socket the datagram arrived on: the firewall hook commits to it,
+    /// and a stream mid-`change_remote` answers on this path when the peer
+    /// still sends from the old one (C libudx routes by the `udx_socket_t`
+    /// the packet arrived on).
+    pub socket: super::socket::UdxSocket,
 }
 
 pub(crate) enum StreamEvent {
@@ -126,6 +102,10 @@ pub(crate) enum StreamEvent {
 struct SentPacket {
     /// Full wire-format packet bytes (header + payload).
     packet: Vec<u8>,
+    /// Destination captured when the packet was first sent. Retransmits go
+    /// here even after `change_remote` moved the stream (C libudx keeps
+    /// `pkt->remote_addr` per packet).
+    remote_addr: SocketAddr,
     /// When this packet was (last) sent — for RTT measurement on first send.
     time_sent: Instant,
     /// Number of times this packet has been retransmitted.
@@ -166,8 +146,19 @@ pub(crate) enum StreamNotify {
 type WriteSenders = Vec<Option<oneshot::Sender<Result<()>>>>;
 type AckedRateInfo = Vec<(u32, super::congestion::rate::PacketRateInfo)>;
 type StreamMap = Arc<Mutex<std::collections::HashMap<u32, mpsc::UnboundedSender<IncomingPacket>>>>;
+/// Stream maps of the sockets a stream is registered on. Shared by the
+/// stream handle and its processor task.
+type Registrations = Arc<Mutex<Vec<StreamMap>>>;
 type FirewallHook =
-    Box<dyn FnOnce(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send>;
+    Box<dyn FnMut(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send>;
+
+/// Remove `local_id` from every socket map in `registrations`.
+fn deregister(local_id: u32, registrations: &Registrations) {
+    let maps = std::mem::take(&mut *registrations.lock().unwrap_or_else(|e| e.into_inner()));
+    for map in maps {
+        map.lock().unwrap_or_else(|e| e.into_inner()).remove(&local_id);
+    }
+}
 
 // ── StreamInner ──────────────────────────────────────────────────────────────
 
@@ -236,13 +227,21 @@ pub(crate) struct StreamInner {
     relay_target: Option<Arc<Mutex<StreamInner>>>,
 
     // ── Firewall hook (set_firewall_hook path) ──
-    /// Single-fire hook invoked on the first incoming packet when the stream
-    /// starts in listening mode (via `set_firewall_hook`). On `true` the stream
-    /// adopts the packet's source as `remote_addr` and transitions to connected.
+    /// Consulted while unconnected and for packets arriving on a socket
+    /// other than the stream's (C `on_firewall`, udx.c:1643).
     firewall_hook: Option<FirewallHook>,
-    /// Retained socket clone supplied to `set_firewall_hook`; forwarded to the
-    /// hook and cleared after the hook fires.
-    firewall_socket: Option<super::socket::UdxSocket>,
+
+    // ── Remote migration (`change_remote`) ──
+    local_id: u32,
+    /// Demux sender, so a migration can register the stream on another socket.
+    incoming_tx: Option<mpsc::UnboundedSender<IncomingPacket>>,
+    registrations: Registrations,
+    /// First seq not sent before the change, and the waiter released once
+    /// the peer has ACKed up to it (C `seq_on_remote_changed`).
+    remote_change: Option<(u32, oneshot::Sender<()>)>,
+    /// Released by the first packet from the current remote on the current
+    /// socket.
+    remote_observed: Option<oneshot::Sender<()>>,
 }
 
 impl StreamInner {
@@ -254,6 +253,16 @@ impl StreamInner {
     fn terminate(&mut self) {
         self.connected = false;
         self.notify_tx = None;
+        // Migration waiters learn the stream died (their receivers error).
+        self.remote_change = None;
+        self.remote_observed = None;
+        // Wake readers: an aborted stream reads as EOF instead of hanging.
+        let _ = self.read_tx.send(StreamEvent::End);
+        // Release the socket so a suspended DHT socket can be rebound.
+        self.udp = None;
+        if let Some(tx) = self.close_tx.take() {
+            let _ = tx.send(());
+        }
 
         for mut pw in self.pending_writes.drain(..) {
             if let Some(tx) = pw.tx.take() {
@@ -272,6 +281,17 @@ impl StreamInner {
 
     pub(crate) fn max_payload(&self) -> usize {
         self.mtu - HEADER_SIZE
+    }
+
+    /// Back to the base MTU, re-probing from scratch: a migrated stream is
+    /// on a new path (C `reset_mtu_state_machine`).
+    fn reset_mtu(&mut self) {
+        self.mtu = MTU_BASE;
+        self.mtu_state = MtuState::Base;
+        self.mtu_probe_size = MTU_BASE + MTU_STEP;
+        self.mtu_probe_count = 0;
+        self.mtu_probe_wanted = false;
+        self.mtu_max = MTU_MAX;
     }
 
     /// Inflate a DATA packet to `mtu_probe_size` by inserting zero padding after the header.
@@ -440,7 +460,13 @@ impl StreamInner {
     // ── Outgoing packet registration ─────────────────────────────────────────
 
     /// Store a sent packet in the outgoing buffer for potential retransmission.
-    pub(crate) fn register_sent(&mut self, seq: u32, packet: Vec<u8>, is_mtu_probe: bool) {
+    pub(crate) fn register_sent(
+        &mut self,
+        seq: u32,
+        packet: Vec<u8>,
+        remote_addr: SocketAddr,
+        is_mtu_probe: bool,
+    ) {
         let now = Instant::now();
         let inflight = self.inflight();
         let rate_info = self.congestion.on_packet_sent(seq, inflight, now);
@@ -448,6 +474,7 @@ impl StreamInner {
         self.unacked_bytes += packet.len();
         self.outgoing.insert(seq, SentPacket {
             packet,
+            remote_addr,
             time_sent: now,
             retransmit_count: 0,
             sacked: false,
@@ -538,6 +565,14 @@ impl StreamInner {
         }
 
         self.remote_acked = ack;
+
+        // Everything sent to the old remote is ACKed: the migration is done
+        // (C udx.c:1754).
+        if self.remote_change.as_ref().is_some_and(|(seq, _)| !seq_after(*seq, ack)) {
+            if let Some((_, done)) = self.remote_change.take() {
+                let _ = done.send(());
+            }
+        }
 
         // Efficient BTreeMap split: remove all entries with key < ack
         let to_keep = self.outgoing.split_off(&ack);
@@ -765,7 +800,7 @@ impl StreamInner {
     /// `only_lost` just the ones SACK gap analysis marked lost (fast retransmit).
     /// Updates retransmit_count and time_sent for each retransmitted packet.
     /// For MTU probes: strips padding, marks failure, and may transition to SearchComplete.
-    fn collect_retransmits(&mut self, only_lost: bool) -> Vec<Vec<u8>> {
+    fn collect_retransmits(&mut self, only_lost: bool) -> Vec<(Vec<u8>, SocketAddr)> {
         let now = Instant::now();
         let mut retransmits = Vec::new();
         let mut probe_failed = false;
@@ -779,7 +814,7 @@ impl StreamInner {
                     pkt.is_mtu_probe = false;
                     probe_failed = true;
                 }
-                retransmits.push(pkt.packet.clone());
+                retransmits.push((pkt.packet.clone(), pkt.remote_addr));
                 pkt.retransmit_count += 1;
                 pkt.time_sent = now;
                 pkt.lost = false;
@@ -870,9 +905,10 @@ pub struct UdxStream {
     incoming_tx: Option<mpsc::UnboundedSender<IncomingPacket>>,
     incoming_rx: Mutex<Option<mpsc::UnboundedReceiver<IncomingPacket>>>,
     pub(crate) read_rx: Option<mpsc::UnboundedReceiver<StreamEvent>>,
-    #[allow(dead_code)]
     close_rx: Option<oneshot::Receiver<()>>,
-    socket_streams: Mutex<Option<StreamMap>>,
+    /// Stream maps of every socket this stream is registered on, so the
+    /// processor's exit and `Drop` can deregister it from all of them.
+    registrations: Registrations,
 }
 
 impl UdxStream {
@@ -880,6 +916,7 @@ impl UdxStream {
         let (read_tx, read_rx) = mpsc::unbounded_channel();
         let (close_tx, close_rx) = oneshot::channel();
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let registrations = Registrations::default();
 
         let inner = StreamInner {
             remote_id: 0,
@@ -919,7 +956,11 @@ impl UdxStream {
             send_queue: VecDeque::new(),
             relay_target: None,
             firewall_hook: None,
-            firewall_socket: None,
+            local_id,
+            incoming_tx: Some(incoming_tx.clone()),
+            registrations: Arc::clone(&registrations),
+            remote_change: None,
+            remote_observed: None,
         };
 
         Self {
@@ -930,7 +971,7 @@ impl UdxStream {
             incoming_rx: Mutex::new(Some(incoming_rx)),
             read_rx: Some(read_rx),
             close_rx: Some(close_rx),
-            socket_streams: Mutex::new(None),
+            registrations,
         }
     }
 
@@ -941,17 +982,34 @@ impl UdxStream {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        // Prevent Drop from deregistering — the processor task is still running
-        self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // Prevent Drop from deregistering — the processor task is still
+        // running and deregisters on exit through its own clone.
+        self.registrations = Registrations::default();
         let Some(read_rx) = self.read_rx.take() else {
             return super::async_stream::UdxAsyncStream::new(
                 Arc::clone(&self.inner),
                 mpsc::unbounded_channel().1,
                 None,
+                self.close_rx.take(),
             );
         };
         let inner = Arc::clone(&self.inner);
-        super::async_stream::UdxAsyncStream::new(inner, read_rx, processor)
+        super::async_stream::UdxAsyncStream::new(inner, read_rx, processor, self.close_rx.take())
+    }
+
+    /// A handle that can destroy this stream from another owner, without
+    /// waiting for the owner to drop it.
+    pub fn abort_handle(&self) -> UdxStreamAbort {
+        UdxStreamAbort {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// A handle that migrates this stream to another peer from any task.
+    pub fn remote_handle(&self) -> UdxStreamRemote {
+        UdxStreamRemote {
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     /// Returns the current effective MTU (Maximum Transmission Unit) in bytes.
@@ -968,6 +1026,46 @@ impl UdxStream {
         remote_addr: SocketAddr,
     ) -> Result<()> {
         let udp = socket.udp_arc()?;
+
+        // A stream primed by `set_firewall_hook` already runs its processor;
+        // connecting it now only fixes the peer identity (Node
+        // `createRawStream()` followed by `rawStream.connect()`).
+        let processor_started = self
+            .incoming_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none();
+        if processor_started {
+            {
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                // Only a hooked stream may re-arm its peer; C returns EISCONN.
+                if inner.connected && inner.firewall_hook.is_none() {
+                    return Err(UdxError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "stream already connected",
+                    )));
+                }
+                inner.remote_id = remote_id;
+                inner.remote_addr = Some(remote_addr);
+                inner.udp = Some(udp);
+                inner.connected = true;
+                // The hook stays armed: C keeps `on_firewall` for packets
+                // that later arrive on another socket.
+                let sentinel: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                for packet in &mut inner.send_queue {
+                    if packet.remote_addr == sentinel {
+                        packet.remote_addr = remote_addr;
+                    }
+                }
+                if let Some(tx) = &inner.notify_tx {
+                    let _ = tx.send(StreamNotify::DataQueued);
+                }
+            }
+            self.register_on(socket)?;
+            tracing::debug!(local_id = self.local_id, remote_id, ?remote_addr, "stream connected (primed)");
+            return Ok(());
+        }
+
         let (notify_tx, notify_rx) = mpsc::unbounded_channel();
 
         {
@@ -979,32 +1077,8 @@ impl UdxStream {
             inner.notify_tx = Some(notify_tx);
         }
 
-        let tx = self
-            .incoming_tx
-            .as_ref()
-            .ok_or_else(|| UdxError::Io(std::io::Error::other("stream already consumed")))?
-            .clone();
-        socket.register_stream(self.local_id, tx)?;
-
-        *self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(socket.streams_ref());
-
-        let incoming_rx = self
-            .incoming_rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .ok_or_else(|| UdxError::Io(std::io::Error::other("processor already started")))?;
-        let inner = Arc::clone(&self.inner);
-        let streams_for_cleanup = socket.streams_ref();
-        let local_id_for_cleanup = self.local_id;
-        let handle = tokio::spawn(async move {
-            process_incoming(inner, incoming_rx, notify_rx).await;
-            if let Ok(mut map) = streams_for_cleanup.lock() {
-                map.remove(&local_id_for_cleanup);
-            }
-        });
-        *self.processor.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        self.register_on(socket)?;
+        self.start_processor(notify_rx)?;
 
         tracing::debug!(local_id = self.local_id, remote_id, ?remote_addr, "stream connected");
         Ok(())
@@ -1067,33 +1141,14 @@ impl UdxStream {
         Ok(())
     }
 
-    /// Register a single-fire firewall hook for deferred 4-tuple commitment.
+    /// Register a firewall hook for deferred socket and peer commitment.
     ///
-    /// The stream is registered with `socket` for demux immediately (so incoming
-    /// packets addressed to `self.local_id` are routed here), but `connected`
-    /// stays `false` until the hook fires.  On the first incoming packet the hook
-    /// is called with `(socket, src_port, src_ip)`; if it returns `true` the
-    /// stream adopts that source as its remote address and becomes connected,
-    /// then processes the packet normally.  If it returns `false` the processor
-    /// exits and the stream is permanently closed.
-    ///
-    /// `remote_id` is the remote stream's local ID (known from the noise handshake
-    /// payload) and is required for correct ACK construction.
-    ///
-    // NOTE: this hook is single-fire (`FnOnce`) to match the Node
-    // Hyperswarm reference. A re-armable variant (`Fn`, fired on every
-    // unknown-source packet) would let the stream re-bind its 4-tuple
-    // mid-stream — useful for NAT rebinding (when a NAT's external
-    // mapping for the local port changes during a long-lived connection,
-    // typically after an idle period or under aggressive NAT timers)
-    // and for follow-the-mobile-peer scenarios (a peer that roams
-    // between networks/interfaces without tearing the stream down).
-    // We don't ship that variant today — the reference doesn't, and
-    // rebinding mid-stream has subtle interactions with congestion
-    // control, RTT estimation, and the secret-stream cipher state. If
-    // we ever need it, add a sibling `set_firewall_hook_rearmable` that
-    // takes an `Fn` and re-arms after each fire; do NOT change this
-    // method's signature.
+    /// The stream receives on `socket` (and on any socket added later with
+    /// [`Self::listen_on`]); the first packet the hook accepts commits both
+    /// the peer address and the socket it arrived on, as C libudx's
+    /// `on_firewall` lets Node bind a raw stream to whichever socket the
+    /// peer reached. Returning `false` rejects only the current packet; a
+    /// later packet can invoke the hook again.
     pub fn set_firewall_hook<F>(
         &self,
         socket: &super::socket::UdxSocket,
@@ -1101,7 +1156,7 @@ impl UdxStream {
         hook: F,
     ) -> Result<()>
     where
-        F: FnOnce(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send + 'static,
+        F: FnMut(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send + 'static,
     {
         let udp = socket.udp_arc()?;
         let (notify_tx, notify_rx) = mpsc::unbounded_channel();
@@ -1112,19 +1167,43 @@ impl UdxStream {
             inner.udp = Some(udp);
             inner.notify_tx = Some(notify_tx);
             inner.firewall_hook = Some(Box::new(hook));
-            inner.firewall_socket = Some(socket.clone());
         }
 
+        self.register_on(socket)?;
+        self.start_processor(notify_rx)?;
+
+        tracing::debug!(local_id = self.local_id, remote_id, "stream listening (firewall hook set)");
+        Ok(())
+    }
+
+    /// Also receive on `socket` while the firewall hook is armed, so the peer
+    /// may reach this stream on more than one of our sockets (a holepunch
+    /// socket and the DHT socket, say). The hook commits whichever socket
+    /// the accepted packet arrives on.
+    pub fn listen_on(&self, socket: &super::socket::UdxSocket) -> Result<()> {
+        if self.inner.lock().unwrap_or_else(|e| e.into_inner()).firewall_hook.is_none() {
+            return Err(UdxError::Io(std::io::Error::other("stream has no firewall hook")));
+        }
+        self.register_on(socket)
+    }
+
+    /// Register for `socket`'s demux and remember the map for deregistration.
+    fn register_on(&self, socket: &super::socket::UdxSocket) -> Result<()> {
         let tx = self
             .incoming_tx
             .as_ref()
             .ok_or_else(|| UdxError::Io(std::io::Error::other("stream already consumed")))?
             .clone();
         socket.register_stream(self.local_id, tx)?;
+        self.registrations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(socket.streams_ref());
+        Ok(())
+    }
 
-        *self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(socket.streams_ref());
-
+    /// Spawn the processor task; it deregisters the stream when it exits.
+    fn start_processor(&self, notify_rx: mpsc::UnboundedReceiver<StreamNotify>) -> Result<()> {
         let incoming_rx = self
             .incoming_rx
             .lock()
@@ -1132,17 +1211,13 @@ impl UdxStream {
             .take()
             .ok_or_else(|| UdxError::Io(std::io::Error::other("processor already started")))?;
         let inner = Arc::clone(&self.inner);
-        let streams_for_cleanup = socket.streams_ref();
-        let local_id_for_cleanup = self.local_id;
+        let registrations = Arc::clone(&self.registrations);
+        let local_id = self.local_id;
         let handle = tokio::spawn(async move {
             process_incoming(inner, incoming_rx, notify_rx).await;
-            if let Ok(mut map) = streams_for_cleanup.lock() {
-                map.remove(&local_id_for_cleanup);
-            }
+            deregister(local_id, &registrations);
         });
         *self.processor.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
-
-        tracing::debug!(local_id = self.local_id, remote_id, "stream listening (firewall hook set)");
         Ok(())
     }
 
@@ -1191,11 +1266,166 @@ impl UdxStream {
             }
         }
 
-        if let Some(streams) = self.socket_streams.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.local_id);
-        }
+        deregister(self.local_id, &self.registrations);
 
         tracing::debug!(local_id = self.local_id, "stream destroyed");
+        Ok(())
+    }
+}
+
+/// Handle that destroys a stream from an owner other than the one holding it.
+///
+/// Returned by [`UdxStream::abort_handle`] and
+/// [`super::async_stream::UdxAsyncStream::abort_handle`]. Used by the swarm to
+/// close connections it has already handed out (Node
+/// `swarm.suspend()` destroys `_allConnections`).
+#[derive(Clone)]
+pub struct UdxStreamAbort {
+    inner: Arc<Mutex<StreamInner>>,
+}
+
+impl UdxStreamAbort {
+    pub(crate) fn new(inner: Arc<Mutex<StreamInner>>) -> Self {
+        Self { inner }
+    }
+
+    /// Send DESTROY to the peer, fail pending writes and turn reads into EOF.
+    pub fn abort(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.connected {
+            if let (Some(udp), Some(addr)) = (inner.udp.clone(), inner.remote_addr) {
+                let header = Header {
+                    type_flags: FLAG_DESTROY,
+                    data_offset: 0,
+                    remote_id: inner.remote_id,
+                    recv_window: 0,
+                    seq: inner.next_seq,
+                    ack: inner.next_remote_seq,
+                };
+                tokio::spawn(async move {
+                    let _ = udp.send_to(&header.encode(), addr).await;
+                });
+            }
+        }
+        inner.terminate();
+    }
+}
+
+/// Handle that moves a connected stream to another peer and path
+/// (Node `rawStream.changeRemote`), from any task holding it.
+///
+/// Returned by [`UdxStream::remote_handle`] and
+/// [`super::async_stream::UdxAsyncStream::remote_handle`].
+#[derive(Clone)]
+pub struct UdxStreamRemote {
+    inner: Arc<Mutex<StreamInner>>,
+}
+
+impl UdxStreamRemote {
+    pub(crate) fn new(inner: Arc<Mutex<StreamInner>>) -> Self {
+        Self { inner }
+    }
+
+    /// Send to `remote_id` at `remote_addr` over `socket` from now on
+    /// (C `udx_stream_change_remote`, udx.c:2582).
+    ///
+    /// Packets already in flight keep their original destination; the
+    /// stream keeps hearing its old socket, and the MTU search restarts on
+    /// the new path. Resolves once the peer has ACKed everything sent before
+    /// the change (right away when nothing was in flight). Fails on an
+    /// unconnected stream, a port of 0, or while an earlier change is still
+    /// pending (Node throws `Remote already changing`).
+    pub async fn change_remote(
+        &self,
+        socket: &super::socket::UdxSocket,
+        remote_id: u32,
+        remote_addr: SocketAddr,
+    ) -> Result<()> {
+        let udp = socket.udp_arc()?;
+        if remote_addr.port() == 0 {
+            return Err(UdxError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "remote port is 0",
+            )));
+        }
+        let (local_id, incoming_tx, registrations, done) = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if !inner.connected || !inner.is_alive() {
+                return Err(UdxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "stream not connected",
+                )));
+            }
+            if inner.remote_change.is_some() {
+                return Err(UdxError::Io(std::io::Error::other("remote already changing")));
+            }
+            inner.remote_id = remote_id;
+            inner.remote_addr = Some(remote_addr);
+            inner.udp = Some(udp);
+            // Not sent yet, so bound to the remote at send time as in C.
+            for queued in &mut inner.send_queue {
+                queued.remote_addr = remote_addr;
+                queued.packet[4..8].copy_from_slice(&remote_id.to_le_bytes());
+            }
+            inner.reset_mtu();
+            let done = inner.outgoing.keys().next_back().copied().map(|last| {
+                let (tx, rx) = oneshot::channel();
+                inner.remote_change = Some((last.wrapping_add(1), tx));
+                rx
+            });
+            let incoming_tx = inner.incoming_tx.clone().ok_or(UdxError::StreamClosed)?;
+            (inner.local_id, incoming_tx, Arc::clone(&inner.registrations), done)
+        };
+        socket.register_stream(local_id, incoming_tx)?;
+        registrations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(socket.streams_ref());
+        tracing::debug!(local_id, remote_id, ?remote_addr, deferred = done.is_some(), "change_remote");
+        if let Some(rx) = done {
+            rx.await.map_err(|_| UdxError::StreamClosed)?;
+        }
+        Ok(())
+    }
+
+    /// Resolves once a packet from the current remote arrives on the current
+    /// socket: the peer is reaching us over the path `change_remote` set.
+    pub async fn remote_observed(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if !inner.is_alive() {
+                return Err(UdxError::StreamClosed);
+            }
+            inner.remote_observed = Some(tx);
+        }
+        rx.await.map_err(|_| UdxError::StreamClosed)
+    }
+
+    /// Send an unreliable message to the current remote (C `udx_stream_send`,
+    /// Node `rawStream.trySend`). hyperdht sends an empty one so the peer
+    /// notices a new path without application data crossing it.
+    pub fn try_send(&self, payload: &[u8]) -> Result<()> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let (Some(udp), Some(addr)) = (inner.udp.clone(), inner.remote_addr) else {
+            return Err(UdxError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "stream not connected",
+            )));
+        };
+        let header = Header {
+            type_flags: FLAG_MESSAGE,
+            data_offset: 0,
+            remote_id: inner.remote_id,
+            recv_window: DEFAULT_RWND,
+            seq: inner.next_seq,
+            ack: inner.next_remote_seq,
+        };
+        let mut packet = header.encode().to_vec();
+        packet.extend_from_slice(payload);
+        tokio::spawn(async move {
+            let _ = udp.send_to(&packet, addr).await;
+        });
         Ok(())
     }
 }
@@ -1207,13 +1437,7 @@ impl Drop for UdxStream {
                 handle.abort();
             }
         }
-        if let Ok(mut guard) = self.socket_streams.lock() {
-            if let Some(streams) = guard.take() {
-                if let Ok(mut map) = streams.lock() {
-                    map.remove(&self.local_id);
-                }
-            }
-        }
+        deregister(self.local_id, &self.registrations);
     }
 }
 
@@ -1247,57 +1471,42 @@ async fn process_incoming(
                 // ── Header decode (early — defense in depth) ─────────
                 // The socket-layer demux (`UdxSocket::ensure_recv_loop`) only
                 // routes packets whose header magic+version pass `Header::decode`,
-                // so reaching this point implies a well-formed UDX header. We
-                // re-decode here regardless: it is cheap (a 20-byte parse), it
-                // makes the firewall-hook gate immediately below independent of
-                // the socket-layer contract, and it lets the gate inspect the
-                // first packet's flag bits before committing the 4-tuple.
+                // so reaching this point implies a well-formed UDX header.
                 let header = match Header::decode(&packet.data) {
                     Ok(h) => h,
                     Err(_) => continue,
                 };
 
-                // ── Firewall hook: single-fire 4-tuple commit ────────────
-                // NOTE: this hook is single-fire (`FnOnce`) to match the Node
-                // Hyperswarm reference. A re-armable variant (`Fn`, fired on every
-                // unknown-source packet) would let the stream re-bind its 4-tuple
-                // mid-stream — useful for NAT rebinding (when a NAT's external
-                // mapping for the local port changes during a long-lived connection,
-                // typically after an idle period or under aggressive NAT timers)
-                // and for follow-the-mobile-peer scenarios (a peer that roams
-                // between networks/interfaces without tearing the stream down).
-                // We don't ship that variant today — the reference doesn't, and
-                // rebinding mid-stream has subtle interactions with congestion
-                // control, RTT estimation, and the secret-stream cipher state. If
-                // we ever need it, add a sibling `set_firewall_hook_rearmable` that
-                // takes an `Fn` and re-arms after each fire; do NOT change this
-                // method's signature.
+                // ── Firewall hook: commit peer and socket ───────────────
+                // C libudx udx.c:1643-1650 consults the hook while the
+                // stream has no socket and for packets arriving on another
+                // socket than the stream's; the source address never
+                // matters. An unconnected stream commits to the accepted
+                // packet's socket and address; a connected one just lets the
+                // packet through (the owner may `change_remote` to it).
                 {
-                    let is_connected = inner.lock().unwrap_or_else(|e| e.into_inner()).connected;
-                    if !is_connected {
-                        // Defense in depth: drop implausible first packets
-                        // without firing the hook. Leaves the hook armed for
-                        // the legitimate first arrival. UDX header magic+version
-                        // are already enforced by the socket demux; here we
-                        // additionally reject flag combinations that cannot
-                        // legitimately begin a fresh stream.
-                        if !is_plausible_first_packet(&header) {
-                            tracing::debug!(
-                                addr = ?packet.addr,
-                                flags = header.type_flags,
-                                "firewall hook: dropping implausible first packet (hook left armed)"
-                            );
-                            continue;
-                        }
-                        let hook_and_socket = {
-                            let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.firewall_hook.take().zip(guard.firewall_socket.take())
+                    let (is_connected, foreign) = {
+                        let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                        let same = match (&guard.udp, packet.socket.udp_arc().ok()) {
+                            (Some(ours), Some(arrival)) => Arc::ptr_eq(ours, &arrival),
+                            _ => false,
                         };
-                        match hook_and_socket {
-                            Some((hook, sock)) => {
-                                if hook(&sock, packet.addr.port(), packet.addr.ip()) {
+                        (guard.connected, !guard.connected || !same)
+                    };
+                    if foreign {
+                        let hook = inner.lock().unwrap_or_else(|e| e.into_inner()).firewall_hook.take();
+                        match hook {
+                            Some(mut hook) => {
+                                let accepted = hook(&packet.socket, packet.addr.port(), packet.addr.ip());
+                                inner.lock().unwrap_or_else(|e| e.into_inner()).firewall_hook = Some(hook);
+                                if !accepted {
+                                    tracing::debug!(addr = ?packet.addr, "firewall hook: rejected");
+                                    continue;
+                                }
+                                if !is_connected {
                                     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.remote_addr = Some(packet.addr);
+                                    guard.udp = packet.socket.udp_arc().ok();
                                     guard.connected = true;
                                     // Patch any packets queued before the hook fired
                                     // (they were staged with the 0.0.0.0:0 sentinel).
@@ -1308,16 +1517,32 @@ async fn process_incoming(
                                             qp.remote_addr = packet.addr;
                                         }
                                     }
-                                    if let Some(ref tx) = guard.notify_tx {
+                                    if let Some(tx) = &guard.notify_tx {
                                         let _ = tx.send(StreamNotify::DataQueued);
                                     }
                                     tracing::debug!(addr = ?packet.addr, "firewall hook: accepted");
-                                } else {
-                                    tracing::debug!(addr = ?packet.addr, "firewall hook: rejected");
-                                    break;
                                 }
                             }
-                            None => continue,
+                            // No hook: C processes the packet; an unconnected
+                            // stream has nowhere to send replies, so drop it.
+                            None if !is_connected => continue,
+                            None => {}
+                        }
+                    }
+                }
+
+                // ── Peer seen on the current path (after `change_remote`) ──
+                {
+                    let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.remote_observed.is_some() && guard.remote_addr == Some(packet.addr) {
+                        let same = match (&guard.udp, packet.socket.udp_arc().ok()) {
+                            (Some(ours), Some(arrival)) => Arc::ptr_eq(ours, &arrival),
+                            _ => false,
+                        };
+                        if same {
+                            if let Some(tx) = guard.remote_observed.take() {
+                                let _ = tx.send(());
+                            }
                         }
                     }
                 }
@@ -1388,7 +1613,7 @@ async fn process_incoming(
                     .and_then(|region| decode_sack(&packet.data[region]).ok());
 
                 if has_ack || sack_ranges.is_some() {
-                    let (completed, outgoing_empty, ack_advanced, fast_retransmits, udp_for_retransmit, addr_for_retransmit) = {
+                    let (completed, outgoing_empty, ack_advanced, fast_retransmits, udp_for_retransmit) = {
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                         guard.send_rwnd = header.recv_window;
                         let prev_acked = guard.remote_acked;
@@ -1414,11 +1639,10 @@ async fn process_incoming(
 
                         let retransmits = guard.collect_retransmits(true);
                         let udp = guard.udp.clone();
-                        let addr = guard.remote_addr;
 
                         let empty = guard.outgoing.is_empty();
                         let advanced = guard.remote_acked != prev_acked;
-                        (write_completions, empty, advanced, retransmits, udp, addr)
+                        (write_completions, empty, advanced, retransmits, udp)
                     };
 
                     // Notify completed writes (outside lock)
@@ -1427,11 +1651,11 @@ async fn process_incoming(
                     }
 
                     // Fast retransmit lost packets (outside lock)
-                    if let (Some(udp), Some(addr)) = (udp_for_retransmit, addr_for_retransmit) {
-                        for packet_bytes in fast_retransmits {
+                    if let Some(udp) = udp_for_retransmit {
+                        for (packet_bytes, dest) in fast_retransmits {
                             let udp = Arc::clone(&udp);
                             tokio::spawn(async move {
-                                let _ = udp.send_to(&packet_bytes, addr).await;
+                                let _ = udp.send_to(&packet_bytes, dest).await;
                             });
                         }
                     }
@@ -1537,8 +1761,11 @@ async fn process_incoming(
                     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                     let mut batch: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
                     let was_outgoing_empty = guard.outgoing.is_empty();
-
-                    while !guard.send_queue.is_empty() {
+                    // A hooked stream has no peer until its first packet
+                    // commits one (C `udx_stream_write` is ENOTCONN before
+                    // that): sending now would address 0.0.0.0:0 and lose
+                    // the packets for good, retransmits included.
+                    while guard.connected && !guard.send_queue.is_empty() {
                         let inflight = guard.inflight() + batch.len() as u32;
                         let queued_bytes = guard.queued_bytes;
                         guard.congestion.check_app_limited(queued_bytes, inflight);
@@ -1565,16 +1792,19 @@ async fn process_incoming(
                             guard.mtu_probe_wanted = true;
                         }
 
+                        // No probes while old-path packets are still in
+                        // flight (C udx.c:846).
                         let is_mtu_probe = if is_data
                             && guard.mtu_state == MtuState::Search
                             && guard.mtu_probe_wanted
+                            && guard.remote_change.is_none()
                         {
                             guard.mtu_probeify_packet(&mut packet)
                         } else {
                             false
                         };
 
-                        guard.register_sent(queued.seq, packet.clone(), is_mtu_probe);
+                        guard.register_sent(queued.seq, packet.clone(), queued.remote_addr, is_mtu_probe);
                         guard.congestion.pacing.try_consume(
                             packet.len() as u32, std::time::Instant::now(),
                         );
@@ -1602,7 +1832,11 @@ async fn process_incoming(
                     );
                 }
 
-                let has_more = !inner.lock().unwrap_or_else(|e| e.into_inner()).send_queue.is_empty();
+                // The hook's `DataQueued` notify re-arms pacing once connected.
+                let has_more = {
+                    let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.connected && !guard.send_queue.is_empty()
+                };
                 if shutting_down && !has_more {
                     break;
                 }
@@ -1614,7 +1848,7 @@ async fn process_incoming(
             }
 
             _ = &mut rto_sleep => {
-                let (retransmits, udp, remote_addr, new_rto, should_close) = {
+                let (retransmits, udp, new_rto, should_close) = {
                     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
 
                     if guard.outgoing.is_empty() {
@@ -1627,7 +1861,7 @@ async fn process_incoming(
 
                     if guard.rto_timeouts >= MAX_RTO_TIMEOUTS {
                         // Exceeded max timeouts — fail the stream
-                        (Vec::new(), None, None, 0u64, true)
+                        (Vec::new(), None, 0u64, true)
                     } else {
                         guard.congestion.on_rto();
                         if let Some(&max_seq) = guard.outgoing.keys().last() {
@@ -1636,7 +1870,7 @@ async fn process_incoming(
                         guard.rto = (guard.rto * 2).min(MAX_RTO_MS);
                         let retransmits = guard.collect_retransmits(false);
                         let rto = guard.rto as u64;
-                        (retransmits, guard.udp.clone(), guard.remote_addr, rto, false)
+                        (retransmits, guard.udp.clone(), rto, false)
                     }
                 };
 
@@ -1661,16 +1895,16 @@ async fn process_incoming(
                 }
 
                 // Retransmit unACKed/unSACKed packets
-                if let (Some(udp), Some(addr)) = (udp, remote_addr) {
+                if let Some(udp) = udp {
                     tracing::debug!(
                         count = retransmits.len(),
                         rto_ms = new_rto,
                         "retransmitting packets"
                     );
-                    for packet_bytes in retransmits {
+                    for (packet_bytes, dest) in retransmits {
                         let udp = Arc::clone(&udp);
                         tokio::spawn(async move {
-                            let _ = udp.send_to(&packet_bytes, addr).await;
+                            let _ = udp.send_to(&packet_bytes, dest).await;
                         });
                     }
                 }
@@ -1860,7 +2094,11 @@ mod mtu_tests {
             relay_target: None,
             ended: false,
             firewall_hook: None,
-            firewall_socket: None,
+            local_id: 0,
+            incoming_tx: None,
+            registrations: Registrations::default(),
+            remote_change: None,
+            remote_observed: None,
         }
     }
 
@@ -1887,6 +2125,7 @@ mod mtu_tests {
         let packet = build_data_packet(0, 0, 0, &payload);
         inner.outgoing.insert(0, SentPacket {
             packet,
+            remote_addr: "0.0.0.0:0".parse().unwrap(),
             time_sent: Instant::now(),
             retransmit_count: 0,
             sacked: false,
@@ -1932,7 +2171,7 @@ mod mtu_tests {
     fn sack_ranges_are_bounded_by_outgoing() {
         let mut inner = make_stream_inner();
         for seq in [5u32, 6, 9] {
-            inner.register_sent(seq, build_data_packet(0, seq, 0, b"x"), false);
+            inner.register_sent(seq, build_data_packet(0, seq, 0, b"x"), "0.0.0.0:0".parse().unwrap(), false);
         }
 
         let started = Instant::now();
@@ -1977,6 +2216,7 @@ mod mtu_tests {
             let packet = build_data_packet(0, i, 0, &payload);
             inner.outgoing.insert(i, SentPacket {
                 packet,
+                remote_addr: "0.0.0.0:0".parse().unwrap(),
                 time_sent: Instant::now(),
                 retransmit_count: 0,
                 sacked: false,
@@ -1994,81 +2234,3 @@ mod mtu_tests {
     }
 }
 
-#[cfg(test)]
-mod firewall_gate_tests {
-    use super::*;
-
-    fn header_with_flags(type_flags: u8) -> Header {
-        Header {
-            type_flags,
-            data_offset: 0,
-            remote_id: 42,
-            recv_window: DEFAULT_RWND,
-            seq: 1,
-            ack: 0,
-        }
-    }
-
-    #[test]
-    fn first_packet_with_data_flag_is_plausible() {
-        let hdr = header_with_flags(FLAG_DATA);
-        assert!(is_plausible_first_packet(&hdr));
-    }
-
-    #[test]
-    fn first_packet_with_heartbeat_is_plausible() {
-        let hdr = header_with_flags(FLAG_HEARTBEAT);
-        assert!(is_plausible_first_packet(&hdr));
-    }
-
-    #[test]
-    fn first_packet_with_data_and_sack_is_plausible() {
-        let hdr = header_with_flags(FLAG_DATA | FLAG_SACK);
-        assert!(is_plausible_first_packet(&hdr));
-    }
-
-    #[test]
-    fn first_packet_with_end_is_plausible() {
-        let hdr = header_with_flags(FLAG_END);
-        assert!(
-            is_plausible_first_packet(&hdr),
-            "a zero-length stream may legitimately lead with FLAG_END"
-        );
-    }
-
-    #[test]
-    fn bare_first_packet_is_rejected() {
-        let hdr = header_with_flags(0);
-        assert!(
-            !is_plausible_first_packet(&hdr),
-            "type_flags == 0 carries no meaningful intent and must not commit the 4-tuple"
-        );
-    }
-
-    #[test]
-    fn destroy_only_first_packet_is_rejected() {
-        let hdr = header_with_flags(FLAG_DESTROY);
-        assert!(
-            !is_plausible_first_packet(&hdr),
-            "FLAG_DESTROY before any agreed state is illegitimate"
-        );
-    }
-
-    #[test]
-    fn destroy_combined_with_data_is_still_rejected() {
-        let hdr = header_with_flags(FLAG_DESTROY | FLAG_DATA);
-        assert!(
-            !is_plausible_first_packet(&hdr),
-            "FLAG_DESTROY in any combination is illegitimate for a first packet"
-        );
-    }
-
-    #[test]
-    fn sack_only_first_packet_is_rejected() {
-        let hdr = header_with_flags(FLAG_SACK);
-        assert!(
-            !is_plausible_first_packet(&hdr),
-            "SACK-only first packet is meaningless before we have sent any data"
-        );
-    }
-}

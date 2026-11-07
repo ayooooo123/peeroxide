@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::stream::{StreamEvent, StreamInner, build_data_packets, build_end_packet};
 
@@ -30,6 +30,7 @@ pub struct UdxAsyncStream {
     read_eof: bool,
     processor: Option<tokio::task::JoinHandle<()>>,
     fin_queued: bool,
+    close_rx: Option<oneshot::Receiver<()>>,
 }
 
 impl UdxAsyncStream {
@@ -37,6 +38,7 @@ impl UdxAsyncStream {
         inner: Arc<Mutex<StreamInner>>,
         read_rx: mpsc::UnboundedReceiver<StreamEvent>,
         processor: Option<tokio::task::JoinHandle<()>>,
+        close_rx: Option<oneshot::Receiver<()>>,
     ) -> Self {
         Self {
             inner,
@@ -46,7 +48,23 @@ impl UdxAsyncStream {
             read_eof: false,
             processor,
             fin_queued: false,
+            close_rx,
         }
+    }
+
+    /// A handle that can destroy this stream from another owner.
+    pub fn abort_handle(&self) -> super::stream::UdxStreamAbort {
+        super::stream::UdxStreamAbort::new(Arc::clone(&self.inner))
+    }
+
+    /// A handle that migrates this stream to another peer from any task.
+    pub fn remote_handle(&self) -> super::stream::UdxStreamRemote {
+        super::stream::UdxStreamRemote::new(Arc::clone(&self.inner))
+    }
+
+    /// Take the one-shot notification sent when the underlying stream closes.
+    pub fn take_close_notification(&mut self) -> Option<oneshot::Receiver<()>> {
+        self.close_rx.take()
     }
 
     fn lock(&self) -> MutexGuard<'_, StreamInner> {
