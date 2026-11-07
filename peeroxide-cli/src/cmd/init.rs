@@ -165,7 +165,10 @@ fn run_update(config_path: &Path, args: &InitArgs) -> i32 {
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: cannot read config file {}: {e}", config_path.display());
+            eprintln!(
+                "error: cannot read config file {}: {e}",
+                config_path.display()
+            );
             return 1;
         }
     };
@@ -372,7 +375,10 @@ mod tests {
         let result = doc.to_string();
 
         assert!(result.contains("true"), "public should be set to true");
-        assert!(result.contains("old:1234"), "bootstrap should be preserved, got: {result}");
+        assert!(
+            result.contains("old:1234"),
+            "bootstrap should be preserved, got: {result}"
+        );
     }
 
     #[test]
@@ -390,8 +396,14 @@ mod tests {
             result.contains("[network]"),
             "should create standard [network] table, got: {result}"
         );
-        assert!(result.contains("public = true"), "public should be set, got: {result}");
-        assert!(result.contains("port = 49737"), "existing content preserved, got: {result}");
+        assert!(
+            result.contains("public = true"),
+            "public should be set, got: {result}"
+        );
+        assert!(
+            result.contains("port = 49737"),
+            "existing content preserved, got: {result}"
+        );
     }
 
     #[test]
@@ -402,9 +414,18 @@ mod tests {
         doc["network"]["public"] = toml_edit::value(true);
         let result = doc.to_string();
 
-        assert!(result.contains("# Whether public"), "leading comment should be preserved, got: {result}");
-        assert!(result.contains("# Bootstrap nodes"), "other comments preserved, got: {result}");
-        assert!(result.contains("old:1"), "bootstrap preserved, got: {result}");
+        assert!(
+            result.contains("# Whether public"),
+            "leading comment should be preserved, got: {result}"
+        );
+        assert!(
+            result.contains("# Bootstrap nodes"),
+            "other comments preserved, got: {result}"
+        );
+        assert!(
+            result.contains("old:1"),
+            "bootstrap preserved, got: {result}"
+        );
     }
 
     #[test]
@@ -430,7 +451,10 @@ mod tests {
         }
 
         let result = doc.to_string();
-        assert!(result.contains("# keep this"), "trailing comment should be preserved, got: {result}");
+        assert!(
+            result.contains("# keep this"),
+            "trailing comment should be preserved, got: {result}"
+        );
     }
 
     #[test]
@@ -452,7 +476,10 @@ mod tests {
             !result.contains("network = {"),
             "should NOT create inline table, got: {result}"
         );
-        assert!(result.contains("port = 49737"), "existing content preserved, got: {result}");
+        assert!(
+            result.contains("port = 49737"),
+            "existing content preserved, got: {result}"
+        );
     }
 
     #[test]

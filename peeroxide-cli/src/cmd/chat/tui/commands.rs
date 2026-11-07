@@ -123,8 +123,14 @@ mod tests {
     #[test]
     fn ignore_with_and_without_arg() {
         assert_eq!(parse("/ignore"), Some(SlashCommand::IgnoreList));
-        assert_eq!(parse("/ignore alice"), Some(SlashCommand::Ignore("alice".to_string())));
-        assert_eq!(parse("/ignore  alice  "), Some(SlashCommand::Ignore("alice".to_string())));
+        assert_eq!(
+            parse("/ignore alice"),
+            Some(SlashCommand::Ignore("alice".to_string()))
+        );
+        assert_eq!(
+            parse("/ignore  alice  "),
+            Some(SlashCommand::Ignore("alice".to_string()))
+        );
     }
 
     #[test]

@@ -5,8 +5,8 @@ use libudx::UdxRuntime;
 use peeroxide_dht::hyperdht;
 use tokio::signal;
 
-use crate::config::ResolvedConfig;
 use super::{build_dht_config, parse_topic, to_hex};
+use crate::config::ResolvedConfig;
 
 #[derive(Args)]
 pub struct LookupArgs {

@@ -14,9 +14,9 @@
 
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::hchacha;
-use poly1305::universal_hash::KeyInit;
 use poly1305::Poly1305;
-use rand::{rngs::OsRng, TryRngCore};
+use poly1305::universal_hash::KeyInit;
+use rand::{TryRngCore, rngs::OsRng};
 use thiserror::Error;
 use tracing::debug;
 
@@ -238,7 +238,9 @@ impl Push {
     pub fn new(key: &[u8; KEYBYTES]) -> (Self, [u8; HEADERBYTES]) {
         let mut header = [0u8; HEADERBYTES];
         // SAFETY: OsRng is the OS CSPRNG; failure indicates a fatal platform issue.
-        OsRng.try_fill_bytes(&mut header).expect("OsRng should not fail");
+        OsRng
+            .try_fill_bytes(&mut header)
+            .expect("OsRng should not fail");
         let state = Self::with_header(key, &header);
         (state, header)
     }
@@ -271,7 +273,12 @@ impl Push {
             rekey_state(&mut self.key, &mut self.nonce);
         }
 
-        debug!(tag, plaintext_len = plaintext.len(), ciphertext_len = ciphertext.len(), "Push::push");
+        debug!(
+            tag,
+            plaintext_len = plaintext.len(),
+            ciphertext_len = ciphertext.len(),
+            "Push::push"
+        );
         ciphertext
     }
 }

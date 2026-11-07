@@ -366,9 +366,7 @@ fn natural_widths(snap: &StatusSnapshot, level: TruncLevel) -> (usize, usize) {
                 parts.join("  ").len()
             }
         }
-        TruncLevel::Short
-        | TruncLevel::ShortDropF
-        | TruncLevel::ShortDropFD => {
+        TruncLevel::Short | TruncLevel::ShortDropF | TruncLevel::ShortDropFD => {
             let mut parts: Vec<String> = Vec::new();
             if snap.send_pending > 0 {
                 parts.push(format!("S:{}", snap.send_pending));
@@ -379,7 +377,11 @@ fn natural_widths(snap: &StatusSnapshot, level: TruncLevel) -> (usize, usize) {
             parts.join(" ").len()
         }
         TruncLevel::ChannelAndReady => {
-            if activity_present { 0 } else { "Ready".len() }
+            if activity_present {
+                0
+            } else {
+                "Ready".len()
+            }
         }
         TruncLevel::ChannelOnly => 0,
     };
@@ -480,8 +482,8 @@ pub fn render_bar(
             *entry = w;
         }
     }
-    let has_real_sticky = slots.left.contains_key(&LeftSeg::Sending)
-        || slots.left.contains_key(&LeftSeg::Receiving);
+    let has_real_sticky =
+        slots.left.contains_key(&LeftSeg::Sending) || slots.left.contains_key(&LeftSeg::Receiving);
     if has_real_sticky {
         slots.left.remove(&LeftSeg::Ready);
     }
@@ -495,10 +497,8 @@ pub fn render_bar(
         }
     }
 
-    let active_left: std::collections::HashMap<LeftSeg, &str> = left_segs
-        .iter()
-        .map(|(k, s)| (*k, s.as_str()))
-        .collect();
+    let active_left: std::collections::HashMap<LeftSeg, &str> =
+        left_segs.iter().map(|(k, s)| (*k, s.as_str())).collect();
     let left_rendered: Vec<String> = if has_real_sticky {
         [LeftSeg::Sending, LeftSeg::Receiving]
             .iter()
@@ -524,7 +524,11 @@ pub fn render_bar(
     let right_rendered: Vec<String> = right_segs
         .iter()
         .map(|(k, s)| {
-            let w = slots.right.get(k).copied().unwrap_or_else(|| s.chars().count());
+            let w = slots
+                .right
+                .get(k)
+                .copied()
+                .unwrap_or_else(|| s.chars().count());
             pad_left(s, w)
         })
         .collect();
@@ -718,7 +722,10 @@ fn build_segments(snap: &StatusSnapshot, level: TruncLevel) -> (LeftSegments, Ri
         TruncLevel::Full => {
             let mut v = Vec::new();
             if snap.send_pending > 0 {
-                v.push((LeftSeg::Sending, format!("Sending... ({})", snap.send_pending)));
+                v.push((
+                    LeftSeg::Sending,
+                    format!("Sending... ({})", snap.send_pending),
+                ));
             }
             if snap.recv_pending > 0 {
                 v.push((
@@ -844,7 +851,14 @@ mod tests {
         }
     }
 
-    fn snap_inbox(s: usize, r: usize, f: usize, d: usize, name: &str, inbox_unread: usize) -> StatusSnapshot {
+    fn snap_inbox(
+        s: usize,
+        r: usize,
+        f: usize,
+        d: usize,
+        name: &str,
+        inbox_unread: usize,
+    ) -> StatusSnapshot {
         StatusSnapshot {
             send_pending: s,
             recv_pending: r,
@@ -867,9 +881,7 @@ mod tests {
     fn falls_back_progressively() {
         let s = snap(3, 12, 7, 42, "#room-name");
         // 120 → Full; shrink to find each level.
-        let levels: Vec<TruncLevel> = (10..=120)
-            .map(|w| pick_level(&s, w))
-            .collect();
+        let levels: Vec<TruncLevel> = (10..=120).map(|w| pick_level(&s, w)).collect();
         // Should be monotone-non-increasing in "detail" (i.e. as we go from
         // narrow to wide, level moves Full → ChannelOnly direction).
         // Spot-check: at very narrow widths we end at ChannelOnly.
@@ -1080,10 +1092,7 @@ mod tests {
             bar.body
         );
         assert!(!bar.body.contains("INBOX"));
-        assert_eq!(
-            bar.inbox_highlight, None,
-            "no highlight when unread = 0"
-        );
+        assert_eq!(bar.inbox_highlight, None, "no highlight when unread = 0");
     }
 
     #[test]
@@ -1097,7 +1106,9 @@ mod tests {
             bar.body
         );
         assert!(!bar.body.contains("inbox"));
-        let range = bar.inbox_highlight.expect("highlight should be Some when unread > 0");
+        let range = bar
+            .inbox_highlight
+            .expect("highlight should be Some when unread > 0");
         assert_eq!(range.end - range.start, "INBOX".len());
         // Body slice at the range should equal "INBOX".
         let chars: Vec<char> = bar.body.chars().collect();

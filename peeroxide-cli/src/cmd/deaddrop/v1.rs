@@ -1,9 +1,9 @@
 use super::*;
-use crate::cmd::sigterm_recv;
 use crate::cmd::deaddrop::progress::{
-    state::{Phase, ProgressState},
     reporter::ProgressReporter,
+    state::{Phase, ProgressState},
 };
+use crate::cmd::sigterm_recv;
 
 const MAX_CHUNKS: usize = 65535;
 const ROOT_HEADER_SIZE: usize = 39;
@@ -72,7 +72,10 @@ pub async fn run_put(args: &PutArgs, cfg: &ResolvedConfig) -> i32 {
 
     let total_chunks = compute_chunk_count(data.len());
     if total_chunks > MAX_CHUNKS {
-        eprintln!("error: file too large ({} chunks exceeds max {})", total_chunks, MAX_CHUNKS);
+        eprintln!(
+            "error: file too large ({} chunks exceeds max {})",
+            total_chunks, MAX_CHUNKS
+        );
         return 1;
     }
 
@@ -124,21 +127,22 @@ pub async fn run_put(args: &PutArgs, cfg: &ResolvedConfig) -> i32 {
         return 1;
     }
 
-    let (max_concurrency, dispatch_delay): (Option<usize>, Option<Duration>) = if let Some(ref speed_str) = args.max_speed {
-        match parse_max_speed(speed_str) {
-            Ok(speed) => {
-                let cap = ((speed / 22000) as usize).max(1);
-                let delay = Duration::from_secs_f64(22000.0 / speed as f64);
-                (Some(cap), Some(delay))
+    let (max_concurrency, dispatch_delay): (Option<usize>, Option<Duration>) =
+        if let Some(ref speed_str) = args.max_speed {
+            match parse_max_speed(speed_str) {
+                Ok(speed) => {
+                    let cap = ((speed / 22000) as usize).max(1);
+                    let delay = Duration::from_secs_f64(22000.0 / speed as f64);
+                    (Some(cap), Some(delay))
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return 1;
+                }
             }
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 1;
-            }
-        }
-    } else {
-        (None, None)
-    };
+        } else {
+            (None, None)
+        };
 
     let filename: Arc<str> = if args.file == "-" {
         Arc::from("<stdin>")
@@ -154,7 +158,15 @@ pub async fn run_put(args: &PutArgs, cfg: &ResolvedConfig) -> i32 {
     let mut reporter = ProgressReporter::from_args(state.clone(), args.no_progress, args.json);
     reporter.on_start();
 
-    if let Err(e) = publish_chunks(&handle, &chunks, max_concurrency, dispatch_delay, Some(state.clone())).await {
+    if let Err(e) = publish_chunks(
+        &handle,
+        &chunks,
+        max_concurrency,
+        dispatch_delay,
+        Some(state.clone()),
+    )
+    .await
+    {
         eprintln!("error: publish failed: {e}");
         reporter.finish().await;
         let _ = handle.destroy().await;
@@ -167,14 +179,19 @@ pub async fn run_put(args: &PutArgs, cfg: &ResolvedConfig) -> i32 {
 
     eprintln!("  published to DHT (best-effort)");
     eprintln!("  pickup key printed to stdout");
-    eprintln!("  refreshing every {}s, monitoring for acks...", args.refresh_interval);
+    eprintln!(
+        "  refreshing every {}s, monitoring for acks...",
+        args.refresh_interval
+    );
 
     let op_factory = reporter.operation_factory();
     let ack_topic = peeroxide::discovery_key(&[root_kp.public_key.as_slice(), b"ack"].concat());
     let mut seen_acks: HashSet<[u8; 32]> = HashSet::new();
     let mut pickup_count: u64 = 0;
 
-    let ttl_deadline = args.ttl.map(|t| tokio::time::Instant::now() + Duration::from_secs(t));
+    let ttl_deadline = args
+        .ttl
+        .map(|t| tokio::time::Instant::now() + Duration::from_secs(t));
     let mut refresh_interval = tokio::time::interval(Duration::from_secs(args.refresh_interval));
     refresh_interval.tick().await;
     let mut ack_interval = tokio::time::interval(Duration::from_secs(30));
@@ -451,8 +468,7 @@ pub async fn get_from_root(
     }
 
     if !args.no_ack {
-        let ack_topic =
-            peeroxide::discovery_key(&[root_pk.as_slice(), b"ack"].concat());
+        let ack_topic = peeroxide::discovery_key(&[root_pk.as_slice(), b"ack"].concat());
         let ack_kp = KeyPair::generate();
         let _ = handle.announce(ack_topic, &ack_kp, &[]).await;
         eprintln!("  ack sent (ephemeral identity)");
@@ -483,12 +499,18 @@ mod tests {
     #[test]
     fn compute_chunk_count_two() {
         assert_eq!(compute_chunk_count(ROOT_PAYLOAD_MAX + 1), 2);
-        assert_eq!(compute_chunk_count(ROOT_PAYLOAD_MAX + NON_ROOT_PAYLOAD_MAX), 2);
+        assert_eq!(
+            compute_chunk_count(ROOT_PAYLOAD_MAX + NON_ROOT_PAYLOAD_MAX),
+            2
+        );
     }
 
     #[test]
     fn compute_chunk_count_three() {
-        assert_eq!(compute_chunk_count(ROOT_PAYLOAD_MAX + NON_ROOT_PAYLOAD_MAX + 1), 3);
+        assert_eq!(
+            compute_chunk_count(ROOT_PAYLOAD_MAX + NON_ROOT_PAYLOAD_MAX + 1),
+            3
+        );
     }
 
     #[test]

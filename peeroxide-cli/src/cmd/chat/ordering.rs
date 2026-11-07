@@ -312,8 +312,7 @@ pub fn chain_sort(messages: Vec<PendingMessage>) -> Vec<PendingMessage> {
     let mut out: Vec<PendingMessage> = Vec::new();
     for (_chain, batch) in by_chain {
         let mut by_prev: HashMap<[u8; 32], PendingMessage> = HashMap::new();
-        let mut own_hashes: std::collections::HashSet<[u8; 32]> =
-            std::collections::HashSet::new();
+        let mut own_hashes: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         for m in batch {
             own_hashes.insert(m.msg_hash);
             by_prev.insert(m.prev_msg_hash, m);
@@ -359,13 +358,7 @@ mod tests {
         msg_on_feed(id, DEFAULT_FEED, own, prev, ts)
     }
 
-    fn msg_on_feed(
-        id: u8,
-        feed_pubkey: [u8; 32],
-        own: u8,
-        prev: u8,
-        ts: u64,
-    ) -> PendingMessage {
+    fn msg_on_feed(id: u8, feed_pubkey: [u8; 32], own: u8, prev: u8, ts: u64) -> PendingMessage {
         PendingMessage {
             display: DisplayMessage {
                 id_pubkey: h(id),
@@ -389,9 +382,7 @@ mod tests {
         out
     }
 
-    fn collect_with_late(
-        rx: &mut mpsc::UnboundedReceiver<DisplayMessage>,
-    ) -> Vec<(String, bool)> {
+    fn collect_with_late(rx: &mut mpsc::UnboundedReceiver<DisplayMessage>) -> Vec<(String, bool)> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
             out.push((m.content, m.late));

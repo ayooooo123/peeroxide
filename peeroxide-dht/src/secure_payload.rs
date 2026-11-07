@@ -12,9 +12,9 @@
 
 #![allow(missing_docs)]
 
+use blake2::Blake2bMac;
 use blake2::digest::consts::U32;
 use blake2::digest::{KeyInit, Mac};
-use blake2::Blake2bMac;
 use rand::RngCore;
 use xsalsa20poly1305::aead::AeadInPlace;
 use xsalsa20poly1305::{Nonce, Tag, XSalsa20Poly1305};

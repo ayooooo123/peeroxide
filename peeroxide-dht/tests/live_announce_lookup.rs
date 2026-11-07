@@ -57,7 +57,10 @@ async fn run_rust_only() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("announce complete");
 
     let relays = handle_a.current_relay_addresses();
-    tracing::info!("node A current_relay_addresses() returned {} entries", relays.len());
+    tracing::info!(
+        "node A current_relay_addresses() returned {} entries",
+        relays.len()
+    );
     assert!(
         !relays.is_empty(),
         "current_relay_addresses() should be populated after a successful announce"
@@ -147,8 +150,12 @@ impl JsLivePeer {
             {
                 let lines = self.lines.lock().unwrap();
                 if let Some(line) = lines.first() {
-                    let v: Value = serde_json::from_str(line).expect("invalid JSON from JS live peer");
-                    assert!(v["ready"].as_bool().unwrap_or(false), "JS live peer not ready");
+                    let v: Value =
+                        serde_json::from_str(line).expect("invalid JSON from JS live peer");
+                    assert!(
+                        v["ready"].as_bool().unwrap_or(false),
+                        "JS live peer not ready"
+                    );
                     return;
                 }
             }
@@ -166,7 +173,9 @@ impl JsLivePeer {
         let mut msg = cmd;
         msg["id"] = serde_json::json!(id);
         let line = serde_json::to_string(&msg).unwrap() + "\n";
-        self.stdin.write_all(line.as_bytes()).expect("write to JS stdin");
+        self.stdin
+            .write_all(line.as_bytes())
+            .expect("write to JS stdin");
         self.stdin.flush().expect("flush JS stdin");
         id
     }
@@ -195,14 +204,20 @@ impl JsLivePeer {
     fn announce(&mut self, topic_hex: &str) -> Value {
         let id = self.send_cmd(serde_json::json!({ "cmd": "announce", "topic": topic_hex }));
         let reply = self.wait_reply(id);
-        assert!(reply["ok"].as_bool().unwrap_or(false), "JS announce failed: {reply}");
+        assert!(
+            reply["ok"].as_bool().unwrap_or(false),
+            "JS announce failed: {reply}"
+        );
         reply
     }
 
     fn lookup(&mut self, topic_hex: &str) -> Vec<String> {
         let id = self.send_cmd(serde_json::json!({ "cmd": "lookup", "topic": topic_hex }));
         let reply = self.wait_reply(id);
-        assert!(reply["ok"].as_bool().unwrap_or(false), "JS lookup failed: {reply}");
+        assert!(
+            reply["ok"].as_bool().unwrap_or(false),
+            "JS lookup failed: {reply}"
+        );
         reply["peers"]
             .as_array()
             .unwrap_or(&vec![])
@@ -259,7 +274,10 @@ async fn run_cross_language() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Rust looking up topic {topic1_hex}");
     let results = handle.lookup(topic1).await?;
     let found_any = results.iter().any(|r| !r.peers.is_empty());
-    assert!(found_any, "Rust found no peers after JS announce on live DHT");
+    assert!(
+        found_any,
+        "Rust found no peers after JS announce on live DHT"
+    );
     tracing::info!("test 1 passed: Rust discovered JS peer on live DHT");
 
     // ── Test 2: Rust announces, Node.js looks up ──────────────────────────
@@ -275,7 +293,10 @@ async fn run_cross_language() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("JS looking up topic {topic2_hex}");
     let js_peers = js.lookup(&topic2_hex);
-    assert!(!js_peers.is_empty(), "JS found no peers after Rust announce on live DHT");
+    assert!(
+        !js_peers.is_empty(),
+        "JS found no peers after Rust announce on live DHT"
+    );
     tracing::info!("test 2 passed: JS discovered Rust peer on live DHT");
 
     handle.destroy().await?;

@@ -11,7 +11,7 @@
 
 use std::env;
 
-use peeroxide::{spawn, JoinOpts, SwarmConfig, SwarmConnection};
+use peeroxide::{JoinOpts, SwarmConfig, SwarmConnection, spawn};
 
 #[tokio::main]
 async fn main() {
@@ -41,14 +41,11 @@ async fn main() {
     let (_join, handle, mut conn_rx) = spawn(config).await.expect("swarm spawn failed");
 
     handle
-        .join(
-            topic,
-            {
-                let mut opts = JoinOpts::default();
-                opts.client = false;
-                opts
-            },
-        )
+        .join(topic, {
+            let mut opts = JoinOpts::default();
+            opts.client = false;
+            opts
+        })
         .await
         .expect("join failed");
 

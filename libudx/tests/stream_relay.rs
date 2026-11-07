@@ -54,11 +54,19 @@ async fn run_relay_test() -> Result<(), Box<dyn std::error::Error>> {
     relay_stream_1.relay_to(&relay_stream_2)?;
     relay_stream_2.relay_to(&relay_stream_1)?;
 
-    relay_stream_1.connect(&relay_sock_1, 1, peer_a_addr).await?;
-    relay_stream_2.connect(&relay_sock_2, 2, peer_b_addr).await?;
+    relay_stream_1
+        .connect(&relay_sock_1, 1, peer_a_addr)
+        .await?;
+    relay_stream_2
+        .connect(&relay_sock_2, 2, peer_b_addr)
+        .await?;
 
-    peer_a_stream.connect(&peer_a_sock, 10, relay_addr_1).await?;
-    peer_b_stream.connect(&peer_b_sock, 20, relay_addr_2).await?;
+    peer_a_stream
+        .connect(&peer_a_sock, 10, relay_addr_1)
+        .await?;
+    peer_b_stream
+        .connect(&peer_b_sock, 20, relay_addr_2)
+        .await?;
 
     peer_a_stream.write(b"hello from A").await?;
     let data = peer_b_stream

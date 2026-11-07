@@ -8,9 +8,7 @@
 use std::net::SocketAddr;
 
 use libudx::UdxRuntime;
-use peeroxide_dht::hyperdht_messages::{
-    NoisePayload, SecretStreamInfo, UdxInfo, FIREWALL_UNKNOWN,
-};
+use peeroxide_dht::hyperdht_messages::{FIREWALL_UNKNOWN, NoisePayload, SecretStreamInfo, UdxInfo};
 use peeroxide_dht::noise;
 use peeroxide_dht::noise_wrap::NoiseWrap;
 use peeroxide_dht::secret_stream::SecretStream;

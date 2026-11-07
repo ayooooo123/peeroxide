@@ -1,14 +1,14 @@
 use clap::Args;
 use libudx::UdxRuntime;
+use peeroxide_dht::blind_relay::BlindRelayServerConfig;
 use peeroxide_dht::hyperdht::{self, HyperDhtConfig, KeyPair};
 use peeroxide_dht::relay_service::{self, RelayServiceConfig};
-use peeroxide_dht::blind_relay::BlindRelayServerConfig;
 use peeroxide_dht::rpc::DhtConfig;
 use std::time::Duration;
 use tokio::signal;
 
-use crate::config::ResolvedConfig;
 use super::{resolve_bootstrap, to_hex};
+use crate::config::ResolvedConfig;
 
 #[derive(Args)]
 pub struct RelayArgs {

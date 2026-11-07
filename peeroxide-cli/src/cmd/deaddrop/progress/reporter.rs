@@ -241,12 +241,8 @@ impl OperationFactory {
                     wire_sent.clone(),
                     wire_received.clone(),
                 );
-                let state = ProgressState::new_with_wire(
-                    Phase::Put,
-                    *version,
-                    filename.clone(),
-                    wire,
-                );
+                let state =
+                    ProgressState::new_with_wire(Phase::Put, *version, filename.clone(), wire);
                 state.set_length(bytes_total, indexes_total, data_total);
                 let renderer = BarRenderer::new(state.clone());
                 OperationHandle {
@@ -437,7 +433,11 @@ mod tests {
 
     #[tokio::test]
     async fn quiet_operation_factory_returns_usable_state() {
-        for mode in [ProgressMode::Off, ProgressMode::PeriodicLog, ProgressMode::Json] {
+        for mode in [
+            ProgressMode::Off,
+            ProgressMode::PeriodicLog,
+            ProgressMode::Json,
+        ] {
             let r = ProgressReporter::new(mode, make_state());
             let factory = r.operation_factory();
             let op = factory.begin_operation(100, 0, 1);

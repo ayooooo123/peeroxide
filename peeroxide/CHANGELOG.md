@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Closed inbound and outbound connections release their connection-set slot, allowing the same Rust or Node peer to reconnect.
 - Dead stream handles are pruned; relay selection follows hyperswarm's forced/randomized-NAT semantics.
+- Adopt shared `HyperDhtServer` for Hyperswarm server connections, eliminating obsolete custom server handshakes, passive holepunch staging, and duplicate caches.
+- Lifecycle generation protection covers both incoming server connections and outgoing asynchronous dials to prevent stale completions from retiring replacements, overwriting current connections, or decrementing active connection counters for subsequent attempts.
+- Dead connection streams are retired prior to duplicate tie-break so immediate redials with close notifications queued behind them are accepted; abort registries are pruned on stream close.
+- Preserve topic-refresh flush completion when using the shared server.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.7.3...peeroxide-v1.7.4) - 2026-11-02
 

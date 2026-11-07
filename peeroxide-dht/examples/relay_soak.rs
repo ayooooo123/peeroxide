@@ -16,11 +16,11 @@
 //!
 //! Press Ctrl-C to shut down gracefully.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use peeroxide_dht::hyperdht::{self, HyperDhtConfig, ServerEvent, DEFAULT_BOOTSTRAP};
+use peeroxide_dht::hyperdht::{self, DEFAULT_BOOTSTRAP, HyperDhtConfig, ServerEvent};
 use peeroxide_dht::rpc::DhtConfig;
 
 use libudx::UdxRuntime;
@@ -35,10 +35,7 @@ async fn main() {
         .init();
 
     let mut dht_config = DhtConfig::default();
-    dht_config.bootstrap = DEFAULT_BOOTSTRAP
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
+    dht_config.bootstrap = DEFAULT_BOOTSTRAP.iter().map(|s| (*s).to_string()).collect();
     dht_config.ephemeral = Some(false);
     dht_config.firewalled = false;
 
@@ -46,8 +43,9 @@ async fn main() {
     config.dht = dht_config;
 
     let runtime = UdxRuntime::new().expect("failed to create UDX runtime");
-    let (join_handle, handle, mut server_rx) =
-        hyperdht::spawn(&runtime, config).await.expect("spawn failed");
+    let (join_handle, handle, mut server_rx) = hyperdht::spawn(&runtime, config)
+        .await
+        .expect("spawn failed");
 
     tracing::info!("waiting for bootstrap...");
     handle.bootstrapped().await.expect("bootstrap failed");
@@ -73,9 +71,7 @@ async fn main() {
                     );
                     let _ = reply_tx.send(None);
                 }
-                ServerEvent::PeerHolepunch {
-                    reply_tx, from, ..
-                } => {
+                ServerEvent::PeerHolepunch { reply_tx, from, .. } => {
                     hp.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(
                         from = %format!("{}:{}", from.host, from.port),

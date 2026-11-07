@@ -43,12 +43,27 @@ async fn relay_basic_forward() {
         relay_stream_1.relay_to(&relay_stream_2).expect("relay 1→2");
         relay_stream_2.relay_to(&relay_stream_1).expect("relay 2→1");
 
-        relay_stream_1.connect(&relay_sock_1, 1, peer_a_addr).await.expect("connect relay_1");
-        relay_stream_2.connect(&relay_sock_2, 2, peer_b_addr).await.expect("connect relay_2");
-        peer_a_stream.connect(&peer_a_sock, 10, relay_addr_1).await.expect("connect peer_a");
-        peer_b_stream.connect(&peer_b_sock, 20, relay_addr_2).await.expect("connect peer_b");
+        relay_stream_1
+            .connect(&relay_sock_1, 1, peer_a_addr)
+            .await
+            .expect("connect relay_1");
+        relay_stream_2
+            .connect(&relay_sock_2, 2, peer_b_addr)
+            .await
+            .expect("connect relay_2");
+        peer_a_stream
+            .connect(&peer_a_sock, 10, relay_addr_1)
+            .await
+            .expect("connect peer_a");
+        peer_b_stream
+            .connect(&peer_b_sock, 20, relay_addr_2)
+            .await
+            .expect("connect peer_b");
 
-        peer_a_stream.write(b"relay forward test").await.expect("write");
+        peer_a_stream
+            .write(b"relay forward test")
+            .await
+            .expect("write");
         let data = peer_b_stream.read().await.expect("read").expect("EOF");
         assert_eq!(data, b"relay forward test");
     })
@@ -86,10 +101,22 @@ async fn relay_large_transfer() {
         relay_stream_1.relay_to(&relay_stream_2).expect("relay 1→2");
         relay_stream_2.relay_to(&relay_stream_1).expect("relay 2→1");
 
-        relay_stream_1.connect(&relay_sock_1, 1, peer_a_addr).await.expect("connect relay_1");
-        relay_stream_2.connect(&relay_sock_2, 2, peer_b_addr).await.expect("connect relay_2");
-        peer_a_stream.connect(&peer_a_sock, 10, relay_addr_1).await.expect("connect peer_a");
-        peer_b_stream.connect(&peer_b_sock, 20, relay_addr_2).await.expect("connect peer_b");
+        relay_stream_1
+            .connect(&relay_sock_1, 1, peer_a_addr)
+            .await
+            .expect("connect relay_1");
+        relay_stream_2
+            .connect(&relay_sock_2, 2, peer_b_addr)
+            .await
+            .expect("connect relay_2");
+        peer_a_stream
+            .connect(&peer_a_sock, 10, relay_addr_1)
+            .await
+            .expect("connect peer_a");
+        peer_b_stream
+            .connect(&peer_b_sock, 20, relay_addr_2)
+            .await
+            .expect("connect peer_b");
 
         let payload = random_payload(1024 * 1024);
         peer_a_stream.write(&payload).await.expect("write");
@@ -135,10 +162,22 @@ async fn relay_bidirectional_concurrent() {
         relay_stream_1.relay_to(&relay_stream_2).expect("relay 1→2");
         relay_stream_2.relay_to(&relay_stream_1).expect("relay 2→1");
 
-        relay_stream_1.connect(&relay_sock_1, 1, peer_a_addr).await.expect("connect relay_1");
-        relay_stream_2.connect(&relay_sock_2, 2, peer_b_addr).await.expect("connect relay_2");
-        peer_a_stream.connect(&peer_a_sock, 10, relay_addr_1).await.expect("connect peer_a");
-        peer_b_stream.connect(&peer_b_sock, 20, relay_addr_2).await.expect("connect peer_b");
+        relay_stream_1
+            .connect(&relay_sock_1, 1, peer_a_addr)
+            .await
+            .expect("connect relay_1");
+        relay_stream_2
+            .connect(&relay_sock_2, 2, peer_b_addr)
+            .await
+            .expect("connect relay_2");
+        peer_a_stream
+            .connect(&peer_a_sock, 10, relay_addr_1)
+            .await
+            .expect("connect peer_a");
+        peer_b_stream
+            .connect(&peer_b_sock, 20, relay_addr_2)
+            .await
+            .expect("connect peer_b");
 
         let payload_a = random_payload(10 * 1024);
         let payload_b = random_payload(10 * 1024);
@@ -146,11 +185,17 @@ async fn relay_bidirectional_concurrent() {
         let payload_b_clone = payload_b.clone();
 
         let write_a = tokio::spawn(async move {
-            peer_a_stream.write(&payload_a_clone).await.expect("write_a");
+            peer_a_stream
+                .write(&payload_a_clone)
+                .await
+                .expect("write_a");
             peer_a_stream
         });
         let write_b = tokio::spawn(async move {
-            peer_b_stream.write(&payload_b_clone).await.expect("write_b");
+            peer_b_stream
+                .write(&payload_b_clone)
+                .await
+                .expect("write_b");
             peer_b_stream
         });
 
@@ -217,18 +262,39 @@ async fn relay_chain() {
         r2a_stream.relay_to(&r2b_stream).expect("relay r2a→r2b");
         r2b_stream.relay_to(&r2a_stream).expect("relay r2b→r2a");
 
-        r1a_stream.connect(&r1a_sock, 1, peer_a_addr).await.expect("connect r1a");
-        r1b_stream.connect(&r1b_sock, 30, r2a_addr).await.expect("connect r1b");
-        r2a_stream.connect(&r2a_sock, 20, r1b_addr).await.expect("connect r2a");
-        r2b_stream.connect(&r2b_sock, 2, peer_b_addr).await.expect("connect r2b");
-        peer_a_stream.connect(&peer_a_sock, 10, r1a_addr).await.expect("connect peer_a");
-        peer_b_stream.connect(&peer_b_sock, 40, r2b_addr).await.expect("connect peer_b");
+        r1a_stream
+            .connect(&r1a_sock, 1, peer_a_addr)
+            .await
+            .expect("connect r1a");
+        r1b_stream
+            .connect(&r1b_sock, 30, r2a_addr)
+            .await
+            .expect("connect r1b");
+        r2a_stream
+            .connect(&r2a_sock, 20, r1b_addr)
+            .await
+            .expect("connect r2a");
+        r2b_stream
+            .connect(&r2b_sock, 2, peer_b_addr)
+            .await
+            .expect("connect r2b");
+        peer_a_stream
+            .connect(&peer_a_sock, 10, r1a_addr)
+            .await
+            .expect("connect peer_a");
+        peer_b_stream
+            .connect(&peer_b_sock, 40, r2b_addr)
+            .await
+            .expect("connect peer_b");
 
         peer_a_stream.write(b"chain test").await.expect("write a→b");
         let data = peer_b_stream.read().await.expect("read b").expect("EOF");
         assert_eq!(data, b"chain test");
 
-        peer_b_stream.write(b"chain reply").await.expect("write b→a");
+        peer_b_stream
+            .write(b"chain reply")
+            .await
+            .expect("write b→a");
         let data = peer_a_stream.read().await.expect("read a").expect("EOF");
         assert_eq!(data, b"chain reply");
     })
@@ -266,10 +332,22 @@ async fn relay_destroy_propagation() {
         relay_stream_1.relay_to(&relay_stream_2).expect("relay 1→2");
         relay_stream_2.relay_to(&relay_stream_1).expect("relay 2→1");
 
-        relay_stream_1.connect(&relay_sock_1, 1, peer_a_addr).await.expect("connect relay_1");
-        relay_stream_2.connect(&relay_sock_2, 2, peer_b_addr).await.expect("connect relay_2");
-        peer_a_stream.connect(&peer_a_sock, 10, relay_addr_1).await.expect("connect peer_a");
-        peer_b_stream.connect(&peer_b_sock, 20, relay_addr_2).await.expect("connect peer_b");
+        relay_stream_1
+            .connect(&relay_sock_1, 1, peer_a_addr)
+            .await
+            .expect("connect relay_1");
+        relay_stream_2
+            .connect(&relay_sock_2, 2, peer_b_addr)
+            .await
+            .expect("connect relay_2");
+        peer_a_stream
+            .connect(&peer_a_sock, 10, relay_addr_1)
+            .await
+            .expect("connect peer_a");
+        peer_b_stream
+            .connect(&peer_b_sock, 20, relay_addr_2)
+            .await
+            .expect("connect peer_b");
 
         peer_a_stream.write(b"before destroy").await.expect("write");
         let data = peer_b_stream.read().await.expect("read").expect("EOF");
@@ -277,11 +355,7 @@ async fn relay_destroy_propagation() {
 
         peer_a_stream.destroy().await.expect("destroy");
 
-        let read_result = tokio::time::timeout(
-            Duration::from_secs(3),
-            peer_b_stream.read(),
-        )
-        .await;
+        let read_result = tokio::time::timeout(Duration::from_secs(3), peer_b_stream.read()).await;
 
         match read_result {
             Ok(Ok(None)) => {}

@@ -67,6 +67,11 @@ impl UdxAsyncStream {
         self.close_rx.take()
     }
 
+    /// Asynchronously wait for the underlying stream to close.
+    pub async fn closed(&self) {
+        self.abort_handle().closed().await
+    }
+
     fn lock(&self) -> MutexGuard<'_, StreamInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -79,7 +84,10 @@ fn poll_all_acked(inner: &mut StreamInner, cx: &mut Context<'_>) -> Poll<io::Res
         return Poll::Ready(Ok(()));
     }
     if !inner.is_alive() {
-        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "UDX stream closed")));
+        return Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "UDX stream closed",
+        )));
     }
     inner.set_flush_waker(cx.waker());
     Poll::Pending
@@ -180,7 +188,10 @@ impl AsyncWrite for UdxAsyncStream {
             let Ok(prep) = inner.prepare_end() else {
                 return Poll::Ready(Ok(()));
             };
-            inner.queue_write(vec![(prep.first_seq, build_end_packet(&prep))], prep.remote_addr);
+            inner.queue_write(
+                vec![(prep.first_seq, build_end_packet(&prep))],
+                prep.remote_addr,
+            );
             this.fin_queued = true;
         }
         poll_all_acked(&mut inner, cx)
@@ -195,9 +206,11 @@ impl Drop for UdxAsyncStream {
     /// drops it. Call `shutdown()` first when delivery matters.
     fn drop(&mut self) {
         let _ = self.processor.take();
-        let guard = self.lock();
+        let mut guard = self.lock();
         if let Some(tx) = &guard.notify_tx {
             let _ = tx.send(super::stream::StreamNotify::Shutdown);
+        } else {
+            guard.terminate();
         }
     }
 }

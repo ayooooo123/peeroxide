@@ -196,7 +196,9 @@ fn run_profiles(command: ProfilesCommands) -> i32 {
                 }
             };
             if profiles.is_empty() {
-                println!("No profiles found. Create one with: peeroxide chat profiles create <name>");
+                println!(
+                    "No profiles found. Create one with: peeroxide chat profiles create <name>"
+                );
                 return 0;
             }
             for name in profiles {
@@ -283,7 +285,11 @@ fn run_friends_sync(command: FriendsCommands) -> i32 {
             }
             0
         }
-        FriendsCommands::Add { key, alias, profile } => {
+        FriendsCommands::Add {
+            key,
+            alias,
+            profile,
+        } => {
             // Resolve key: could be full 64-char hex, 8-char shortkey, or name@shortkey
             let pubkey = match resolve_recipient(&profile, &key) {
                 Ok(pk) => pk,
@@ -508,7 +514,11 @@ mod tests {
         Ok(())
     }
 
-    fn write_friends(home: &Path, profile_name: &str, rows: &[([u8; 32], Option<&str>)]) -> io::Result<()> {
+    fn write_friends(
+        home: &Path,
+        profile_name: &str,
+        rows: &[([u8; 32], Option<&str>)],
+    ) -> io::Result<()> {
         let dir = profile_root(home).join(profile_name);
         fs::create_dir_all(&dir)?;
         let mut file = fs::OpenOptions::new()
@@ -595,7 +605,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_known_users(tmp.path(), &[(pk(1), "Alice")]).unwrap();
         let shortkey = &hex::encode(pk(1))[..8];
-        run_child_case(tmp.path(), "at_shortkey", "default", &format!("@{shortkey}"));
+        run_child_case(
+            tmp.path(),
+            "at_shortkey",
+            "default",
+            &format!("@{shortkey}"),
+        );
     }
 
     #[test]
@@ -603,7 +618,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_known_users(tmp.path(), &[(pk(2), "alice")]).unwrap();
         let shortkey = &hex::encode(pk(2))[..8];
-        run_child_case(tmp.path(), "name_at_shortkey", "default", &format!("alice@{shortkey}"));
+        run_child_case(
+            tmp.path(),
+            "name_at_shortkey",
+            "default",
+            &format!("alice@{shortkey}"),
+        );
     }
 
     #[test]
@@ -654,7 +674,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_known_users(tmp.path(), &[(pk(10), "grace")]).unwrap();
         let shortkey = &hex::encode(pk(10))[..8];
-        run_child_case(tmp.path(), "name_mismatch", "default", &format!("wrong@{shortkey}"));
+        run_child_case(
+            tmp.path(),
+            "name_mismatch",
+            "default",
+            &format!("wrong@{shortkey}"),
+        );
     }
 
     #[test]

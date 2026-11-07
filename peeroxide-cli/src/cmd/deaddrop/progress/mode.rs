@@ -20,7 +20,7 @@ pub fn select(stderr_is_tty: bool, no_progress: bool, json: bool) -> ProgressMod
 
 #[cfg(test)]
 mod tests {
-    use super::{select, ProgressMode};
+    use super::{ProgressMode, select};
 
     #[test]
     fn tty_and_no_progress_off_with_json() {

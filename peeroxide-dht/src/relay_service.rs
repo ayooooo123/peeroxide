@@ -36,8 +36,8 @@
 //! control connections).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use libudx::{RuntimeHandle, UdxRuntime, UdxStream};
@@ -49,8 +49,8 @@ use crate::blind_relay::{
 };
 use crate::hyperdht::{HyperDhtError, HyperDhtHandle, KeyPair, ServerEvent};
 use crate::hyperdht_messages::{
-    encode_handshake_to_bytes, FIREWALL_UNKNOWN, HandshakeMessage, MODE_FROM_RELAY,
-    MODE_FROM_SECOND_RELAY, MODE_FROM_SERVER, MODE_REPLY, NoisePayload, SecretStreamInfo, UdxInfo,
+    FIREWALL_UNKNOWN, HandshakeMessage, MODE_FROM_RELAY, MODE_FROM_SECOND_RELAY, MODE_FROM_SERVER,
+    MODE_REPLY, NoisePayload, SecretStreamInfo, UdxInfo, encode_handshake_to_bytes,
 };
 use crate::noise::Keypair as NoiseKeypair;
 use crate::noise_wrap::NoiseWrap;
@@ -142,7 +142,10 @@ pub fn run_relay_server(
                 .await
             {
                 Ok(r) => {
-                    tracing::debug!(closest = r.closest_nodes.len(), "relay: self-announce complete");
+                    tracing::debug!(
+                        closest = r.closest_nodes.len(),
+                        "relay: self-announce complete"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, "relay: self-announce failed");
@@ -239,7 +242,11 @@ async fn handle_handshake(
     };
     let mut nw = NoiseWrap::new_responder(noise_kp);
 
-    tracing::debug!(mode = msg.mode, noise_len = msg.noise.len(), "relay: received handshake request");
+    tracing::debug!(
+        mode = msg.mode,
+        noise_len = msg.noise.len(),
+        "relay: received handshake request"
+    );
 
     let remote_payload = match nw.recv(&msg.noise) {
         Ok(p) => p,
@@ -251,13 +258,18 @@ async fn handle_handshake(
     };
 
     if remote_payload.error != 0 {
-        tracing::debug!(error = remote_payload.error, "relay handshake: remote reported error");
+        tracing::debug!(
+            error = remote_payload.error,
+            "relay handshake: remote reported error"
+        );
         let _ = reply_tx.send(None);
         return;
     }
 
     let local_stream_id = next_relay_stream_id();
-    let addresses4 = dht.noise_addresses4(dht.local_port().await.unwrap_or(0)).await;
+    let addresses4 = dht
+        .noise_addresses4(dht.local_port().await.unwrap_or(0))
+        .await;
 
     let reply_payload = NoisePayload {
         version: 1,
@@ -320,8 +332,14 @@ async fn handle_handshake(
     let remote_pk = nw_result.remote_public_key;
 
     tokio::spawn(async move {
-        match finalize_relay_connection(runtime_handle, &dht, local_stream_id, &remote_udx, &nw_result)
-            .await
+        match finalize_relay_connection(
+            runtime_handle,
+            &dht,
+            local_stream_id,
+            &remote_udx,
+            &nw_result,
+        )
+        .await
         {
             Ok(mux) => {
                 run_relay_session(relay, mux, remote_pk, matched_tx).await;
@@ -351,10 +369,9 @@ async fn finalize_relay_connection(
     let remote_id = u32::try_from(remote_udx.id)
         .map_err(|_| HyperDhtError::StreamEstablishment("remote UDX id out of u32 range".into()))?;
 
-    let socket = dht
-        .server_socket()
-        .await?
-        .ok_or_else(|| HyperDhtError::StreamEstablishment("DHT server socket not available".into()))?;
+    let socket = dht.server_socket().await?.ok_or_else(|| {
+        HyperDhtError::StreamEstablishment("DHT server socket not available".into())
+    })?;
 
     let stream = runtime.create_stream(local_stream_id).await?;
     stream.set_firewall_hook(&socket, remote_id, |_, _, _| true)?;
@@ -464,10 +481,9 @@ async fn bridge_one_pairing(
     matched: MatchedPairing,
 ) -> Result<(UdxStream, UdxStream), HyperDhtError> {
     let runtime = UdxRuntime::shared(runtime_handle);
-    let socket = dht
-        .server_socket()
-        .await?
-        .ok_or_else(|| HyperDhtError::StreamEstablishment("DHT server socket not available".into()))?;
+    let socket = dht.server_socket().await?.ok_or_else(|| {
+        HyperDhtError::StreamEstablishment("DHT server socket not available".into())
+    })?;
 
     let first_local_id = next_relay_stream_id();
     let second_local_id = next_relay_stream_id();
@@ -494,16 +510,22 @@ async fn bridge_one_pairing(
     first_stream.relay_to(&second_stream)?;
     second_stream.relay_to(&first_stream)?;
 
-    let _ = matched.first.outbound_tx.send(SessionOutbound::PairMatched {
-        token: matched.token,
-        is_initiator: matched.first.is_initiator,
-        local_stream_id: u64::from(first_local_id),
-    });
-    let _ = matched.second.outbound_tx.send(SessionOutbound::PairMatched {
-        token: matched.token,
-        is_initiator: matched.second.is_initiator,
-        local_stream_id: u64::from(second_local_id),
-    });
+    let _ = matched
+        .first
+        .outbound_tx
+        .send(SessionOutbound::PairMatched {
+            token: matched.token,
+            is_initiator: matched.first.is_initiator,
+            local_stream_id: u64::from(first_local_id),
+        });
+    let _ = matched
+        .second
+        .outbound_tx
+        .send(SessionOutbound::PairMatched {
+            token: matched.token,
+            is_initiator: matched.second.is_initiator,
+            local_stream_id: u64::from(second_local_id),
+        });
 
     Ok((first_stream, second_stream))
 }

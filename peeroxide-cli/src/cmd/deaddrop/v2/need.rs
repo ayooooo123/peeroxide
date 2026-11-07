@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use super::build::{BuiltTree, IndexChunk};
-use super::tree::{compute_layout, TreeLayout};
+use super::tree::{TreeLayout, compute_layout};
 use super::wire::{
     NEED_ENTRY_SIZE, NEED_LIST_ENTRY_CAP, NEED_LIST_HEADER_SIZE, NON_ROOT_INDEX_SLOT_CAP, VERSION,
     WireError,
@@ -83,10 +83,7 @@ pub fn decode_need_list(bytes: &[u8]) -> Result<Vec<NeedEntry>, WireError> {
     }
     let computed = entry_bytes.len() / NEED_ENTRY_SIZE;
     if computed != declared as usize {
-        return Err(WireError::BadCount {
-            declared,
-            computed,
-        });
+        return Err(WireError::BadCount { declared, computed });
     }
 
     let mut entries = Vec::with_capacity(computed);
@@ -325,7 +322,10 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 8]); // but only 1
         assert!(matches!(
             decode_need_list(&bytes),
-            Err(WireError::BadCount { declared: 5, computed: 1 })
+            Err(WireError::BadCount {
+                declared: 5,
+                computed: 1
+            })
         ));
     }
 

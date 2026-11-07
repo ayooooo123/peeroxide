@@ -17,8 +17,8 @@ use tokio::sync::oneshot;
 
 use crate::io::RequestParams;
 use crate::messages::{Command, Ipv4Peer};
-use crate::peer::{peer_id, NodeId};
-use crate::routing_table::{RoutingTable, K};
+use crate::peer::{NodeId, peer_id};
+use crate::routing_table::{K, RoutingTable};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -235,7 +235,14 @@ impl Query {
             if id == self.own_id {
                 continue;
             }
-            self.add_pending_impl(QueryNode { id, host: host.clone(), port: *port }, None);
+            self.add_pending_impl(
+                QueryNode {
+                    id,
+                    host: host.clone(),
+                    port: *port,
+                },
+                None,
+            );
         }
     }
 
@@ -866,7 +873,10 @@ mod tests {
     fn test_is_closer_empty_set() {
         let target = [0u8; 32];
         let (q, _) = make_query(target);
-        assert!(q.is_closer(&[0xFFu8; 32]), "anything is closer when set is empty");
+        assert!(
+            q.is_closer(&[0xFFu8; 32]),
+            "anything is closer when set is empty"
+        );
     }
 
     #[test]
@@ -921,7 +931,9 @@ mod tests {
         });
 
         let table_arc = Arc::new(Mutex::new(table));
-        let mut q = Query::new(1, target, true, 2, None, 10, false, tx, table_arc, [0u8; 32]);
+        let mut q = Query::new(
+            1, target, true, 2, None, 10, false, tx, table_arc, [0u8; 32],
+        );
         assert!(q.pending.is_empty());
 
         q.add_from_table();
@@ -941,8 +953,8 @@ mod tests {
 
     #[test]
     fn test_bootstrap_parse_with_suggested_ip() {
-        let (host, port) = parse_bootstrap_str("10.0.0.1@bootstrap.example.com:24242")
-            .expect("parse with @");
+        let (host, port) =
+            parse_bootstrap_str("10.0.0.1@bootstrap.example.com:24242").expect("parse with @");
         assert_eq!(port, 24242);
         assert_eq!(host, "10.0.0.1");
     }
@@ -960,8 +972,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_bootstrap_suggested_ip_preferred() {
-        let result =
-            resolve_bootstrap_nodes(&["10.0.0.1@example.invalid:9999".to_string()]).await;
+        let result = resolve_bootstrap_nodes(&["10.0.0.1@example.invalid:9999".to_string()]).await;
         assert_eq!(result, vec!["10.0.0.1:9999"]);
     }
 
@@ -973,8 +984,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_bootstrap_bad_hostname_skipped() {
-        let result =
-            resolve_bootstrap_nodes(&["doesnotexist.invalid:1234".to_string()]).await;
+        let result = resolve_bootstrap_nodes(&["doesnotexist.invalid:1234".to_string()]).await;
         assert!(result.is_empty());
     }
 }

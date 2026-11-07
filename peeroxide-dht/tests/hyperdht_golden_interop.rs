@@ -2,18 +2,18 @@ use peeroxide_dht::crypto::{
     NS_ANNOUNCE, NS_MUTABLE_PUT, NS_PEER_HANDSHAKE, NS_PEER_HOLEPUNCH, NS_UNANNOUNCE,
 };
 use peeroxide_dht::hyperdht_messages::{
+    AnnounceMessage, HandshakeMessage, HolepunchInfo, HolepunchMessage, HolepunchPayload,
+    HyperPeer, LookupRawReply, MutableGetResponse, MutablePutRequest, MutableSignable,
+    NoisePayload, RelayInfo, RelayThroughInfo, SecretStreamInfo, UdxInfo,
     decode_announce_from_bytes, decode_handshake_from_bytes, decode_holepunch_msg_from_bytes,
     decode_holepunch_payload_from_bytes, decode_hyper_peer_from_bytes,
     decode_lookup_raw_reply_from_bytes, decode_mutable_get_response_from_bytes,
     decode_mutable_put_request_from_bytes, decode_mutable_signable_from_bytes,
     decode_noise_payload_from_bytes, encode_announce_to_bytes, encode_handshake_to_bytes,
-    encode_holepunch_msg_to_bytes, encode_holepunch_payload_to_bytes,
-    encode_hyper_peer_to_bytes, encode_lookup_raw_reply_to_bytes,
-    encode_mutable_get_response_to_bytes, encode_mutable_put_request_to_bytes,
-    encode_mutable_signable_to_bytes, encode_noise_payload_to_bytes, AnnounceMessage,
-    HandshakeMessage, HolepunchInfo, HolepunchMessage, HolepunchPayload, HyperPeer,
-    LookupRawReply, MutableGetResponse, MutablePutRequest, MutableSignable, NoisePayload,
-    RelayInfo, RelayThroughInfo, SecretStreamInfo, UdxInfo,
+    encode_holepunch_msg_to_bytes, encode_holepunch_payload_to_bytes, encode_hyper_peer_to_bytes,
+    encode_lookup_raw_reply_to_bytes, encode_mutable_get_response_to_bytes,
+    encode_mutable_put_request_to_bytes, encode_mutable_signable_to_bytes,
+    encode_noise_payload_to_bytes,
 };
 use peeroxide_dht::messages::Ipv4Peer;
 use serde::Deserialize;
@@ -73,8 +73,7 @@ fn opt_hex64(v: &serde_json::Value) -> Option<[u8; 64]> {
 }
 
 fn peer_from_fields(f: &serde_json::Value) -> HyperPeer {
-    let pk = hex::decode(f["publicKey"].as_str().expect("publicKey hex"))
-        .expect("valid hex");
+    let pk = hex::decode(f["publicKey"].as_str().expect("publicKey hex")).expect("valid hex");
     let public_key: [u8; 32] = pk.try_into().expect("32 bytes");
     let relay_addresses = f["relayAddresses"]
         .as_array()
@@ -97,8 +96,8 @@ fn golden_hyper_peer() {
         let expected = hex_bytes(&f.hex);
         let peer = peer_from_fields(&f.fields);
 
-        let encoded = encode_hyper_peer_to_bytes(&peer)
-            .unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
+        let encoded =
+            encode_hyper_peer_to_bytes(&peer).unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
         assert_eq!(
             encoded,
             expected,
@@ -111,8 +110,7 @@ fn golden_hyper_peer() {
         let decoded = decode_hyper_peer_from_bytes(&expected)
             .unwrap_or_else(|e| panic!("DECODE {}: {e}", f.label));
         assert_eq!(
-            decoded.public_key,
-            peer.public_key,
+            decoded.public_key, peer.public_key,
             "publicKey mismatch: {}",
             f.label
         );
@@ -156,8 +154,8 @@ fn golden_announce() {
             bump,
         };
 
-        let encoded = encode_announce_to_bytes(&m)
-            .unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
+        let encoded =
+            encode_announce_to_bytes(&m).unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
         assert_eq!(
             encoded,
             expected,
@@ -169,15 +167,9 @@ fn golden_announce() {
 
         let decoded = decode_announce_from_bytes(&expected)
             .unwrap_or_else(|e| panic!("DECODE {}: {e}", f.label));
+        assert_eq!(decoded.refresh, m.refresh, "refresh mismatch: {}", f.label);
         assert_eq!(
-            decoded.refresh,
-            m.refresh,
-            "refresh mismatch: {}",
-            f.label
-        );
-        assert_eq!(
-            decoded.signature,
-            m.signature,
+            decoded.signature, m.signature,
             "signature mismatch: {}",
             f.label
         );
@@ -189,7 +181,11 @@ fn golden_announce() {
             f.label
         );
         if let (Some(dp), Some(mp)) = (decoded.peer, m.peer) {
-            assert_eq!(dp.public_key, mp.public_key, "peer.pk mismatch: {}", f.label);
+            assert_eq!(
+                dp.public_key, mp.public_key,
+                "peer.pk mismatch: {}",
+                f.label
+            );
         }
     }
 }
@@ -211,10 +207,7 @@ fn golden_lookup_raw_reply() {
             .collect();
         let bump = flds["bump"].as_u64().expect("bump");
 
-        let m = LookupRawReply {
-            peers,
-            bump,
-        };
+        let m = LookupRawReply { peers, bump };
 
         let encoded = encode_lookup_raw_reply_to_bytes(&m)
             .unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
@@ -238,8 +231,7 @@ fn golden_lookup_raw_reply() {
         assert_eq!(decoded.bump, m.bump, "bump mismatch: {}", f.label);
         for (i, (got, want)) in decoded.peers.iter().zip(m.peers.iter()).enumerate() {
             assert_eq!(
-                got.public_key,
-                want.public_key,
+                got.public_key, want.public_key,
                 "peers[{i}].pk mismatch: {}",
                 f.label
             );
@@ -413,12 +405,15 @@ fn golden_handshake() {
             relay_address: opt_ipv4_peer_from_json(&flds["relayAddress"]),
         };
 
-        let encoded = encode_handshake_to_bytes(&m)
-            .unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
+        let encoded =
+            encode_handshake_to_bytes(&m).unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
         assert_eq!(
-            encoded, expected,
+            encoded,
+            expected,
             "ENCODE mismatch {}: expected {}, got {}",
-            f.label, f.hex, hex::encode(&encoded)
+            f.label,
+            f.hex,
+            hex::encode(&encoded)
         );
 
         let decoded = decode_handshake_from_bytes(&expected)
@@ -440,12 +435,15 @@ fn golden_holepunch_msg() {
             peer_address: opt_ipv4_peer_from_json(&flds["peerAddress"]),
         };
 
-        let encoded = encode_holepunch_msg_to_bytes(&m)
-            .unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
+        let encoded =
+            encode_holepunch_msg_to_bytes(&m).unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
         assert_eq!(
-            encoded, expected,
+            encoded,
+            expected,
             "ENCODE mismatch {}: expected {}, got {}",
-            f.label, f.hex, hex::encode(&encoded)
+            f.label,
+            f.hex,
+            hex::encode(&encoded)
         );
 
         let decoded = decode_holepunch_msg_from_bytes(&expected)
@@ -469,10 +467,7 @@ fn relay_info_from_json(v: &serde_json::Value) -> RelayInfo {
 
 #[test]
 fn golden_noise_payload() {
-    for f in load_fixtures()
-        .iter()
-        .filter(|f| f.typ == "noise_payload")
-    {
+    for f in load_fixtures().iter().filter(|f| f.typ == "noise_payload") {
         let expected = hex_bytes(&f.hex);
         let flds = &f.fields;
 
@@ -545,12 +540,15 @@ fn golden_noise_payload() {
             relay_addresses,
         };
 
-        let encoded = encode_noise_payload_to_bytes(&m)
-            .unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
+        let encoded =
+            encode_noise_payload_to_bytes(&m).unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
         assert_eq!(
-            encoded, expected,
+            encoded,
+            expected,
             "ENCODE mismatch {}: expected {}, got {}",
-            f.label, f.hex, hex::encode(&encoded)
+            f.label,
+            f.hex,
+            hex::encode(&encoded)
         );
 
         let decoded = decode_noise_payload_from_bytes(&expected)
@@ -603,9 +601,12 @@ fn golden_holepunch_payload() {
         let encoded = encode_holepunch_payload_to_bytes(&m)
             .unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
         assert_eq!(
-            encoded, expected,
+            encoded,
+            expected,
             "ENCODE mismatch {}: expected {}, got {}",
-            f.label, f.hex, hex::encode(&encoded)
+            f.label,
+            f.hex,
+            hex::encode(&encoded)
         );
 
         let decoded = decode_holepunch_payload_from_bytes(&expected)

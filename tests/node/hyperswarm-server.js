@@ -51,6 +51,7 @@ async function main () {
   const serverDht = new DHT({
     host: '127.0.0.1',
     bootstrap: bsAddr,
+    ...(flags.has('--remote-client') ? { firewalled: true, quickFirewall: false } : {}),
     ...(flags.has('--open-client') ? { firewalled: false } : {}),
     ...(flags.has('--direct-client') ? { ephemeral: false, firewalled: false } : {})
   })

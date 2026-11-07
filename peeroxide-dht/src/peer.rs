@@ -10,9 +10,9 @@
 
 #![allow(missing_docs)]
 
-use blake2::digest::consts::U32;
-use blake2::digest::Digest;
 use blake2::Blake2b;
+use blake2::digest::Digest;
+use blake2::digest::consts::U32;
 
 use crate::compact_encoding::{self, State};
 

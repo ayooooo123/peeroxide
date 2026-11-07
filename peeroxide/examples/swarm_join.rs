@@ -11,7 +11,7 @@
 
 use std::env;
 
-use peeroxide::{spawn, JoinOpts, SwarmConfig};
+use peeroxide::{JoinOpts, SwarmConfig, spawn};
 
 #[tokio::main]
 async fn main() {
@@ -25,7 +25,9 @@ async fn main() {
     let topic_hex = env::args()
         .nth(1)
         .expect("usage: swarm_join <hex-topic> [message]");
-    let message = env::args().nth(2).unwrap_or_else(|| "hello from peeroxide".to_string());
+    let message = env::args()
+        .nth(2)
+        .unwrap_or_else(|| "hello from peeroxide".to_string());
 
     let topic_bytes = hex::decode(&topic_hex).expect("topic must be 64 hex chars");
     let mut topic = [0u8; 32];
@@ -37,14 +39,11 @@ async fn main() {
     let (_join, handle, mut conn_rx) = spawn(config).await.expect("swarm spawn failed");
 
     handle
-        .join(
-            topic,
-            {
-                let mut opts = JoinOpts::default();
-                opts.server = false;
-                opts
-            },
-        )
+        .join(topic, {
+            let mut opts = JoinOpts::default();
+            opts.server = false;
+            opts
+        })
         .await
         .expect("join failed");
 

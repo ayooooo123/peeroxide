@@ -174,16 +174,30 @@ impl UdxSocket {
     }
 
     /// Register a stream to receive packets addressed to `local_id`.
+    ///
+    /// Rejects registration if `local_id` is already occupied by a different live stream,
+    /// but permits idempotent registration of the same stream.
     pub(crate) fn register_stream(
         &self,
         local_id: u32,
         tx: mpsc::UnboundedSender<super::stream::IncomingPacket>,
     ) -> Result<()> {
-        self.inner
-            .streams
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(local_id, tx);
+        let mut streams = self.inner.streams.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = streams.get(&local_id) {
+            if existing.same_channel(&tx) {
+                drop(streams);
+                self.inner.ensure_recv_loop(self)?;
+                return Ok(());
+            }
+            if !existing.is_closed() {
+                return Err(UdxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "stream ID already registered on socket",
+                )));
+            }
+        }
+        streams.insert(local_id, tx);
+        drop(streams);
         self.inner.ensure_recv_loop(self)?;
         Ok(())
     }
@@ -253,5 +267,48 @@ impl UdxSocket {
             handle.abort();
             let _ = handle.await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn socket_registration_rejects_overwrite_permits_idempotent() {
+        let socket = UdxSocket::new();
+        socket
+            .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .expect("bind");
+
+        let (tx1, rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+
+        // 1. Initial registration of tx1 at ID 10 succeeds
+        socket
+            .register_stream(10, tx1.clone())
+            .expect("initial registration");
+
+        // 2. Same-stream registration (tx1 clone, same channel) succeeds idempotently
+        socket
+            .register_stream(10, tx1.clone())
+            .expect("idempotent registration");
+
+        // 3. Different stream (tx2, different channel) at ID 10 is rejected
+        let err = socket.register_stream(10, tx2.clone());
+        assert!(
+            err.is_err(),
+            "registration with different stream must be rejected"
+        );
+
+        // 4. Close tx1 (drop receiver rx1) -> tx1 is now closed
+        drop(rx1);
+        assert!(tx1.is_closed());
+
+        // 5. Now tx2 can register at ID 10
+        socket
+            .register_stream(10, tx2)
+            .expect("registration after previous stream closed");
     }
 }

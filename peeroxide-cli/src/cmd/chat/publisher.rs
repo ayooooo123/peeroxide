@@ -29,7 +29,7 @@ use tokio::time::Instant;
 use crate::cmd::chat::crypto;
 use crate::cmd::chat::debug;
 use crate::cmd::chat::feed::{self, FeedState};
-use crate::cmd::chat::post::{prepare_one, Prepared};
+use crate::cmd::chat::post::{Prepared, prepare_one};
 use crate::cmd::chat::probe;
 use crate::cmd::chat::tui::{NoticeSink, StatusState};
 
@@ -85,8 +85,7 @@ pub async fn run_publisher(
         notices.send(format!("warning: initial feed publish failed: {e}"));
     }
 
-    let (refresh_tx, refresh_rx) =
-        watch::channel((initial_data.clone(), feed_state.seq));
+    let (refresh_tx, refresh_rx) = watch::channel((initial_data.clone(), feed_state.seq));
     let mut refresh_handle: JoinHandle<()> = {
         let h = handle.clone();
         let kp = feed_state.feed_keypair.clone();

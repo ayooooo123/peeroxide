@@ -15,8 +15,8 @@ use std::time::Duration;
 use libudx::UdxRuntime;
 use peeroxide_dht::crypto::hash;
 use peeroxide_dht::hyperdht::{
-    spawn, HyperDhtConfig, HyperDhtError, HyperDhtHandle, KeyPair, PeerConnection, ServerAddress,
-    ServerConfig, ServerEvent,
+    HyperDhtConfig, HyperDhtError, HyperDhtHandle, KeyPair, PeerConnection, ServerAddress,
+    ServerConfig, ServerEvent, spawn,
 };
 use peeroxide_dht::hyperdht_messages::FIREWALL_UNKNOWN;
 use tokio::sync::mpsc;
@@ -204,13 +204,25 @@ async fn two_servers_share_one_dht() {
         first.listen(&first_key).await.expect("first listen");
         second.listen(&second_key).await.expect("second listen");
         let client_key = KeyPair::generate();
-        let mut connection = dial(&client_node, &client_key, &second_key, &second.address().unwrap())
-            .await
-            .expect("dial second");
+        let mut connection = dial(
+            &client_node,
+            &client_key,
+            &second_key,
+            &second.address().unwrap(),
+        )
+        .await
+        .expect("dial second");
         let mut accepted = second.accept().await.expect("second accept");
         connection.stream.write(b"second").await.expect("write");
-        assert_eq!(accepted.stream.read().await.expect("read"), Some(b"second".to_vec()));
-        assert!(tokio::time::timeout(Duration::from_millis(100), first.accept()).await.is_err());
+        assert_eq!(
+            accepted.stream.read().await.expect("read"),
+            Some(b"second".to_vec())
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), first.accept())
+                .await
+                .is_err()
+        );
         first.close().await;
         second.close().await;
     })

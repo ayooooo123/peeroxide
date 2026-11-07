@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use libudx::UdxRuntime;
-use peeroxide_dht::crypto::{mutable_signable, sign_detached, NS_MUTABLE_PUT};
+use peeroxide_dht::crypto::{NS_MUTABLE_PUT, mutable_signable, sign_detached};
 use peeroxide_dht::hyperdht::{self, HyperDhtConfig, KeyPair};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -15,7 +15,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 async fn js_reads_back_a_record_signed_out_of_band() {
     let _ = tracing_subscriber::fmt::try_init();
     tokio::time::timeout(Duration::from_secs(60), async {
-        let script = format!("{}/../tests/node/mutable-get-peer.js", env!("CARGO_MANIFEST_DIR"));
+        let script = format!(
+            "{}/../tests/node/mutable-get-peer.js",
+            env!("CARGO_MANIFEST_DIR")
+        );
         let mut child = tokio::process::Command::new("node")
             .arg(script)
             .stdin(std::process::Stdio::piped())
@@ -51,7 +54,10 @@ async fn js_reads_back_a_record_signed_out_of_band() {
             .mutable_put_signed(&endpoint.public_key, &value, seq, signature)
             .await
             .expect("mutable_put_signed");
-        assert!(!result.closest_nodes.is_empty(), "no node stored the record");
+        assert!(
+            !result.closest_nodes.is_empty(),
+            "no node stored the record"
+        );
 
         input
             .write_all(format!("{} {seq}\n", hex::encode(endpoint.public_key)).as_bytes())
@@ -62,7 +68,11 @@ async fn js_reads_back_a_record_signed_out_of_band() {
         let got: serde_json::Value = serde_json::from_str(&line).expect("result JSON");
         assert_eq!(got["seq"], seq, "JS result: {line}");
         assert_eq!(got["value"], "signed by the endpoint", "JS result: {line}");
-        assert_eq!(got["signature"], hex::encode(signature), "JS result: {line}");
+        assert_eq!(
+            got["signature"],
+            hex::encode(signature),
+            "JS result: {line}"
+        );
 
         guard.destroy().await.expect("destroy");
         child.kill().await.expect("stop JS");

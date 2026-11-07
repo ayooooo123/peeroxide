@@ -6,8 +6,8 @@ use peeroxide_dht::messages::Ipv4Peer;
 use std::time::{Duration, Instant};
 use tokio::signal;
 
-use crate::config::ResolvedConfig;
 use super::{build_dht_config, parse_topic, to_hex};
+use crate::config::ResolvedConfig;
 
 const PING_MAGIC: &[u8; 4] = b"PING";
 const PONG_MAGIC: &[u8; 4] = b"PONG";
@@ -45,7 +45,10 @@ enum Target {
 fn parse_target(input: &str) -> Result<Target, String> {
     if let Some(hex_part) = input.strip_prefix('@') {
         if hex_part.len() != 64 {
-            return Err(format!("public key must be 64 hex chars, got {}", hex_part.len()));
+            return Err(format!(
+                "public key must be 64 hex chars, got {}",
+                hex_part.len()
+            ));
         }
         let bytes = hex::decode(hex_part).map_err(|e| format!("invalid hex: {e}"))?;
         let mut pk = [0u8; 32];
@@ -79,19 +82,19 @@ pub async fn run(args: PingArgs, cfg: &ResolvedConfig) -> i32 {
     let bootstrap_addrs = dht_config.dht.bootstrap.clone();
 
     let target = match &args.target {
-        Some(t) => {
-            match parse_target(t) {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return 1;
-                }
+        Some(t) => match parse_target(t) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
             }
-        }
+        },
         None => {
             if bootstrap_addrs.is_empty() {
                 eprintln!("error: no target specified and no bootstrap nodes configured.");
-                eprintln!("       Use --public for default network, or specify bootstrap nodes in config.");
+                eprintln!(
+                    "       Use --public for default network, or specify bootstrap nodes in config."
+                );
                 return 1;
             }
             None
@@ -120,15 +123,9 @@ pub async fn run(args: PingArgs, cfg: &ResolvedConfig) -> i32 {
     }
 
     let exit_code = match target {
-        None => {
-            run_bootstrap_check(&handle, &args, &bootstrap_addrs).await
-        }
-        Some(Target::HostPort(host, port)) => {
-            run_direct_ping(&handle, &args, &host, port).await
-        }
-        Some(Target::PubKey(pk)) => {
-            run_pubkey_ping(&handle, &args, &pk, &runtime).await
-        }
+        None => run_bootstrap_check(&handle, &args, &bootstrap_addrs).await,
+        Some(Target::HostPort(host, port)) => run_direct_ping(&handle, &args, &host, port).await,
+        Some(Target::PubKey(pk)) => run_pubkey_ping(&handle, &args, &pk, &runtime).await,
         Some(Target::Topic(topic, name)) => {
             run_topic_ping(&handle, &args, &topic, &name, &runtime).await
         }
@@ -153,7 +150,10 @@ enum NatType {
 }
 
 impl NatType {
-    fn classify(reflexive_addrs: &[Ipv4Peer], local_port: Option<u16>) -> (Self, Option<String>, Option<u16>) {
+    fn classify(
+        reflexive_addrs: &[Ipv4Peer],
+        local_port: Option<u16>,
+    ) -> (Self, Option<String>, Option<u16>) {
         if reflexive_addrs.is_empty() {
             return (Self::Unknown, None, None);
         }
@@ -232,7 +232,11 @@ fn parse_host_port(addr: &str) -> Option<(&str, u16)> {
     Some((host, port))
 }
 
-async fn run_bootstrap_check(handle: &HyperDhtHandle, args: &PingArgs, bootstrap_addrs: &[String]) -> i32 {
+async fn run_bootstrap_check(
+    handle: &HyperDhtHandle,
+    args: &PingArgs,
+    bootstrap_addrs: &[String],
+) -> i32 {
     let node_count = bootstrap_addrs.len();
 
     if args.json {
@@ -242,11 +246,18 @@ async fn run_bootstrap_check(handle: &HyperDhtHandle, args: &PingArgs, bootstrap
         });
         println!("{}", serde_json::to_string(&obj).unwrap());
     } else {
-        eprintln!("BOOTSTRAP CHECK ({node_count} node{})", if node_count == 1 { "" } else { "s" });
+        eprintln!(
+            "BOOTSTRAP CHECK ({node_count} node{})",
+            if node_count == 1 { "" } else { "s" }
+        );
     }
 
     let interval = Duration::from_secs_f64(args.interval);
-    let count = if args.count == 0 { u64::MAX } else { args.count };
+    let count = if args.count == 0 {
+        u64::MAX
+    } else {
+        args.count
+    };
     let mut reachable: u64 = 0;
     let mut unreachable: u64 = 0;
     let mut reflexive_addrs: Vec<Ipv4Peer> = Vec::new();
@@ -305,10 +316,17 @@ async fn run_bootstrap_check(handle: &HyperDhtHandle, args: &PingArgs, bootstrap
                         });
                         println!("{}", serde_json::to_string(&obj).unwrap());
                     } else if count == 1 {
-                        let node_str = resp.id.map(|id| format!("  node_id={}", to_hex(&id))).unwrap_or_default();
-                        eprintln!("  {addr_str}  OK  {rtt_ms:.0}ms  ({nodes_offered} nodes){node_str}");
+                        let node_str = resp
+                            .id
+                            .map(|id| format!("  node_id={}", to_hex(&id)))
+                            .unwrap_or_default();
+                        eprintln!(
+                            "  {addr_str}  OK  {rtt_ms:.0}ms  ({nodes_offered} nodes){node_str}"
+                        );
                     } else {
-                        eprintln!("  {addr_str}  [{seq}] OK  {rtt_ms:.0}ms  ({nodes_offered} nodes)");
+                        eprintln!(
+                            "  {addr_str}  [{seq}] OK  {rtt_ms:.0}ms  ({nodes_offered} nodes)"
+                        );
                     }
                 }
                 Err(_) => {
@@ -373,21 +391,27 @@ async fn run_bootstrap_check(handle: &HyperDhtHandle, args: &PingArgs, bootstrap
             summary["observed_ports"] = serde_json::json!(ports);
         }
         if matches!(nat_type, NatType::MultiHomed) {
-            let mut unique_hosts: Vec<&str> = reflexive_addrs.iter().map(|a| a.host.as_str()).collect();
+            let mut unique_hosts: Vec<&str> =
+                reflexive_addrs.iter().map(|a| a.host.as_str()).collect();
             unique_hosts.dedup();
             summary["observed_hosts"] = serde_json::json!(unique_hosts);
         }
         println!("{}", serde_json::to_string(&summary).unwrap());
     } else {
         eprintln!("--- bootstrap summary ---");
-        eprintln!("{node_count} node{}, {reachable} reachable, {unreachable} unreachable",
-            if node_count == 1 { "" } else { "s" });
-        eprintln!("{total_unique_nodes} unique peer{} discovered via routing tables",
-            if total_unique_nodes == 1 { "" } else { "s" });
+        eprintln!(
+            "{node_count} node{}, {reachable} reachable, {unreachable} unreachable",
+            if node_count == 1 { "" } else { "s" }
+        );
+        eprintln!(
+            "{total_unique_nodes} unique peer{} discovered via routing tables",
+            if total_unique_nodes == 1 { "" } else { "s" }
+        );
 
         match nat_type {
             NatType::MultiHomed => {
-                let mut unique_hosts: Vec<&str> = reflexive_addrs.iter().map(|a| a.host.as_str()).collect();
+                let mut unique_hosts: Vec<&str> =
+                    reflexive_addrs.iter().map(|a| a.host.as_str()).collect();
                 unique_hosts.sort();
                 unique_hosts.dedup();
                 eprintln!("public address: multiple ({})", unique_hosts.join(", "));
@@ -396,10 +420,13 @@ async fn run_bootstrap_check(handle: &HyperDhtHandle, args: &PingArgs, bootstrap
                 if let Some(ref host) = public_host {
                     if let Some(port) = public_port {
                         let sample_count = reflexive_addrs.len();
-                        eprintln!("public address: {host}:{port} (consistent across {sample_count} node{})",
-                            if sample_count == 1 { "" } else { "s" });
+                        eprintln!(
+                            "public address: {host}:{port} (consistent across {sample_count} node{})",
+                            if sample_count == 1 { "" } else { "s" }
+                        );
                     } else {
-                        let ports: Vec<String> = reflexive_addrs.iter().map(|a| a.port.to_string()).collect();
+                        let ports: Vec<String> =
+                            reflexive_addrs.iter().map(|a| a.port.to_string()).collect();
                         eprintln!("public address: {host} (port varies: {})", ports.join(", "));
                     }
                 }
@@ -441,7 +468,11 @@ async fn run_direct_ping(handle: &HyperDhtHandle, args: &PingArgs, host: &str, p
     let mut rtts: Vec<f64> = Vec::new();
     let mut interrupted = false;
 
-    let count = if args.count == 0 { u64::MAX } else { args.count };
+    let count = if args.count == 0 {
+        u64::MAX
+    } else {
+        args.count
+    };
 
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let cancel_handle = tokio::spawn(async move {
@@ -469,7 +500,10 @@ async fn run_direct_ping(handle: &HyperDhtHandle, args: &PingArgs, host: &str, p
                     });
                     println!("{}", serde_json::to_string(&obj).unwrap());
                 } else if i == 1 && args.count == 1 {
-                    let node_str = resp.id.map(|id| format!("  node_id={}", to_hex(&id))).unwrap_or_default();
+                    let node_str = resp
+                        .id
+                        .map(|id| format!("  node_id={}", to_hex(&id)))
+                        .unwrap_or_default();
                     eprintln!("  [{i}] OK  {rtt_ms:.0}ms{node_str}");
                 } else {
                     eprintln!("  [{i}] OK  {rtt_ms:.0}ms");
@@ -546,7 +580,9 @@ fn print_udp_summary(
             0.0
         };
         eprintln!("--- {host}:{port} ping statistics ---");
-        eprintln!("{sent} probes, {responded} responded, {timed_out} timed out ({loss_pct:.0}% probe loss)");
+        eprintln!(
+            "{sent} probes, {responded} responded, {timed_out} timed out ({loss_pct:.0}% probe loss)"
+        );
         if !rtts.is_empty() {
             let min = rtts.iter().copied().reduce(f64::min).unwrap();
             let max = rtts.iter().copied().reduce(f64::max).unwrap();
@@ -556,7 +592,12 @@ fn print_udp_summary(
     }
 }
 
-async fn run_pubkey_ping(handle: &HyperDhtHandle, args: &PingArgs, pk: &[u8; 32], runtime: &UdxRuntime) -> i32 {
+async fn run_pubkey_ping(
+    handle: &HyperDhtHandle,
+    args: &PingArgs,
+    pk: &[u8; 32],
+    runtime: &UdxRuntime,
+) -> i32 {
     let pk_hex = to_hex(pk);
 
     if args.json {
@@ -611,7 +652,13 @@ async fn run_pubkey_ping(handle: &HyperDhtHandle, args: &PingArgs, pk: &[u8; 32]
 
     let mut any_success = false;
     let mut any_failure = false;
-    let udp_count = if args.connect { 1 } else if args.count == 0 { u64::MAX } else { args.count };
+    let udp_count = if args.connect {
+        1
+    } else if args.count == 0 {
+        u64::MAX
+    } else {
+        args.count
+    };
     let interval = Duration::from_secs_f64(args.interval);
     let mut interrupted = false;
 
@@ -730,7 +777,8 @@ async fn run_topic_ping(
     };
 
     let mut peers: Vec<([u8; 32], Vec<peeroxide_dht::messages::Ipv4Peer>)> = Vec::new();
-    let mut seen_keys: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
+    let mut seen_keys: std::collections::HashMap<[u8; 32], usize> =
+        std::collections::HashMap::new();
 
     for result in &results {
         for peer in &result.peers {
@@ -738,7 +786,10 @@ async fn run_topic_ping(
                 // Union relay addresses for duplicate pubkeys
                 let existing = &mut peers[idx].1;
                 for addr in &peer.relay_addresses {
-                    if !existing.iter().any(|a| a.host == addr.host && a.port == addr.port) {
+                    if !existing
+                        .iter()
+                        .any(|a| a.host == addr.host && a.port == addr.port)
+                    {
                         existing.push(addr.clone());
                     }
                 }
@@ -772,7 +823,11 @@ async fn run_topic_ping(
         });
         println!("{}", serde_json::to_string(&obj).unwrap());
     } else if peers.len() > 20 {
-        eprintln!("  {} peers found (showing 20 of {})", display_count, peers.len());
+        eprintln!(
+            "  {} peers found (showing 20 of {})",
+            display_count,
+            peers.len()
+        );
     } else {
         eprintln!("  {} peer(s) found", peers.len());
     }
@@ -781,7 +836,13 @@ async fn run_topic_ping(
 
     let mut any_success = false;
     let mut any_failure = false;
-    let udp_count = if args.connect { 1 } else if args.count == 0 { u64::MAX } else { args.count };
+    let udp_count = if args.connect {
+        1
+    } else if args.count == 0 {
+        u64::MAX
+    } else {
+        args.count
+    };
     let interval = Duration::from_secs_f64(args.interval);
     let mut interrupted = false;
 
@@ -895,7 +956,10 @@ async fn run_connect(
     let local_kp = KeyPair::generate();
     let start = Instant::now();
 
-    let mut peer_conn = match handle.connect_with_nodes(&local_kp, *remote_pk, relay_addresses, runtime).await {
+    let mut peer_conn = match handle
+        .connect_with_nodes(&local_kp, *remote_pk, relay_addresses, runtime)
+        .await
+    {
         Ok(conn) => conn,
         Err(e) => {
             let err_msg = format!("{e}");
@@ -938,12 +1002,18 @@ async fn run_connect(
     match pong {
         Ok(Ok(Some(msg))) if msg == PONG_MAGIC => {}
         _ => {
-            eprintln!("  Remote peer does not support echo protocol (not running announce --ping?)");
+            eprintln!(
+                "  Remote peer does not support echo protocol (not running announce --ping?)"
+            );
             return 1;
         }
     }
 
-    let count = if args.count == 0 { u64::MAX } else { args.count };
+    let count = if args.count == 0 {
+        u64::MAX
+    } else {
+        args.count
+    };
     let interval = Duration::from_secs_f64(args.interval);
     let mut sent: u64 = 0;
     let mut responded: u64 = 0;
@@ -1030,7 +1100,10 @@ async fn run_connect(
             println!("{}", serde_json::to_string(&summary).unwrap());
         } else {
             eprintln!("--- {short_pk}... echo statistics ---");
-            eprintln!("{sent} probes sent, {responded} responded, {} timed out", sent - responded);
+            eprintln!(
+                "{sent} probes sent, {responded} responded, {} timed out",
+                sent - responded
+            );
             if !latencies.is_empty() {
                 let min = latencies.iter().copied().reduce(f64::min).unwrap();
                 let max = latencies.iter().copied().reduce(f64::max).unwrap();
@@ -1051,10 +1124,13 @@ async fn run_connect(
 
 #[cfg(test)]
 mod tests {
-    use super::{NatType, Ipv4Peer};
+    use super::{Ipv4Peer, NatType};
 
     fn peer(host: &str, port: u16) -> Ipv4Peer {
-        Ipv4Peer { host: host.to_string(), port }
+        Ipv4Peer {
+            host: host.to_string(),
+            port,
+        }
     }
 
     #[test]

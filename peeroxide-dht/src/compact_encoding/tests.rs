@@ -25,10 +25,7 @@ fn encode_value_with_pre(
 #[test]
 fn uint8_roundtrip() {
     for val in [0u8, 1, 127, 128, 255] {
-        let buf = encode_value_with_pre(
-            |s| preencode_uint8(s, val),
-            |s| encode_uint8(s, val),
-        );
+        let buf = encode_value_with_pre(|s| preencode_uint8(s, val), |s| encode_uint8(s, val));
         assert_eq!(buf, vec![val]);
         let mut state = State::from_buffer(&buf);
         assert_eq!(decode_uint8(&mut state).unwrap(), val);
@@ -82,10 +79,7 @@ fn uint64_little_endian() {
 #[test]
 fn uint_varint_1_byte() {
     for val in [0u64, 1, 100, 252] {
-        let buf = encode_value_with_pre(
-            |s| preencode_uint(s, val),
-            |s| encode_uint(s, val),
-        );
+        let buf = encode_value_with_pre(|s| preencode_uint(s, val), |s| encode_uint(s, val));
         assert_eq!(buf.len(), 1);
         assert_eq!(buf[0], val as u8);
         let mut state = State::from_buffer(&buf);
@@ -96,10 +90,7 @@ fn uint_varint_1_byte() {
 #[test]
 fn uint_varint_3_byte() {
     for val in [253u64, 1000, 65535] {
-        let buf = encode_value_with_pre(
-            |s| preencode_uint(s, val),
-            |s| encode_uint(s, val),
-        );
+        let buf = encode_value_with_pre(|s| preencode_uint(s, val), |s| encode_uint(s, val));
         assert_eq!(buf.len(), 3);
         assert_eq!(buf[0], 0xfd);
         let mut state = State::from_buffer(&buf);
@@ -110,10 +101,7 @@ fn uint_varint_3_byte() {
 #[test]
 fn uint_varint_5_byte() {
     for val in [65536u64, 100_000, 0xffffffff] {
-        let buf = encode_value_with_pre(
-            |s| preencode_uint(s, val),
-            |s| encode_uint(s, val),
-        );
+        let buf = encode_value_with_pre(|s| preencode_uint(s, val), |s| encode_uint(s, val));
         assert_eq!(buf.len(), 5);
         assert_eq!(buf[0], 0xfe);
         let mut state = State::from_buffer(&buf);
@@ -124,10 +112,7 @@ fn uint_varint_5_byte() {
 #[test]
 fn uint_varint_9_byte() {
     let val = 0x100000000u64;
-    let buf = encode_value_with_pre(
-        |s| preencode_uint(s, val),
-        |s| encode_uint(s, val),
-    );
+    let buf = encode_value_with_pre(|s| preencode_uint(s, val), |s| encode_uint(s, val));
     assert_eq!(buf.len(), 9);
     assert_eq!(buf[0], 0xff);
     let mut state = State::from_buffer(&buf);
@@ -152,10 +137,7 @@ fn zigzag_encoding() {
 #[test]
 fn int_roundtrip() {
     for val in [0i64, 1, -1, 127, -128, 1000, -1000, i64::MAX, i64::MIN] {
-        let buf = encode_value_with_pre(
-            |s| preencode_int(s, val),
-            |s| encode_int(s, val),
-        );
+        let buf = encode_value_with_pre(|s| preencode_int(s, val), |s| encode_int(s, val));
         let mut state = State::from_buffer(&buf);
         assert_eq!(decode_int(&mut state).unwrap(), val);
     }
@@ -164,10 +146,7 @@ fn int_roundtrip() {
 #[test]
 fn float64_roundtrip() {
     for val in [0.0f64, 1.5, -1.5, std::f64::consts::PI, f64::MAX, f64::MIN] {
-        let buf = encode_value_with_pre(
-            |s| preencode_float64(s, val),
-            |s| encode_float64(s, val),
-        );
+        let buf = encode_value_with_pre(|s| preencode_float64(s, val), |s| encode_float64(s, val));
         let mut state = State::from_buffer(&buf);
         assert_eq!(decode_float64(&mut state).unwrap(), val);
     }
@@ -176,10 +155,7 @@ fn float64_roundtrip() {
 #[test]
 fn bool_roundtrip() {
     for val in [true, false] {
-        let buf = encode_value_with_pre(
-            |s| preencode_bool(s, val),
-            |s| encode_bool(s, val),
-        );
+        let buf = encode_value_with_pre(|s| preencode_bool(s, val), |s| encode_bool(s, val));
         let mut state = State::from_buffer(&buf);
         assert_eq!(decode_bool(&mut state).unwrap(), val);
     }
@@ -198,10 +174,7 @@ fn buffer_some() {
 
 #[test]
 fn buffer_none() {
-    let buf = encode_value_with_pre(
-        |s| preencode_buffer(s, None),
-        |s| encode_buffer(s, None),
-    );
+    let buf = encode_value_with_pre(|s| preencode_buffer(s, None), |s| encode_buffer(s, None));
     assert_eq!(buf, vec![0x00]);
     let mut state = State::from_buffer(&buf);
     assert_eq!(decode_buffer(&mut state).unwrap(), None);
@@ -210,10 +183,7 @@ fn buffer_none() {
 #[test]
 fn string_roundtrip() {
     for val in ["", "hello", "hello world 🌍", "a".repeat(1000).as_str()] {
-        let buf = encode_value_with_pre(
-            |s| preencode_string(s, val),
-            |s| encode_string(s, val),
-        );
+        let buf = encode_value_with_pre(|s| preencode_string(s, val), |s| encode_string(s, val));
         let mut state = State::from_buffer(&buf);
         assert_eq!(decode_string(&mut state).unwrap(), val);
     }
@@ -223,7 +193,9 @@ fn string_roundtrip() {
 fn fixed32_roundtrip() {
     let data = [42u8; 32];
     let buf = encode_value_with_pre(
-        |s| { preencode_fixed32(s, &data).unwrap(); },
+        |s| {
+            preencode_fixed32(s, &data).unwrap();
+        },
         |s| encode_fixed32(s, &data),
     );
     assert_eq!(buf.len(), 32);
@@ -235,7 +207,9 @@ fn fixed32_roundtrip() {
 fn fixed64_roundtrip() {
     let data = [99u8; 64];
     let buf = encode_value_with_pre(
-        |s| { preencode_fixed64(s, &data).unwrap(); },
+        |s| {
+            preencode_fixed64(s, &data).unwrap();
+        },
         |s| encode_fixed64(s, &data),
     );
     assert_eq!(buf.len(), 64);
@@ -271,10 +245,7 @@ fn ipv6_roundtrip() {
 #[test]
 fn ip_dual_v4() {
     let addr = "192.168.1.1";
-    let buf = encode_value_with_pre(
-        |s| preencode_ip(s, addr),
-        |s| encode_ip(s, addr).unwrap(),
-    );
+    let buf = encode_value_with_pre(|s| preencode_ip(s, addr), |s| encode_ip(s, addr).unwrap());
     assert_eq!(buf[0], 4);
     assert_eq!(buf.len(), 5);
     let mut state = State::from_buffer(&buf);
@@ -284,10 +255,7 @@ fn ip_dual_v4() {
 #[test]
 fn ip_dual_v6() {
     let addr = "::1";
-    let buf = encode_value_with_pre(
-        |s| preencode_ip(s, addr),
-        |s| encode_ip(s, addr).unwrap(),
-    );
+    let buf = encode_value_with_pre(|s| preencode_ip(s, addr), |s| encode_ip(s, addr).unwrap());
     assert_eq!(buf[0], 6);
     assert_eq!(buf.len(), 17);
     let mut state = State::from_buffer(&buf);
@@ -313,7 +281,10 @@ fn string_array_roundtrip() {
         |s| encode_string_array(s, &arr),
     );
     let mut state = State::from_buffer(&buf);
-    assert_eq!(decode_string_array(&mut state).unwrap(), arr.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert_eq!(
+        decode_string_array(&mut state).unwrap(),
+        arr.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -402,7 +373,10 @@ mod golden_interop {
         hex::decode(hex_str).unwrap_or_else(|e| panic!("Invalid hex '{hex_str}': {e}"))
     }
 
-    fn encode_with_pre(pre_fn: impl FnOnce(&mut State), enc_fn: impl FnOnce(&mut State)) -> Vec<u8> {
+    fn encode_with_pre(
+        pre_fn: impl FnOnce(&mut State),
+        enc_fn: impl FnOnce(&mut State),
+    ) -> Vec<u8> {
         let mut state = State::new();
         pre_fn(&mut state);
         state.alloc();
@@ -448,11 +422,22 @@ mod golden_interop {
             let val = val_u64(&f.value) as u8;
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_uint8(s, val), |s| encode_uint8(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_uint8(&mut state).unwrap();
-            assert_eq!(decoded, val, "DECODE {}: expected {val}, got {decoded}", f.label);
+            assert_eq!(
+                decoded, val,
+                "DECODE {}: expected {val}, got {decoded}",
+                f.label
+            );
         }
     }
 
@@ -462,7 +447,14 @@ mod golden_interop {
             let val = val_u64(&f.value) as u16;
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_uint16(s, val), |s| encode_uint16(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_uint16(&mut state).unwrap();
@@ -476,7 +468,14 @@ mod golden_interop {
             let val = val_u64(&f.value) as u32;
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_uint24(s, val), |s| encode_uint24(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_uint24(&mut state).unwrap();
@@ -490,7 +489,14 @@ mod golden_interop {
             let val = val_u64(&f.value) as u32;
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_uint32(s, val), |s| encode_uint32(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_uint32(&mut state).unwrap();
@@ -504,7 +510,14 @@ mod golden_interop {
             let val = val_u64(&f.value);
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_uint64(s, val), |s| encode_uint64(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_uint64(&mut state).unwrap();
@@ -518,7 +531,14 @@ mod golden_interop {
             let val = val_u64(&f.value);
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_uint(s, val), |s| encode_uint(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_uint(&mut state).unwrap();
@@ -532,7 +552,14 @@ mod golden_interop {
             let val = val_i64(&f.value);
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_int(s, val), |s| encode_int(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_int(&mut state).unwrap();
@@ -546,7 +573,14 @@ mod golden_interop {
             let val = val_i64(&f.value) as i8;
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_int8(s, val), |s| encode_int8(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_int8(&mut state).unwrap();
@@ -560,7 +594,14 @@ mod golden_interop {
             let val = val_i64(&f.value) as i16;
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_int16(s, val), |s| encode_int16(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_int16(&mut state).unwrap();
@@ -574,7 +615,14 @@ mod golden_interop {
             let val = val_i64(&f.value) as i32;
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_int32(s, val), |s| encode_int32(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_int32(&mut state).unwrap();
@@ -588,7 +636,14 @@ mod golden_interop {
             let val = val_i64(&f.value);
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_int64(s, val), |s| encode_int64(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_int64(&mut state).unwrap();
@@ -601,8 +656,16 @@ mod golden_interop {
         for f in load_fixtures().iter().filter(|f| f.typ == "float32") {
             let val = val_f32(&f.value);
             let expected = expected_bytes(&f.hex);
-            let encoded = encode_with_pre(|s| preencode_float32(s, val), |s| encode_float32(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            let encoded =
+                encode_with_pre(|s| preencode_float32(s, val), |s| encode_float32(s, val));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_float32(&mut state).unwrap();
@@ -615,8 +678,16 @@ mod golden_interop {
         for f in load_fixtures().iter().filter(|f| f.typ == "float64") {
             let val = val_f64(&f.value);
             let expected = expected_bytes(&f.hex);
-            let encoded = encode_with_pre(|s| preencode_float64(s, val), |s| encode_float64(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            let encoded =
+                encode_with_pre(|s| preencode_float64(s, val), |s| encode_float64(s, val));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_float64(&mut state).unwrap();
@@ -630,7 +701,14 @@ mod golden_interop {
             let val = val_bool(&f.value);
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_bool(s, val), |s| encode_bool(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_bool(&mut state).unwrap();
@@ -659,7 +737,14 @@ mod golden_interop {
                 |s| preencode_buffer(s, val_slice),
                 |s| encode_buffer(s, val_slice),
             );
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_buffer(&mut state).unwrap();
@@ -673,7 +758,14 @@ mod golden_interop {
             let val = val_str(&f.value);
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(|s| preencode_string(s, val), |s| encode_string(s, val));
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_string(&mut state).unwrap();
@@ -688,10 +780,19 @@ mod golden_interop {
             let val: [u8; 32] = val_vec.try_into().unwrap();
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(
-                |s| { preencode_fixed32(s, &val).unwrap(); },
+                |s| {
+                    preencode_fixed32(s, &val).unwrap();
+                },
                 |s| encode_fixed32(s, &val),
             );
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_fixed32(&mut state).unwrap();
@@ -706,10 +807,19 @@ mod golden_interop {
             let val: [u8; 64] = val_vec.try_into().unwrap();
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(
-                |s| { preencode_fixed64(s, &val).unwrap(); },
+                |s| {
+                    preencode_fixed64(s, &val).unwrap();
+                },
                 |s| encode_fixed64(s, &val),
             );
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_fixed64(&mut state).unwrap();
@@ -722,11 +832,16 @@ mod golden_interop {
         for f in load_fixtures().iter().filter(|f| f.typ == "ipv4") {
             let val = val_str(&f.value);
             let expected = expected_bytes(&f.hex);
-            let encoded = encode_with_pre(
-                |s| preencode_ipv4(s, val),
-                |s| encode_ipv4(s, val).unwrap(),
+            let encoded =
+                encode_with_pre(|s| preencode_ipv4(s, val), |s| encode_ipv4(s, val).unwrap());
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
             );
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_ipv4(&mut state).unwrap();
@@ -739,17 +854,26 @@ mod golden_interop {
         for f in load_fixtures().iter().filter(|f| f.typ == "ipv6") {
             let val = val_str(&f.value);
             let expected = expected_bytes(&f.hex);
-            let encoded = encode_with_pre(
-                |s| preencode_ipv6(s, val),
-                |s| encode_ipv6(s, val).unwrap(),
+            let encoded =
+                encode_with_pre(|s| preencode_ipv6(s, val), |s| encode_ipv6(s, val).unwrap());
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
             );
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_ipv6(&mut state).unwrap();
             let expected_addr: std::net::Ipv6Addr = val.parse().unwrap();
             let decoded_addr: std::net::Ipv6Addr = decoded.parse().unwrap();
-            assert_eq!(decoded_addr, expected_addr, "DECODE {}: expected {expected_addr}, got {decoded_addr}", f.label);
+            assert_eq!(
+                decoded_addr, expected_addr,
+                "DECODE {}: expected {expected_addr}, got {decoded_addr}",
+                f.label
+            );
         }
     }
 
@@ -758,11 +882,15 @@ mod golden_interop {
         for f in load_fixtures().iter().filter(|f| f.typ == "ip") {
             let val = val_str(&f.value);
             let expected = expected_bytes(&f.hex);
-            let encoded = encode_with_pre(
-                |s| preencode_ip(s, val),
-                |s| encode_ip(s, val).unwrap(),
+            let encoded = encode_with_pre(|s| preencode_ip(s, val), |s| encode_ip(s, val).unwrap());
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
             );
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_ip(&mut state).unwrap();
@@ -788,7 +916,14 @@ mod golden_interop {
                 |s| preencode_ipv4_address(s, host, port),
                 |s| encode_ipv4_address(s, host, port).unwrap(),
             );
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let (decoded_host, decoded_port) = decode_ipv4_address(&mut state).unwrap();
@@ -806,7 +941,14 @@ mod golden_interop {
                 |s| preencode_uint_array(s, &val),
                 |s| encode_uint_array(s, &val),
             );
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_uint_array(&mut state).unwrap();
@@ -817,13 +959,26 @@ mod golden_interop {
     #[test]
     fn golden_string_array() {
         for f in load_fixtures().iter().filter(|f| f.typ == "string_array") {
-            let val: Vec<&str> = f.value.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            let val: Vec<&str> = f
+                .value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
             let expected = expected_bytes(&f.hex);
             let encoded = encode_with_pre(
                 |s| preencode_string_array(s, &val),
                 |s| encode_string_array(s, &val),
             );
-            assert_eq!(encoded, expected, "ENCODE {}: expected {}, got {}", f.label, f.hex, hex::encode(&encoded));
+            assert_eq!(
+                encoded,
+                expected,
+                "ENCODE {}: expected {}, got {}",
+                f.label,
+                f.hex,
+                hex::encode(&encoded)
+            );
 
             let mut state = State::from_buffer(&expected);
             let decoded = decode_string_array(&mut state).unwrap();

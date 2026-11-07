@@ -1,6 +1,6 @@
 use crate::compact_encoding::{
-    self, decode_fixed32, decode_fixed64, decode_uint, encode_fixed32, encode_fixed64, encode_uint,
-    preencode_uint, EncodingError, State,
+    self, EncodingError, State, decode_fixed32, decode_fixed64, decode_uint, encode_fixed32,
+    encode_fixed64, encode_uint, preencode_uint,
 };
 use crate::messages::Ipv4Peer;
 
@@ -158,7 +158,11 @@ pub fn preencode_announce(state: &mut State, m: &AnnounceMessage) {
 pub fn encode_announce(state: &mut State, m: &AnnounceMessage) -> Result<()> {
     let flags = (if m.peer.is_some() { FLAG_PEER } else { 0 })
         | (if m.refresh.is_some() { FLAG_REFRESH } else { 0 })
-        | (if m.signature.is_some() { FLAG_SIGNATURE } else { 0 })
+        | (if m.signature.is_some() {
+            FLAG_SIGNATURE
+        } else {
+            0
+        })
         | (if m.bump != 0 { FLAG_BUMP } else { 0 });
     encode_uint(state, flags);
     if let Some(peer) = &m.peer {
@@ -1708,10 +1712,7 @@ mod tests {
             round: 1,
             connected: false,
             punching: true,
-            addresses: Some(vec![
-                make_addr("1.2.3.4", 1000),
-                make_addr("5.6.7.8", 2000),
-            ]),
+            addresses: Some(vec![make_addr("1.2.3.4", 1000), make_addr("5.6.7.8", 2000)]),
             remote_address: Some(make_addr("10.0.0.1", 8080)),
             token: None,
             remote_token: None,

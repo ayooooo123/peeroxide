@@ -48,7 +48,10 @@ impl fmt::Display for WireError {
                 write!(f, "buffer too short: need {need} bytes, got {got}")
             }
             WireError::RecordTooLarge { size } => {
-                write!(f, "record too large: {size} bytes exceeds {MAX_RECORD_SIZE} byte limit")
+                write!(
+                    f,
+                    "record too large: {size} bytes exceeds {MAX_RECORD_SIZE} byte limit"
+                )
             }
             WireError::InvalidContentType(b) => {
                 write!(f, "invalid content type: {b}")
@@ -123,7 +126,10 @@ impl MessageEnvelope {
         // Minimum: 32+32+8+1+1+2+64 = 140 bytes (zero-length screen_name + content)
         let min_len = 140;
         if data.len() < min_len {
-            return Err(WireError::BufferTooShort { need: min_len, got: data.len() });
+            return Err(WireError::BufferTooShort {
+                need: min_len,
+                got: data.len(),
+            });
         }
 
         let mut pos = 0usize;
@@ -221,8 +227,13 @@ impl MessageEnvelope {
     pub fn verify(&self) -> bool {
         let sn = self.screen_name.as_bytes();
         let ct = self.content.as_bytes();
-        let msg =
-            build_msg_signable(&self.prev_msg_hash, self.timestamp, self.content_type, sn, ct);
+        let msg = build_msg_signable(
+            &self.prev_msg_hash,
+            self.timestamp,
+            self.content_type,
+            sn,
+            ct,
+        );
         verify_detached(&self.signature, &msg, &self.id_pubkey)
     }
 }
@@ -236,9 +247,8 @@ fn build_msg_signable(
     content: &[u8],
 ) -> Vec<u8> {
     let prefix = b"peeroxide-chat:msg:v1:";
-    let mut msg = Vec::with_capacity(
-        prefix.len() + 32 + 8 + 1 + 1 + screen_name.len() + content.len(),
-    );
+    let mut msg =
+        Vec::with_capacity(prefix.len() + 32 + 8 + 1 + 1 + screen_name.len() + content.len());
     msg.extend_from_slice(prefix);
     msg.extend_from_slice(prev_msg_hash);
     msg.extend_from_slice(&timestamp.to_le_bytes());
@@ -295,7 +305,10 @@ impl FeedRecord {
     pub fn deserialize(data: &[u8]) -> Result<Self, WireError> {
         let min_len = 32 + 64 + 32 + 32 + 1; // 161
         if data.len() < min_len {
-            return Err(WireError::BufferTooShort { need: min_len, got: data.len() });
+            return Err(WireError::BufferTooShort {
+                need: min_len,
+                got: data.len(),
+            });
         }
 
         let mut pos = 0usize;
@@ -391,7 +404,10 @@ impl SummaryBlock {
     pub fn deserialize(data: &[u8]) -> Result<Self, WireError> {
         let min_len = 32 + 32 + 1 + 64; // 129 (zero hashes)
         if data.len() < min_len {
-            return Err(WireError::BufferTooShort { need: min_len, got: data.len() });
+            return Err(WireError::BufferTooShort {
+                need: min_len,
+                got: data.len(),
+            });
         }
 
         let mut pos = 0usize;
@@ -587,7 +603,10 @@ impl InviteRecord {
     pub fn deserialize(data: &[u8]) -> Result<Self, WireError> {
         let min_len = 32 + 64 + 32 + 1 + 2; // 131
         if data.len() < min_len {
-            return Err(WireError::BufferTooShort { need: min_len, got: data.len() });
+            return Err(WireError::BufferTooShort {
+                need: min_len,
+                got: data.len(),
+            });
         }
 
         let mut pos = 0usize;
@@ -736,7 +755,15 @@ mod tests {
         let ts = 1_700_000_000u64;
         let (secret, pubkey) = make_keypair();
 
-        let env = MessageEnvelope::sign(&secret, pubkey, prev, ts, CONTENT_TYPE_TEXT, "alice", "hello");
+        let env = MessageEnvelope::sign(
+            &secret,
+            pubkey,
+            prev,
+            ts,
+            CONTENT_TYPE_TEXT,
+            "alice",
+            "hello",
+        );
         let bytes = env.serialize();
         let env2 = MessageEnvelope::deserialize(&bytes).expect("deserialize");
         assert_eq!(env, env2);
@@ -746,7 +773,8 @@ mod tests {
     fn message_envelope_sign_verify() {
         let prev = random_bytes::<32>();
         let (secret, pubkey) = make_keypair();
-        let env = MessageEnvelope::sign(&secret, pubkey, prev, 42, CONTENT_TYPE_TEXT, "bob", "world");
+        let env =
+            MessageEnvelope::sign(&secret, pubkey, prev, 42, CONTENT_TYPE_TEXT, "bob", "world");
         assert!(env.verify(), "signature must be valid");
     }
 
@@ -754,8 +782,15 @@ mod tests {
     fn message_envelope_verify_rejects_tampered() {
         let prev = random_bytes::<32>();
         let (secret, pubkey) = make_keypair();
-        let mut env =
-            MessageEnvelope::sign(&secret, pubkey, prev, 42, CONTENT_TYPE_TEXT, "carol", "secret");
+        let mut env = MessageEnvelope::sign(
+            &secret,
+            pubkey,
+            prev,
+            42,
+            CONTENT_TYPE_TEXT,
+            "carol",
+            "secret",
+        );
         env.content = "tampered".to_owned();
         assert!(!env.verify(), "tampered content must fail verification");
     }
@@ -765,8 +800,7 @@ mod tests {
         let prev = random_bytes::<32>();
         let (secret, pubkey) = make_keypair();
         let content = "x".repeat(819);
-        let env =
-            MessageEnvelope::sign(&secret, pubkey, prev, 0, CONTENT_TYPE_TEXT, "a", &content);
+        let env = MessageEnvelope::sign(&secret, pubkey, prev, 0, CONTENT_TYPE_TEXT, "a", &content);
         let bytes = env.serialize();
         assert!(bytes.len() <= MAX_RECORD_SIZE - 40, "plaintext must fit");
     }
@@ -798,7 +832,11 @@ mod tests {
             next_feed_pubkey: [0u8; 32],
             summary_hash: [0u8; 32],
             msg_count: 3,
-            msg_hashes: vec![random_bytes::<32>(), random_bytes::<32>(), random_bytes::<32>()],
+            msg_hashes: vec![
+                random_bytes::<32>(),
+                random_bytes::<32>(),
+                random_bytes::<32>(),
+            ],
         };
         let bytes = rec.serialize().expect("serialize");
         let rec2 = FeedRecord::deserialize(&bytes).expect("deserialize");
@@ -831,7 +869,10 @@ mod tests {
             msg_count: 27,
             msg_hashes: vec![[0u8; 32]; 27],
         };
-        assert!(matches!(rec.serialize(), Err(WireError::RecordTooLarge { .. })));
+        assert!(matches!(
+            rec.serialize(),
+            Err(WireError::RecordTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -895,7 +936,10 @@ mod tests {
 
     #[test]
     fn nexus_record_empty_fields() {
-        let rec = NexusRecord { name: "".to_owned(), bio: "".to_owned() };
+        let rec = NexusRecord {
+            name: "".to_owned(),
+            bio: "".to_owned(),
+        };
         let bytes = rec.serialize().expect("serialize");
         let rec2 = NexusRecord::deserialize(&bytes).expect("deserialize");
         assert_eq!(rec, rec2);
@@ -907,7 +951,10 @@ mod tests {
             name: "a".repeat(255),
             bio: "b".repeat(750),
         };
-        assert!(matches!(rec.serialize(), Err(WireError::RecordTooLarge { .. })));
+        assert!(matches!(
+            rec.serialize(),
+            Err(WireError::RecordTooLarge { .. })
+        ));
     }
 
     #[test]

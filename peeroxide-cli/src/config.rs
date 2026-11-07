@@ -214,7 +214,10 @@ max_lru_age = 1200
         assert_eq!(cfg.network.public, Some(true));
         assert_eq!(
             cfg.network.bootstrap,
-            Some(vec!["10.0.1.5:49737".to_string(), "10.0.1.6:49737".to_string()])
+            Some(vec![
+                "10.0.1.5:49737".to_string(),
+                "10.0.1.6:49737".to_string()
+            ])
         );
         assert_eq!(cfg.node.port, Some(49737));
         assert_eq!(cfg.node.host, Some("0.0.0.0".to_string()));

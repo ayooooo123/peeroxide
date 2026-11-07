@@ -1,7 +1,7 @@
 pub(crate) mod bbr;
-pub(crate) mod rate;
 pub(crate) mod filter;
 pub(crate) mod pacing;
+pub(crate) mod rate;
 
 use std::time::{Duration, Instant};
 
@@ -122,7 +122,12 @@ impl CongestionController {
     }
 
     /// Records a packet send and returns the associated rate info.
-    pub(crate) fn on_packet_sent(&mut self, _seq: u32, inflight: u32, now: Instant) -> rate::PacketRateInfo {
+    pub(crate) fn on_packet_sent(
+        &mut self,
+        _seq: u32,
+        inflight: u32,
+        now: Instant,
+    ) -> rate::PacketRateInfo {
         if inflight == 0 || self.first_sent_ts.is_none() {
             self.first_sent_ts = Some(now);
             self.delivered_ts = Some(now);
@@ -166,8 +171,15 @@ impl CongestionController {
             let dur = now
                 .checked_duration_since(info.first_sent_ts)
                 .unwrap_or(Duration::ZERO);
-            let rtt_ms = if dur.is_zero() { 0 } else { (dur.as_millis() as u32).max(1) };
-            if let Some(new_first_sent) = self.rate.on_packet_delivered(info, info.first_sent_ts, rtt_ms) {
+            let rtt_ms = if dur.is_zero() {
+                0
+            } else {
+                (dur.as_millis() as u32).max(1)
+            };
+            if let Some(new_first_sent) =
+                self.rate
+                    .on_packet_delivered(info, info.first_sent_ts, rtt_ms)
+            {
                 self.first_sent_ts = Some(new_first_sent);
             }
         }
@@ -235,7 +247,8 @@ impl CongestionController {
 
     /// Marks the start of a transmit opportunity.
     pub(crate) fn on_transmit_start(&mut self, now: Instant) {
-        self.bbr.on_transmit_start(self.app_limited > 0, self.mss, now);
+        self.bbr
+            .on_transmit_start(self.app_limited > 0, self.mss, now);
         self.pacing.reset(now);
     }
 

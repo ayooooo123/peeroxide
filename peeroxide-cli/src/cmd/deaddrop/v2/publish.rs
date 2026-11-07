@@ -3,8 +3,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use libudx::UdxRuntime;
@@ -19,8 +19,8 @@ use crate::cmd::deaddrop::progress::state::{Phase, ProgressState};
 use crate::cmd::sigterm_recv;
 use crate::config::ResolvedConfig;
 
-use super::super::{build_dht_config, to_hex, PutArgs};
-use super::build::{build_tree, BuiltTree};
+use super::super::{PutArgs, build_dht_config, to_hex};
+use super::build::{BuiltTree, build_tree};
 use super::keys::{ack_topic, need_topic};
 use super::need::{decode_need_list, response_chunks_for_list};
 use super::queue::{ChunkId, Lane, Operation, WorkQueue};
@@ -303,12 +303,7 @@ impl ConcurrencyState {
         loop {
             let permit = self.sem.clone().acquire_owned().await.unwrap();
             let pending = self.forget_pending.load(Ordering::Relaxed);
-            if pending > 0
-                && self
-                    .forget_pending
-                    .fetch_sub(1, Ordering::Relaxed)
-                    > 0
-            {
+            if pending > 0 && self.forget_pending.fetch_sub(1, Ordering::Relaxed) > 0 {
                 permit.forget();
             } else {
                 return permit;
@@ -386,11 +381,7 @@ fn now_ms() -> u64 {
 /// Publish a single mutable record (signed by `kp` with the current Unix
 /// timestamp as `seq`). Returns whether the put was degraded (commit
 /// timeouts > 0).
-async fn put_mutable(
-    handle: &HyperDhtHandle,
-    kp: &KeyPair,
-    bytes: &[u8],
-) -> Result<bool, String> {
+async fn put_mutable(handle: &HyperDhtHandle, kp: &KeyPair, bytes: &[u8]) -> Result<bool, String> {
     let seq = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -457,12 +448,7 @@ async fn dispatcher(
 }
 
 /// Enqueue every non-root chunk of `tree` against `op` on the given lane.
-async fn enqueue_tree_non_root(
-    queue: &WorkQueue,
-    tree: &BuiltTree,
-    lane: Lane,
-    op: &Operation,
-) {
+async fn enqueue_tree_non_root(queue: &WorkQueue, tree: &BuiltTree, lane: Lane, op: &Operation) {
     for (i, c) in tree.data_chunks.iter().enumerate() {
         queue
             .enqueue(
@@ -719,13 +705,18 @@ fn rpassword_read() -> String {
         Err(_) => {
             let mut line = String::new();
             std::io::stdin().read_line(&mut line).unwrap_or(0);
-            return line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+            return line
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .to_string();
         }
     };
     let mut reader = BufReader::new(tty);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap_or(0);
-    line.trim_end_matches('\n').trim_end_matches('\r').to_string()
+    line.trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .to_string()
 }
 
 /// Read input bytes for the put operation. Uses mmap when reading from a

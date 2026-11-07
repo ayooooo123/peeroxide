@@ -44,9 +44,8 @@ fn load_fixtures() -> FixtureFile {
         env!("CARGO_MANIFEST_DIR"),
         "/../tests/interop/secure-payload-fixtures.json"
     );
-    let data = std::fs::read_to_string(path).unwrap_or_else(|e| {
-        panic!("Failed to read secure-payload fixtures at {path}: {e}.")
-    });
+    let data = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("Failed to read secure-payload fixtures at {path}: {e}."));
     serde_json::from_str(&data)
         .unwrap_or_else(|e| panic!("Failed to parse secure-payload fixtures: {e}"))
 }

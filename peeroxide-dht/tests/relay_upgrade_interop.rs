@@ -11,7 +11,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use libudx::UdxRuntime;
-use peeroxide_dht::hyperdht::{self, ConnectOpts, HyperDhtConfig, KeyPair, PeerConnection, ServerConfig};
+use peeroxide_dht::hyperdht::{
+    self, ConnectOpts, HyperDhtConfig, KeyPair, PeerConnection, ServerConfig,
+};
 use peeroxide_dht::hyperdht_messages::FIREWALL_UNKNOWN;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
@@ -28,7 +30,10 @@ struct JsPeer {
 
 impl JsPeer {
     async fn start(args: &[&str]) -> Result<(Self, serde_json::Value), Box<dyn std::error::Error>> {
-        let path = format!("{}/../tests/node/relay-upgrade-peer.js", env!("CARGO_MANIFEST_DIR"));
+        let path = format!(
+            "{}/../tests/node/relay-upgrade-peer.js",
+            env!("CARGO_MANIFEST_DIR")
+        );
         let mut child = tokio::process::Command::new("node")
             .arg(path)
             .args(args)
@@ -41,7 +46,14 @@ impl JsPeer {
         let mut line = String::new();
         output.read_line(&mut line).await?;
         let ready = serde_json::from_str(&line)?;
-        Ok((Self { child, output, input }, ready))
+        Ok((
+            Self {
+                child,
+                output,
+                input,
+            },
+            ready,
+        ))
     }
 
     async fn read_json(&mut self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -60,7 +72,10 @@ struct Ready {
 
 fn ready(value: &serde_json::Value) -> Ready {
     let key = |name: &str| -> [u8; 32] {
-        hex::decode(value[name].as_str().expect(name)).expect("hex").try_into().expect("key length")
+        hex::decode(value[name].as_str().expect(name))
+            .expect("hex")
+            .try_into()
+            .expect("key length")
     };
     let host = value["relayAddr"]["host"].as_str().expect("relay host");
     let port = value["relayAddr"]["port"].as_u64().expect("relay port");
@@ -91,11 +106,17 @@ fn firewalled_config(bootstrap: u64) -> HyperDhtConfig {
 
 fn expected_byte(offset: usize) -> u8 {
     let within = offset % CHUNK;
-    if within < 8 { ((offset / CHUNK) as u64 >> (within * 8)) as u8 } else { within as u8 }
+    if within < 8 {
+        ((offset / CHUNK) as u64 >> (within * 8)) as u8
+    } else {
+        within as u8
+    }
 }
 
 fn chunk(index: usize) -> Vec<u8> {
-    (0..CHUNK).map(|i| expected_byte(index * CHUNK + i)).collect()
+    (0..CHUNK)
+        .map(|i| expected_byte(index * CHUNK + i))
+        .collect()
 }
 
 /// Send chunks and verify the echo until the stream has left `relay_addr`
@@ -120,7 +141,12 @@ async fn pump_until_moved(conn: PeerConnection, relay_addr: SocketAddr) -> usize
     let mut received = 0usize;
     while let Some(data) = read_half.read().await.expect("read echo") {
         for (i, byte) in data.iter().enumerate() {
-            assert_eq!(*byte, expected_byte(received + i), "echo diverged at byte {}", received + i);
+            assert_eq!(
+                *byte,
+                expected_byte(received + i),
+                "echo diverged at byte {}",
+                received + i
+            );
         }
         received += data.len();
     }
@@ -132,14 +158,17 @@ async fn pump_until_moved(conn: PeerConnection, relay_addr: SocketAddr) -> usize
 
 #[tokio::test]
 async fn rust_client_moves_off_the_relay_mid_transfer_against_a_js_server() {
-    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (mut js, value) = JsPeer::start(&["server"]).await.expect("JS server");
         let ready = ready(&value);
 
         let runtime = UdxRuntime::new().expect("runtime");
-        let (_task, dht, _events) =
-            hyperdht::spawn(&runtime, firewalled_config(ready.port)).await.expect("DHT");
+        let (_task, dht, _events) = hyperdht::spawn(&runtime, firewalled_config(ready.port))
+            .await
+            .expect("DHT");
         dht.fully_bootstrapped().await.expect("bootstrapped");
 
         let keys = KeyPair::generate();
@@ -150,14 +179,22 @@ async fn rust_client_moves_off_the_relay_mid_transfer_against_a_js_server() {
             .connect_with_options(&keys, ready.public_key, &[], &runtime, opts)
             .await
             .expect("relayed connect");
-        assert_eq!(conn.remote_addr, Some(ready.relay_addr), "the relay must land first");
+        assert_eq!(
+            conn.remote_addr,
+            Some(ready.relay_addr),
+            "the relay must land first"
+        );
         let opened = js.read_json().await.expect("JS open");
         assert_eq!(js_remote(&opened), ready.relay_addr);
 
         let bytes = pump_until_moved(conn, ready.relay_addr).await;
         let done = js.read_json().await.expect("JS done");
         assert_eq!(done["bytes"].as_u64(), Some(bytes as u64));
-        assert_ne!(js_remote(&done), ready.relay_addr, "JS side still on the relay");
+        assert_ne!(
+            js_remote(&done),
+            ready.relay_addr,
+            "JS side still on the relay"
+        );
 
         dht.destroy().await.expect("destroy");
         js.child.kill().await.expect("stop JS");
@@ -168,14 +205,19 @@ async fn rust_client_moves_off_the_relay_mid_transfer_against_a_js_server() {
 
 #[tokio::test]
 async fn rust_client_stays_relayed_when_the_js_server_refuses_to_punch() {
-    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let (mut js, value) = JsPeer::start(&["server", "--no-punch"]).await.expect("JS server");
+        let (mut js, value) = JsPeer::start(&["server", "--no-punch"])
+            .await
+            .expect("JS server");
         let ready = ready(&value);
 
         let runtime = UdxRuntime::new().expect("runtime");
-        let (_task, dht, _events) =
-            hyperdht::spawn(&runtime, firewalled_config(ready.port)).await.expect("DHT");
+        let (_task, dht, _events) = hyperdht::spawn(&runtime, firewalled_config(ready.port))
+            .await
+            .expect("DHT");
         dht.fully_bootstrapped().await.expect("bootstrapped");
 
         let keys = KeyPair::generate();
@@ -201,7 +243,11 @@ async fn rust_client_stays_relayed_when_the_js_server_refuses_to_punch() {
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }
-        assert_eq!(remote.remote_addr(), Some(ready.relay_addr), "left the relay without a punch");
+        assert_eq!(
+            remote.remote_addr(),
+            Some(ready.relay_addr),
+            "left the relay without a punch"
+        );
         conn.stream.shutdown().await.expect("shutdown");
         let done = js.read_json().await.expect("JS done");
         assert_eq!(done["bytes"].as_u64(), Some(received as u64));
@@ -216,26 +262,40 @@ async fn rust_client_stays_relayed_when_the_js_server_refuses_to_punch() {
 
 #[tokio::test]
 async fn js_client_moves_off_the_relay_mid_transfer_into_a_rust_server() {
-    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     tokio::time::timeout(TEST_TIMEOUT, async {
         let (mut js, value) = JsPeer::start(&["client"]).await.expect("JS client");
         let ready = ready(&value);
 
         let runtime = UdxRuntime::new().expect("runtime");
-        let (_task, dht, events) =
-            hyperdht::spawn(&runtime, firewalled_config(ready.port)).await.expect("DHT");
+        let (_task, dht, events) = hyperdht::spawn(&runtime, firewalled_config(ready.port))
+            .await
+            .expect("DHT");
         dht.fully_bootstrapped().await.expect("bootstrapped");
 
         let keys = KeyPair::generate();
-        let mut server = dht.create_server(&runtime, ServerConfig::new(keys.clone(), FIREWALL_UNKNOWN), events);
+        let mut server = dht.create_server(
+            &runtime,
+            ServerConfig::new(keys.clone(), FIREWALL_UNKNOWN),
+            events,
+        );
         server.listen(&keys).await.expect("listen");
         js.input
             .write_all(format!("{}\n", hex::encode(keys.public_key)).as_bytes())
             .await
             .expect("ask JS to dial");
 
-        let mut accepted = server.accept().await.expect("server accepted the relayed client");
-        assert_eq!(accepted.remote_addr, Some(ready.relay_addr), "the relay must land first");
+        let mut accepted = server
+            .accept()
+            .await
+            .expect("server accepted the relayed client");
+        assert_eq!(
+            accepted.remote_addr,
+            Some(ready.relay_addr),
+            "the relay must land first"
+        );
         let opened = js.read_json().await.expect("JS open");
         assert_eq!(js_remote(&opened), ready.relay_addr);
 
@@ -249,8 +309,16 @@ async fn js_client_moves_off_the_relay_mid_transfer_into_a_rust_server() {
         let done = js.read_json().await.expect("JS done");
         assert_eq!(done["ok"], true, "JS saw a corrupted echo");
         assert_eq!(done["bytes"].as_u64(), Some(echoed));
-        assert_ne!(js_remote(&done), ready.relay_addr, "JS side still on the relay");
-        assert_ne!(remote.remote_addr(), Some(ready.relay_addr), "Rust side still on the relay");
+        assert_ne!(
+            js_remote(&done),
+            ready.relay_addr,
+            "JS side still on the relay"
+        );
+        assert_ne!(
+            remote.remote_addr(),
+            Some(ready.relay_addr),
+            "Rust side still on the relay"
+        );
 
         server.close().await;
         dht.destroy().await.expect("destroy");

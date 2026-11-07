@@ -63,8 +63,7 @@ pub fn namespace(name: &str, ids: &[u8]) -> Vec<[u8; 32]> {
 }
 
 /// Precomputed namespace hash for announce operations.
-pub static NS_ANNOUNCE: LazyLock<[u8; 32]> =
-    LazyLock::new(|| namespace("hyperswarm/dht", &[4])[0]);
+pub static NS_ANNOUNCE: LazyLock<[u8; 32]> = LazyLock::new(|| namespace("hyperswarm/dht", &[4])[0]);
 /// Precomputed namespace hash for unannounce operations.
 pub static NS_UNANNOUNCE: LazyLock<[u8; 32]> =
     LazyLock::new(|| namespace("hyperswarm/dht", &[5])[0]);

@@ -36,7 +36,15 @@ async fn spawn_bootstrap() -> (u16, BootstrapNode) {
     let (task, handle, rx) = hyperdht::spawn(&rt, cfg).await.unwrap();
     let port = handle.local_port().await.unwrap();
 
-    (port, BootstrapNode { _rt: rt, _task: task, _handle: handle, _rx: rx })
+    (
+        port,
+        BootstrapNode {
+            _rt: rt,
+            _task: task,
+            _handle: handle,
+            _rx: rx,
+        },
+    )
 }
 
 struct BootstrapNode {
@@ -69,7 +77,12 @@ async fn spawn_dht_cluster(n: usize) -> (Vec<u16>, Vec<BootstrapNode>) {
         let port = handle.local_port().await.unwrap();
 
         ports.push(port);
-        nodes.push(BootstrapNode { _rt: rt, _task: task, _handle: handle, _rx: rx });
+        nodes.push(BootstrapNode {
+            _rt: rt,
+            _task: task,
+            _handle: handle,
+            _rx: rx,
+        });
     }
 
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -114,7 +127,10 @@ async fn test_chat_help() {
     assert!(stdout.contains("dm"), "help should mention 'dm'");
     assert!(stdout.contains("inbox"), "help should mention 'inbox'");
     assert!(stdout.contains("whoami"), "help should mention 'whoami'");
-    assert!(stdout.contains("profiles"), "help should mention 'profiles'");
+    assert!(
+        stdout.contains("profiles"),
+        "help should mention 'profiles'"
+    );
     assert!(stdout.contains("nexus"), "help should mention 'nexus'");
     assert!(stdout.contains("friends"), "help should mention 'friends'");
 }
@@ -130,7 +146,14 @@ async fn test_chat_profiles_create_list_delete() {
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
             .env("HOME", &home_create)
-            .args(["chat", "profiles", "create", "alice", "--screen-name", "Alice"])
+            .args([
+                "chat",
+                "profiles",
+                "create",
+                "alice",
+                "--screen-name",
+                "Alice",
+            ])
             .output()
             .expect("failed to run profiles create")
     })
@@ -159,7 +182,10 @@ async fn test_chat_profiles_create_list_delete() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
-    assert!(stdout.contains("alice"), "profile list should contain 'alice', got: {stdout}");
+    assert!(
+        stdout.contains("alice"),
+        "profile list should contain 'alice', got: {stdout}"
+    );
 
     let home_delete = home.clone();
     let output = tokio::task::spawn_blocking(move || {
@@ -189,7 +215,10 @@ async fn test_chat_profiles_create_list_delete() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
-    assert!(!stdout.contains("alice"), "deleted profile should not appear, got: {stdout}");
+    assert!(
+        !stdout.contains("alice"),
+        "deleted profile should not appear, got: {stdout}"
+    );
 }
 
 // ── Test: whoami ────────────────────────────────────────────────────────────────
@@ -245,7 +274,10 @@ async fn test_chat_nexus_set_name_and_bio() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Screen name updated to: NewName"), "got: {stdout}");
+    assert!(
+        stdout.contains("Screen name updated to: NewName"),
+        "got: {stdout}"
+    );
 
     let home_bio = home.clone();
     let output = tokio::task::spawn_blocking(move || {
@@ -308,7 +340,10 @@ async fn test_chat_nexus_publish_and_lookup() {
             .lines()
             .find(|l| l.starts_with("Public key:"))
             .expect("no Public key line");
-        let pubkey = pubkey_line.trim_start_matches("Public key:").trim().to_string();
+        let pubkey = pubkey_line
+            .trim_start_matches("Public key:")
+            .trim()
+            .to_string();
         assert_eq!(pubkey.len(), 64, "pubkey should be 64 hex chars");
 
         let pub_home_publish = pub_home_str.clone();
@@ -318,8 +353,11 @@ async fn test_chat_nexus_publish_and_lookup() {
                 .env("HOME", &pub_home_publish)
                 .args([
                     "--no-default-config",
-                    "chat", "nexus", "--publish",
-                    "--bootstrap", &bs_addr_pub,
+                    "chat",
+                    "nexus",
+                    "--publish",
+                    "--bootstrap",
+                    &bs_addr_pub,
                 ])
                 .output()
                 .expect("failed to run nexus --publish")
@@ -349,8 +387,12 @@ async fn test_chat_nexus_publish_and_lookup() {
                 .env("HOME", &lookup_home_str)
                 .args([
                     "--no-default-config",
-                    "chat", "nexus", "--lookup", &pubkey_lookup,
-                    "--bootstrap", &bs_addr_lookup,
+                    "chat",
+                    "nexus",
+                    "--lookup",
+                    &pubkey_lookup,
+                    "--bootstrap",
+                    &bs_addr_lookup,
                 ])
                 .output()
                 .expect("failed to run nexus --lookup")
@@ -371,7 +413,10 @@ async fn test_chat_nexus_publish_and_lookup() {
     })
     .await;
 
-    assert!(result.is_ok(), "test_chat_nexus_publish_and_lookup timed out");
+    assert!(
+        result.is_ok(),
+        "test_chat_nexus_publish_and_lookup timed out"
+    );
 }
 
 // ── Test: two instances exchange a message ──────────────────────────────────────
@@ -394,10 +439,15 @@ async fn test_chat_message_exchange() {
             .env("HOME", &alice_home_str)
             .args([
                 "--no-default-config",
-                "chat", "join", "test-chat-exchange",
-                "--bootstrap", &bs_alice,
-                "--no-nexus", "--no-friends",
-                "--feed-lifetime", "60",
+                "chat",
+                "join",
+                "test-chat-exchange",
+                "--bootstrap",
+                &bs_alice,
+                "--no-nexus",
+                "--no-friends",
+                "--feed-lifetime",
+                "60",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -428,10 +478,15 @@ async fn test_chat_message_exchange() {
             .env("HOME", &bob_home_str)
             .args([
                 "--no-default-config",
-                "chat", "join", "test-chat-exchange",
-                "--bootstrap", &bs_bob,
-                "--no-nexus", "--no-friends",
-                "--feed-lifetime", "60",
+                "chat",
+                "join",
+                "test-chat-exchange",
+                "--bootstrap",
+                &bs_bob,
+                "--no-nexus",
+                "--no-friends",
+                "--feed-lifetime",
+                "60",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -528,10 +583,15 @@ async fn test_chat_burst_ordering() {
             .env("HOME", &alice_home_str)
             .args([
                 "--no-default-config",
-                "chat", "join", "test-chat-burst",
-                "--bootstrap", &bs_alice,
-                "--no-nexus", "--no-friends",
-                "--feed-lifetime", "60",
+                "chat",
+                "join",
+                "test-chat-burst",
+                "--bootstrap",
+                &bs_alice,
+                "--no-nexus",
+                "--no-friends",
+                "--feed-lifetime",
+                "60",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -561,11 +621,16 @@ async fn test_chat_burst_ordering() {
             .env("HOME", &bob_home_str)
             .args([
                 "--no-default-config",
-                "chat", "join", "test-chat-burst",
-                "--bootstrap", &bs_bob,
+                "chat",
+                "join",
+                "test-chat-burst",
+                "--bootstrap",
+                &bs_bob,
                 "--read-only",
-                "--no-nexus", "--no-friends",
-                "--feed-lifetime", "60",
+                "--no-nexus",
+                "--no-friends",
+                "--feed-lifetime",
+                "60",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -594,8 +659,7 @@ async fn test_chat_burst_ordering() {
 
         let alice_stdin = alice.stdin.as_mut().expect("no stdin for Alice");
         for i in 1..=BURST_SIZE {
-            writeln!(alice_stdin, "burst-line-{i:03}")
-                .expect("failed to write burst line");
+            writeln!(alice_stdin, "burst-line-{i:03}").expect("failed to write burst line");
         }
         alice_stdin.flush().expect("failed to flush Alice stdin");
 
@@ -618,8 +682,7 @@ async fn test_chat_burst_ordering() {
             seen
         });
 
-        let collect_result =
-            tokio::time::timeout(Duration::from_secs(120), collector).await;
+        let collect_result = tokio::time::timeout(Duration::from_secs(120), collector).await;
 
         kill_child(&mut alice);
         kill_child(&mut bob);
@@ -658,10 +721,14 @@ async fn test_chat_read_only_no_post() {
             .env("HOME", &home)
             .args([
                 "--no-default-config",
-                "chat", "join", "readonly-test-channel",
-                "--bootstrap", &bs_clone,
+                "chat",
+                "join",
+                "readonly-test-channel",
+                "--bootstrap",
+                &bs_clone,
                 "--read-only",
-                "--no-nexus", "--no-friends",
+                "--no-nexus",
+                "--no-friends",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -682,7 +749,10 @@ async fn test_chat_read_only_no_post() {
         });
 
         let ready = tokio::time::timeout(Duration::from_secs(20), live_check).await;
-        assert!(matches!(ready, Ok(Ok(true))), "read-only instance did not reach live state");
+        assert!(
+            matches!(ready, Ok(Ok(true))),
+            "read-only instance did not reach live state"
+        );
 
         if let Some(ref mut stdin) = child.stdin {
             let _ = writeln!(stdin, "this should not post");
@@ -715,7 +785,10 @@ async fn test_chat_cannot_delete_default_profile() {
     .await
     .unwrap();
 
-    assert!(!output.status.success(), "should fail to delete default profile");
+    assert!(
+        !output.status.success(),
+        "should fail to delete default profile"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("cannot delete the default profile"),
@@ -735,7 +808,14 @@ async fn test_chat_friends_add_list() {
     let output = tokio::task::spawn_blocking(move || {
         Command::new(bin_path())
             .env("HOME", &home_add)
-            .args(["chat", "friends", "add", fake_pubkey, "--alias", "TestBuddy"])
+            .args([
+                "chat",
+                "friends",
+                "add",
+                fake_pubkey,
+                "--alias",
+                "TestBuddy",
+            ])
             .output()
             .expect("failed to run friends add")
     })

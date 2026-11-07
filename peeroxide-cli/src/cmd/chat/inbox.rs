@@ -4,7 +4,7 @@ use rand::Rng;
 use crate::cmd::chat::crypto;
 use crate::cmd::chat::debug;
 use crate::cmd::chat::known_users::KnownUser;
-use crate::cmd::chat::wire::{self, InviteRecord, INVITE_TYPE_DM};
+use crate::cmd::chat::wire::{self, INVITE_TYPE_DM, InviteRecord};
 
 pub async fn send_dm_invite(
     handle: &HyperDhtHandle,
@@ -29,7 +29,9 @@ pub async fn send_dm_invite(
         payload: message.as_bytes().to_vec(),
     };
 
-    let plaintext = invite.serialize().map_err(|e| format!("invite serialize: {e}"))?;
+    let plaintext = invite
+        .serialize()
+        .map_err(|e| format!("invite serialize: {e}"))?;
 
     let invite_x25519_priv = crypto::ed25519_secret_to_x25519(&invite_feed_keypair.secret_key);
     let recipient_x25519 = crypto::ed25519_pubkey_to_x25519(recipient_pubkey)
@@ -37,8 +39,8 @@ pub async fn send_dm_invite(
     let ecdh_secret = crypto::x25519_ecdh(&invite_x25519_priv, &recipient_x25519);
     let inv_key = crypto::invite_key(&ecdh_secret, &invite_feed_keypair.public_key);
 
-    let encrypted = wire::encrypt_invite(&inv_key, &plaintext)
-        .map_err(|e| format!("invite encrypt: {e}"))?;
+    let encrypted =
+        wire::encrypt_invite(&inv_key, &plaintext).map_err(|e| format!("invite encrypt: {e}"))?;
 
     handle
         .mutable_put(invite_feed_keypair, &encrypted, 0)
@@ -107,7 +109,9 @@ pub async fn send_dm_nudge(
         payload,
     };
 
-    let plaintext = invite.serialize().map_err(|e| format!("nudge serialize: {e}"))?;
+    let plaintext = invite
+        .serialize()
+        .map_err(|e| format!("nudge serialize: {e}"))?;
 
     let invite_x25519_priv = crypto::ed25519_secret_to_x25519(&invite_feed_keypair.secret_key);
     let recipient_x25519 = crypto::ed25519_pubkey_to_x25519(recipient_pubkey)
@@ -115,8 +119,8 @@ pub async fn send_dm_nudge(
     let ecdh_secret = crypto::x25519_ecdh(&invite_x25519_priv, &recipient_x25519);
     let inv_key = crypto::invite_key(&ecdh_secret, &invite_feed_keypair.public_key);
 
-    let encrypted = wire::encrypt_invite(&inv_key, &plaintext)
-        .map_err(|e| format!("nudge encrypt: {e}"))?;
+    let encrypted =
+        wire::encrypt_invite(&inv_key, &plaintext).map_err(|e| format!("nudge encrypt: {e}"))?;
 
     handle
         .mutable_put(invite_feed_keypair, &encrypted, seq + 1)
@@ -195,11 +199,9 @@ pub fn decrypt_and_verify_invite(
     let plaintext =
         wire::decrypt_invite(&inv_key, encrypted_data).map_err(|e| format!("decrypt: {e}"))?;
 
-    let record =
-        InviteRecord::deserialize(&plaintext).map_err(|e| format!("parse invite: {e}"))?;
+    let record = InviteRecord::deserialize(&plaintext).map_err(|e| format!("parse invite: {e}"))?;
 
-    let candidate_dm_key =
-        crypto::dm_channel_key(&record.id_pubkey, &my_keypair.public_key);
+    let candidate_dm_key = crypto::dm_channel_key(&record.id_pubkey, &my_keypair.public_key);
     if crypto::verify_ownership_proof(
         &record.id_pubkey,
         invite_feed_pubkey,
@@ -277,11 +279,10 @@ pub fn display_invite(
                     invite.payload[2 + name_len],
                 ]) as usize;
                 if invite.payload.len() >= 3 + name_len + salt_len {
-                    let salt =
-                        String::from_utf8_lossy(&invite.payload[3 + name_len..3 + name_len + salt_len]);
-                    println!(
-                        "[INVITE #{number}] Channel \"{name}\" from {sender_name} ({short})"
+                    let salt = String::from_utf8_lossy(
+                        &invite.payload[3 + name_len..3 + name_len + salt_len],
                     );
+                    println!("[INVITE #{number}] Channel \"{name}\" from {sender_name} ({short})");
                     println!(
                         "  → peeroxide chat join \"{name}\" --group \"{salt}\" --profile {profile_name}"
                     );

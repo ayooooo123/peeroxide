@@ -77,7 +77,10 @@ async fn rust_initiator_node_responder() {
 
         let event = channel.recv().await.expect("expected message");
         match event {
-            ChannelEvent::Message { message_type: 0, data } => {
+            ChannelEvent::Message {
+                message_type: 0,
+                data,
+            } => {
                 assert_eq!(data, b"hello from node");
             }
             other => panic!("expected Message(0, hello from node), got {other:?}"),
@@ -87,7 +90,10 @@ async fn rust_initiator_node_responder() {
 
         let event = channel.recv().await.expect("expected echo message");
         match event {
-            ChannelEvent::Message { message_type: 0, data } => {
+            ChannelEvent::Message {
+                message_type: 0,
+                data,
+            } => {
                 assert_eq!(data, b"echo: hello from rust");
             }
             other => panic!("expected Message(0, echo: hello from rust), got {other:?}"),
@@ -95,7 +101,10 @@ async fn rust_initiator_node_responder() {
 
         let event = channel.recv().await.expect("expected goodbye message");
         match event {
-            ChannelEvent::Message { message_type: 0, data } => {
+            ChannelEvent::Message {
+                message_type: 0,
+                data,
+            } => {
                 assert_eq!(data, b"goodbye");
             }
             other => panic!("expected Message(0, goodbye), got {other:?}"),

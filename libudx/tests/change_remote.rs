@@ -24,8 +24,10 @@ async fn relay(rt: &UdxRuntime) -> (UdxStream, UdxStream, UdxSocket, SocketAddr)
     let (socket, addr) = create_bound_socket(rt).await;
     let to_a = rt.create_stream(RELAY_A_ID).await.expect("relay a");
     let to_b = rt.create_stream(RELAY_B_ID).await.expect("relay b");
-    to_a.set_firewall_hook(&socket, A_ID, |_, _, _| true).expect("hook a");
-    to_b.set_firewall_hook(&socket, B_ID, |_, _, _| true).expect("hook b");
+    to_a.set_firewall_hook(&socket, A_ID, |_, _, _| true)
+        .expect("hook a");
+    to_b.set_firewall_hook(&socket, B_ID, |_, _, _| true)
+        .expect("hook b");
     to_a.relay_to(&to_b).expect("relay a→b");
     to_b.relay_to(&to_a).expect("relay b→a");
     (to_a, to_b, socket, addr)
@@ -37,9 +39,15 @@ async fn direct_observation_waits_for_in_order_data() {
     let (socket, addr) = create_bound_socket(&runtime).await;
     let (peer, peer_addr) = create_bound_socket(&runtime).await;
     let stream = runtime.create_stream(A_ID).await.expect("stream");
-    stream.connect(&socket, B_ID, peer_addr).await.expect("connect");
+    stream
+        .connect(&socket, B_ID, peer_addr)
+        .await
+        .expect("connect");
     let remote = stream.remote_handle();
-    remote.change_remote(&socket, B_ID, peer_addr).await.expect("move");
+    remote
+        .change_remote(&socket, B_ID, peer_addr)
+        .await
+        .expect("move");
     let packet = |seq: u32| {
         let mut data = vec![0u8; 20];
         data[..4].copy_from_slice(&[0xff, 1, 1, 0]); // UDX v1 DATA header.
@@ -50,11 +58,17 @@ async fn direct_observation_waits_for_in_order_data() {
         data
     };
     peer.send_to(&packet(1), addr).expect("out-of-order data");
-    assert!(tokio::time::timeout(Duration::from_millis(30), remote.remote_observed())
-        .await.is_err(), "a gap must keep the relay alive");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), remote.remote_observed())
+            .await
+            .is_err(),
+        "a gap must keep the relay alive"
+    );
     peer.send_to(&packet(0), addr).expect("in-order data");
     tokio::time::timeout(Duration::from_secs(2), remote.remote_observed())
-        .await.expect("direct observation").expect("stream alive");
+        .await
+        .expect("direct observation")
+        .expect("stream alive");
 }
 
 /// A (the initiator) learns B's direct address out of band and moves first;
@@ -76,9 +90,13 @@ async fn relayed_stream_moves_to_a_direct_path_mid_transfer() {
         let (socket_b2, addr_b2) = create_bound_socket(&rt).await;
 
         let stream_a = rt.create_stream(A_ID).await.expect("stream a");
-        stream_a.connect(&socket_a, RELAY_A_ID, relay_addr).await.expect("connect a");
+        stream_a
+            .connect(&socket_a, RELAY_A_ID, relay_addr)
+            .await
+            .expect("connect a");
 
-        let (direct_tx, mut direct_rx) = tokio::sync::mpsc::unbounded_channel::<(UdxSocket, SocketAddr)>();
+        let (direct_tx, mut direct_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(UdxSocket, SocketAddr)>();
         let stream_b = rt.create_stream(B_ID).await.expect("stream b");
         stream_b
             .set_firewall_hook(&socket_b, RELAY_B_ID, move |socket, port, ip| {
@@ -87,7 +105,10 @@ async fn relayed_stream_moves_to_a_direct_path_mid_transfer() {
             })
             .expect("hook b");
         stream_b.listen_on(&socket_b2).expect("listen b2");
-        stream_b.connect(&socket_b, RELAY_B_ID, relay_addr).await.expect("connect b");
+        stream_b
+            .connect(&socket_b, RELAY_B_ID, relay_addr)
+            .await
+            .expect("connect b");
 
         // Both relay legs learn their peer before the bulk starts.
         stream_b.write(b"hello").await.expect("b hello");
@@ -116,29 +137,45 @@ async fn relayed_stream_moves_to_a_direct_path_mid_transfer() {
         // First third crosses the relay; some of it is still in flight when
         // A moves to B's direct address, so the change completes deferred.
         let third = payload.len() / 3;
-        a.write_all(&payload[..third]).await.expect("write via relay");
+        a.write_all(&payload[..third])
+            .await
+            .expect("write via relay");
         tokio::time::sleep(Duration::from_millis(5)).await;
         a_remote
             .change_remote(&socket_a2, B_ID, addr_b2)
             .await
             .expect("a change_remote");
-        a.write_all(&payload[third..2 * third]).await.expect("write during move");
+        a.write_all(&payload[third..2 * third])
+            .await
+            .expect("write during move");
 
         // B's hook saw A on the direct socket (not the relay packets on its
         // own socket) and follows.
         let (socket, addr) = direct_rx.recv().await.expect("b hook");
         assert_eq!(addr, addr_a2);
         assert_eq!(socket.local_addr().await.unwrap(), addr_b2);
-        b_remote.change_remote(&socket, A_ID, addr).await.expect("b change_remote");
-        assert!(tokio::time::timeout(Duration::from_millis(20), a_remote.remote_observed())
-            .await.is_err(), "ACKs alone must not confirm direct application traffic");
+        b_remote
+            .change_remote(&socket, A_ID, addr)
+            .await
+            .expect("b change_remote");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), a_remote.remote_observed())
+                .await
+                .is_err(),
+            "ACKs alone must not confirm direct application traffic"
+        );
         b_remote.try_send(&[]).expect("confirm direct path");
-        a_remote.remote_observed().await.expect("a observed b directly");
+        a_remote
+            .remote_observed()
+            .await
+            .expect("a observed b directly");
 
         // The relay is gone; the rest must go direct.
         drop(relay_a);
         drop(relay_b);
-        a.write_all(&payload[2 * third..]).await.expect("write direct");
+        a.write_all(&payload[2 * third..])
+            .await
+            .expect("write direct");
         a.flush().await.expect("flush");
 
         let _b = reader.await.expect("reader");
@@ -154,14 +191,27 @@ async fn change_remote_rejects_unconnected_and_bad_targets() {
         let (socket_other, _) = create_bound_socket(&rt).await;
 
         let idle = rt.create_stream(7).await.expect("idle stream");
-        assert!(idle.remote_handle().change_remote(&socket, 8, addr).await.is_err());
+        assert!(
+            idle.remote_handle()
+                .change_remote(&socket, 8, addr)
+                .await
+                .is_err()
+        );
 
         let (a, _b, socket_a, _socket_b) = common::create_connected_pair(&rt).await;
         let remote = a.remote_handle();
         let zero_port: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        assert!(remote.change_remote(&socket_a, B_ID, zero_port).await.is_err());
+        assert!(
+            remote
+                .change_remote(&socket_a, B_ID, zero_port)
+                .await
+                .is_err()
+        );
         // Nothing in flight: completes at once.
-        remote.change_remote(&socket_other, B_ID, addr).await.expect("immediate change");
+        remote
+            .change_remote(&socket_other, B_ID, addr)
+            .await
+            .expect("immediate change");
     })
     .await;
 }
@@ -187,8 +237,14 @@ async fn change_remote_waits_for_in_flight_packets() {
 
         let stream_a = rt.create_stream(A_ID).await.expect("stream a");
         let mut stream_b = rt.create_stream(B_ID).await.expect("stream b");
-        stream_a.connect(&socket_a, B_ID, proxy.addr_for_a).await.expect("connect a");
-        stream_b.connect(&socket_b, A_ID, proxy.addr_for_b).await.expect("connect b");
+        stream_a
+            .connect(&socket_a, B_ID, proxy.addr_for_a)
+            .await
+            .expect("connect a");
+        stream_b
+            .connect(&socket_b, A_ID, proxy.addr_for_b)
+            .await
+            .expect("connect b");
 
         let payload = random_payload(64 * 1024);
         let a_remote = stream_a.remote_handle();
@@ -200,7 +256,10 @@ async fn change_remote_waits_for_in_flight_packets() {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let started = std::time::Instant::now();
-        a_remote.change_remote(&socket_a, B_ID, addr_b).await.expect("change");
+        a_remote
+            .change_remote(&socket_a, B_ID, addr_b)
+            .await
+            .expect("change");
         assert!(
             started.elapsed() >= delay,
             "change completed in {:?} with packets still on the slow path",

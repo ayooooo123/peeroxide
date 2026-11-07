@@ -28,7 +28,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use peeroxide::{discovery_key, spawn, JoinOpts, SwarmConfig, SwarmHandle};
+use peeroxide::{JoinOpts, SwarmConfig, SwarmHandle, discovery_key, spawn};
 use peeroxide_dht::hyperdht::HyperDhtConfig;
 use peeroxide_dht::hyperdht_messages::{FIREWALL_CONSISTENT, FIREWALL_RANDOM};
 use peeroxide_dht::rpc::DhtConfig;
@@ -93,7 +93,10 @@ impl JsSwarm {
                     let v: Value = serde_json::from_str(line).expect("invalid JSON from JS");
                     assert!(v["ready"].as_bool().unwrap_or(false), "JS not ready");
                     let port = v["port"].as_u64().expect("missing port") as u16;
-                    let pk = v["publicKey"].as_str().expect("missing publicKey").to_string();
+                    let pk = v["publicKey"]
+                        .as_str()
+                        .expect("missing publicKey")
+                        .to_string();
                     return (port, pk);
                 }
             }
@@ -183,7 +186,10 @@ impl JsSwarm {
         let id = self.send_cmd(serde_json::json!({ "cmd": "stats" }));
         let reply = self.wait_reply(id);
         let p = &reply["punches"];
-        let count = |k: &str| p[k].as_u64().unwrap_or_else(|| panic!("no punches.{k}: {reply}"));
+        let count = |k: &str| {
+            p[k].as_u64()
+                .unwrap_or_else(|| panic!("no punches.{k}: {reply}"))
+        };
         (count("open"), count("consistent") + count("random"))
     }
 
@@ -215,9 +221,7 @@ impl JsSwarm {
 
 impl Drop for JsSwarm {
     fn drop(&mut self) {
-        let _ = self
-            .stdin
-            .write_all(b"{\"cmd\":\"shutdown\",\"id\":0}\n");
+        let _ = self.stdin.write_all(b"{\"cmd\":\"shutdown\",\"id\":0}\n");
         let _ = self.stdin.flush();
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -266,14 +270,11 @@ async fn run_interop() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Rust swarm started");
 
     handle
-        .join(
-            topic,
-            {
-                let mut opts = JoinOpts::default();
-                opts.server = false;
-                opts
-            },
-        )
+        .join(topic, {
+            let mut opts = JoinOpts::default();
+            opts.server = false;
+            opts
+        })
         .await?;
     tracing::info!("Rust joined topic as client");
 
@@ -365,7 +366,10 @@ async fn wait_until_firewalled(handle: &SwarmHandle) -> Result<u64, Box<dyn std:
             return Ok(state);
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("Rust server never classified itself as firewalled (state {state})").into());
+            return Err(format!(
+                "Rust server never classified itself as firewalled (state {state})"
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -404,14 +408,11 @@ async fn run_node_client_interop(
     let rust_pk = hex::encode(handle.key_pair().public_key);
 
     handle
-        .join(
-            topic,
-            {
-                let mut opts = JoinOpts::default();
-                opts.client = false;
-                opts
-            },
-        )
+        .join(topic, {
+            let mut opts = JoinOpts::default();
+            opts.client = false;
+            opts
+        })
         .await?;
     handle.flush().await?;
     tracing::info!("Rust announced topic as server");
@@ -427,7 +428,10 @@ async fn run_node_client_interop(
         .map_err(|_| "timed out waiting for the Node client's connection")?
         .ok_or("conn_rx closed without delivering a connection")?;
 
-    assert!(!conn.is_initiator, "the Node client should be the initiator");
+    assert!(
+        !conn.is_initiator,
+        "the Node client should be the initiator"
+    );
 
     let connected_event = js.wait_event("connected");
     assert_eq!(connected_event["remotePk"].as_str(), Some(rust_pk.as_str()));
@@ -446,7 +450,10 @@ async fn run_node_client_interop(
     let (open, punched) = js.punches();
     match expected {
         ExpectedPath::Holepunch => {
-            assert_eq!(open, 0, "the Node client should not have dialled the server directly");
+            assert_eq!(
+                open, 0,
+                "the Node client should not have dialled the server directly"
+            );
             assert!(punched >= 1, "the Node client should have holepunched");
         }
         ExpectedPath::ServerDials | ExpectedPath::Direct => {

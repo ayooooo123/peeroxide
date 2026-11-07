@@ -152,7 +152,8 @@ async fn socket_stream_ids_sparse() {
         socket_b.bind(addr()).await.expect("bind_b");
         let addr_b = socket_b.local_addr().await.expect("addr_b");
 
-        let sparse_ids: [(u32, u32); 4] = [(1, 1000), (42, 9999), (7777, 65535), (100_000, 200_000)];
+        let sparse_ids: [(u32, u32); 4] =
+            [(1, 1000), (42, 9999), (7777, 65535), (100_000, 200_000)];
 
         let mut pairs = Vec::new();
         for (id_a, id_b) in sparse_ids {

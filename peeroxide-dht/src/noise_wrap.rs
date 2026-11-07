@@ -5,14 +5,14 @@
 //!
 //! Reference: `hyperdht/lib/noise-wrap.js`.
 
+use blake2::Blake2bMac;
 use blake2::digest::consts::U32;
 use blake2::digest::{KeyInit, Mac};
-use blake2::Blake2bMac;
 
 use crate::crypto::NS_PEER_HANDSHAKE;
 use crate::crypto::NS_PEER_HOLEPUNCH;
 use crate::hyperdht_messages::{
-    decode_noise_payload_from_bytes, encode_noise_payload_to_bytes, NoisePayload,
+    NoisePayload, decode_noise_payload_from_bytes, encode_noise_payload_to_bytes,
 };
 use crate::noise::{HandshakeIK, Keypair};
 
@@ -90,8 +90,7 @@ impl NoiseWrap {
     ///
     /// `remote_public_key` is the responder's static key (obtained via findPeer).
     pub fn new_initiator(keypair: Keypair, remote_public_key: [u8; 32]) -> Self {
-        let handshake =
-            HandshakeIK::new_initiator(keypair, remote_public_key, &*NS_PEER_HANDSHAKE);
+        let handshake = HandshakeIK::new_initiator(keypair, remote_public_key, &*NS_PEER_HANDSHAKE);
         NoiseWrap {
             handshake,
             is_initiator: true,
@@ -348,7 +347,10 @@ mod tests {
         assert_eq!(decoded.addresses4[0].port, 9999);
         assert_eq!(decoded.udx.as_ref().unwrap().id, 7);
         assert_eq!(decoded.secret_stream.as_ref().unwrap().version, 1);
-        assert_eq!(decoded.relay_through.as_ref().unwrap().public_key, [0xBBu8; 32]);
+        assert_eq!(
+            decoded.relay_through.as_ref().unwrap().public_key,
+            [0xBBu8; 32]
+        );
     }
 
     #[test]
@@ -358,8 +360,7 @@ mod tests {
         let secret = derive_holepunch_secret(&hash);
 
         // Recompute independently
-        let mut mac: Blake2bMac256 =
-            KeyInit::new_from_slice(&hash[..]).expect("64-byte key");
+        let mut mac: Blake2bMac256 = KeyInit::new_from_slice(&hash[..]).expect("64-byte key");
         Mac::update(&mut mac, &*NS_PEER_HOLEPUNCH);
         let expected = mac.finalize().into_bytes();
         let mut expected_arr = [0u8; 32];

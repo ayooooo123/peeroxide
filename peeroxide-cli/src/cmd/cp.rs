@@ -1,13 +1,13 @@
 use clap::{Args, Subcommand};
-use peeroxide::{spawn, JoinOpts, SwarmConfig};
+use peeroxide::{JoinOpts, SwarmConfig, spawn};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use tokio::signal;
 use tokio::io::AsyncWriteExt;
+use tokio::signal;
 
-use crate::config::ResolvedConfig;
 use super::{apply_force_relay_env, build_dht_config, parse_topic, to_hex};
+use crate::config::ResolvedConfig;
 
 const CHUNK_SIZE: usize = 65536;
 
@@ -79,7 +79,10 @@ async fn run_send(args: SendArgs, cfg: &ResolvedConfig) -> i32 {
     }
 
     let (file_size, file_name) = if args.file == "-" {
-        (None, args.name.clone().unwrap_or_else(|| "stdin".to_string()))
+        (
+            None,
+            args.name.clone().unwrap_or_else(|| "stdin".to_string()),
+        )
     } else {
         let path = PathBuf::from(&args.file);
         if !path.exists() {
@@ -181,7 +184,8 @@ async fn run_send(args: SendArgs, cfg: &ResolvedConfig) -> i32 {
         eprintln!("  connected from @{}", &remote_pk[..8]);
 
         let start = Instant::now();
-        let bytes_sent = stream_send_file(&args.file, file_size, &file_name, conn, args.progress).await;
+        let bytes_sent =
+            stream_send_file(&args.file, file_size, &file_name, conn, args.progress).await;
 
         match bytes_sent {
             Ok(sent) => {
@@ -191,7 +195,11 @@ async fn run_send(args: SendArgs, cfg: &ResolvedConfig) -> i32 {
                 } else {
                     "∞".to_string()
                 };
-                eprintln!("  done: {} in {:.1}s ({speed}/s)", format_size(sent), elapsed.as_secs_f64());
+                eprintln!(
+                    "  done: {} in {:.1}s ({speed}/s)",
+                    format_size(sent),
+                    elapsed.as_secs_f64()
+                );
                 transfer_count += 1;
             }
             Err(ref e) if e == "interrupted" => {
@@ -258,9 +266,11 @@ async fn stream_send_file(
             }
             None => {
                 let pb = ProgressBar::new_spinner();
-                pb.set_style(ProgressStyle::default_spinner()
-                    .template("{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})")
-                    .unwrap());
+                pb.set_style(
+                    ProgressStyle::default_spinner()
+                        .template("{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})")
+                        .unwrap(),
+                );
                 Some(pb)
             }
         }
@@ -493,7 +503,10 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
 
     let sanitized_name = sanitize_filename(&filename);
     if sanitized_name != filename {
-        eprintln!("  warning: filename sanitized: \"{}\" → \"{}\"", filename, sanitized_name);
+        eprintln!(
+            "  warning: filename sanitized: \"{}\" → \"{}\"",
+            filename, sanitized_name
+        );
     }
 
     let dest_path = if stdout_mode {
@@ -556,9 +569,13 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
                 }
                 None => {
                     let pb = ProgressBar::new_spinner();
-                    pb.set_style(ProgressStyle::default_spinner()
-                        .template("{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})")
-                        .unwrap());
+                    pb.set_style(
+                        ProgressStyle::default_spinner()
+                            .template(
+                                "{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})",
+                            )
+                            .unwrap(),
+                    );
                     Some(pb)
                 }
             }
@@ -603,7 +620,9 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
             total_received += chunk.len() as u64;
             if let Some(expected) = expected_size {
                 if total_received > expected {
-                    if let Some(ref pb) = pb { pb.abandon(); }
+                    if let Some(ref pb) = pb {
+                        pb.abandon();
+                    }
                     eprintln!("error: received more data than expected size");
                     let _ = handle.destroy().await;
                     let _ = task.await;
@@ -615,7 +634,9 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
             }
 
             if let Err(e) = stdout.write_all(&chunk).await {
-                if let Some(ref pb) = pb { pb.abandon(); }
+                if let Some(ref pb) = pb {
+                    pb.abandon();
+                }
                 eprintln!("error: failed to write to stdout: {e}");
                 let _ = handle.destroy().await;
                 let _ = task.await;
@@ -623,7 +644,9 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
             }
         }
         let _ = stdout.flush().await;
-        if let Some(pb) = pb { pb.finish_and_clear(); }
+        if let Some(pb) = pb {
+            pb.finish_and_clear();
+        }
 
         if let Some(expected) = expected_size {
             if total_received != expected {
@@ -636,7 +659,11 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
     } else {
         let dest = dest_path.unwrap();
         let dir = dest.parent().unwrap_or(std::path::Path::new("."));
-        let temp_path = dir.join(format!(".peeroxide-recv-{}-{}", std::process::id(), rand_suffix()));
+        let temp_path = dir.join(format!(
+            ".peeroxide-recv-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
 
         let mut temp_file = match tokio::fs::File::create(&temp_path).await {
             Ok(f) => f,
@@ -661,9 +688,13 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
                 }
                 None => {
                     let pb = ProgressBar::new_spinner();
-                    pb.set_style(ProgressStyle::default_spinner()
-                        .template("{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})")
-                        .unwrap());
+                    pb.set_style(
+                        ProgressStyle::default_spinner()
+                            .template(
+                                "{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})",
+                            )
+                            .unwrap(),
+                    );
                     Some(pb)
                 }
             }
@@ -710,7 +741,9 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
             total_received += chunk.len() as u64;
             if let Some(expected) = expected_size {
                 if total_received > expected {
-                    if let Some(ref pb) = pb { pb.abandon(); }
+                    if let Some(ref pb) = pb {
+                        pb.abandon();
+                    }
                     let _ = tokio::fs::remove_file(&temp_path).await;
                     eprintln!("error: received more data than expected size");
                     let _ = handle.destroy().await;
@@ -723,7 +756,9 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
             }
 
             if let Err(e) = temp_file.write_all(&chunk).await {
-                if let Some(ref pb) = pb { pb.abandon(); }
+                if let Some(ref pb) = pb {
+                    pb.abandon();
+                }
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 eprintln!("error: failed to write chunk: {e}");
                 let _ = handle.destroy().await;
@@ -733,7 +768,9 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
         }
 
         if let Err(e) = temp_file.flush().await {
-            if let Some(ref pb) = pb { pb.abandon(); }
+            if let Some(ref pb) = pb {
+                pb.abandon();
+            }
             let _ = tokio::fs::remove_file(&temp_path).await;
             eprintln!("error: failed to flush file: {e}");
             let _ = handle.destroy().await;
@@ -744,7 +781,9 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
 
         if let Some(expected) = expected_size {
             if total_received != expected {
-                if let Some(ref pb) = pb { pb.abandon(); }
+                if let Some(ref pb) = pb {
+                    pb.abandon();
+                }
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 eprintln!("error: size mismatch (expected {expected}, got {total_received})");
                 let _ = handle.destroy().await;
@@ -752,7 +791,9 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
                 return 1;
             }
         }
-        if let Some(pb) = pb { pb.finish_and_clear(); }
+        if let Some(pb) = pb {
+            pb.finish_and_clear();
+        }
 
         if let Err(e) = tokio::fs::rename(&temp_path, &dest).await {
             let _ = tokio::fs::remove_file(&temp_path).await;
@@ -769,7 +810,10 @@ async fn run_recv(args: RecvArgs, cfg: &ResolvedConfig) -> i32 {
         } else {
             "∞".to_string()
         };
-        eprintln!("  done: {size_display} in {:.1}s ({speed}/s)", elapsed.as_secs_f64());
+        eprintln!(
+            "  done: {size_display} in {:.1}s ({speed}/s)",
+            elapsed.as_secs_f64()
+        );
         eprintln!("  saved to {}", dest.display());
     }
 
@@ -815,11 +859,7 @@ fn resolve_dest_path(dest: &Option<String>, filename: &str) -> PathBuf {
     match dest {
         Some(d) if d != "-" => {
             let p = PathBuf::from(d);
-            if p.is_dir() {
-                p.join(filename)
-            } else {
-                p
-            }
+            if p.is_dir() { p.join(filename) } else { p }
         }
         _ => PathBuf::from(filename),
     }

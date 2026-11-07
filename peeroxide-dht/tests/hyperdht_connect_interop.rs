@@ -3,17 +3,13 @@
 use std::time::Duration;
 
 use libudx::UdxRuntime;
+use peeroxide_dht::Router;
 use peeroxide_dht::crypto::hash;
-use peeroxide_dht::hyperdht::{
-    run_server, HyperDhtConfig, KeyPair, ServerConfig, spawn,
-};
-use peeroxide_dht::hyperdht_messages::{
-    NoisePayload, FIREWALL_UNKNOWN, PEER_HANDSHAKE,
-};
+use peeroxide_dht::hyperdht::{HyperDhtConfig, KeyPair, ServerConfig, run_server, spawn};
+use peeroxide_dht::hyperdht_messages::{FIREWALL_UNKNOWN, NoisePayload, PEER_HANDSHAKE};
 use peeroxide_dht::messages::Ipv4Peer;
 use peeroxide_dht::noise::Keypair as NoiseKeypair;
 use peeroxide_dht::noise_wrap::NoiseWrap;
-use peeroxide_dht::Router;
 use peeroxide_dht::rpc::{DhtConfig, UserRequestParams};
 
 fn to_noise_kp(kp: &KeyPair) -> NoiseKeypair {
@@ -74,7 +70,12 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
 
     let server_config = ServerConfig::new(server_kp.clone(), 0);
     let server_rt = UdxRuntime::new()?;
-    let server_task = tokio::spawn(run_server(srv_rx, server_config, server_rt, srv_handle.dht().clone()));
+    let server_task = tokio::spawn(run_server(
+        srv_rx,
+        server_config,
+        server_rt,
+        srv_handle.dht().clone(),
+    ));
 
     // ── 3. Client node ────────────────────────────────────────────────────
     let mut cli_dht = DhtConfig::default();
@@ -122,11 +123,7 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
     params.value = Some(hs_value);
     let resp = cli_handle
         .dht()
-        .request(
-            params,
-            "127.0.0.1",
-            srv_port,
-        )
+        .request(params, "127.0.0.1", srv_port)
         .await?;
 
     assert_eq!(resp.error, 0, "server returned error code {}", resp.error);
@@ -155,11 +152,13 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
         "remote public key should match server's key"
     );
 
-    assert_eq!(remote_payload.error, 0, "server payload should have no error");
+    assert_eq!(
+        remote_payload.error, 0,
+        "server payload should have no error"
+    );
 
     assert_ne!(
-        nw_result.holepunch_secret,
-        [0u8; 32],
+        nw_result.holepunch_secret, [0u8; 32],
         "holepunch secret should be non-zero"
     );
 

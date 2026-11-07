@@ -100,7 +100,10 @@ impl SharedKnownUsers {
                 self.entries[idx].screen_name = screen_name;
             } else {
                 let idx = self.entries.len();
-                self.entries.push(KnownUser { pubkey, screen_name });
+                self.entries.push(KnownUser {
+                    pubkey,
+                    screen_name,
+                });
                 self.index.insert(pubkey, idx);
             }
         }
@@ -115,7 +118,9 @@ impl SharedKnownUsers {
         }
         self.last_checked = Instant::now();
 
-        let current_mtime = fs::metadata(&self.path).ok().and_then(|m| m.modified().ok());
+        let current_mtime = fs::metadata(&self.path)
+            .ok()
+            .and_then(|m| m.modified().ok());
         if current_mtime != self.last_mtime {
             self.load();
         }
@@ -160,10 +165,7 @@ impl SharedKnownUsers {
             1 => Ok(Some(matches[0])),
             n => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "shortkey '{}' is ambiguous: {} matches found",
-                    prefix, n
-                ),
+                format!("shortkey '{}' is ambiguous: {} matches found", prefix, n),
             )),
         }
     }

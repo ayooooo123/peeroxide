@@ -4,14 +4,10 @@
 use std::time::Instant;
 
 use super::{
-    filter::WindowedMaxFilter,
-    rate::RateSample,
-    BbrMode, CaState,
-    BBR_BW_FILTER_CYCLES, BBR_CYCLE_LEN,
-    BBR_MIN_RTT_INTERVAL_MS, BBR_MIN_PROBE_RTT_MODE_MS,
-    BBR_PACING_MARGIN_PERCENT, BBR_HIGH_GAIN, BBR_DRAIN_GAIN, BBR_CWND_GAIN, BBR_PACING_GAIN,
-    BBR_CWND_MIN_TARGET, BBR_FULL_BW_THRESH, BBR_FULL_BW_COUNT,
-    BBR_EXTRA_ACKED_GAIN, BBR_EXTRA_ACKED_WIN_RTTS,
+    BBR_BW_FILTER_CYCLES, BBR_CWND_GAIN, BBR_CWND_MIN_TARGET, BBR_CYCLE_LEN, BBR_DRAIN_GAIN,
+    BBR_EXTRA_ACKED_GAIN, BBR_EXTRA_ACKED_WIN_RTTS, BBR_FULL_BW_COUNT, BBR_FULL_BW_THRESH,
+    BBR_HIGH_GAIN, BBR_MIN_PROBE_RTT_MODE_MS, BBR_MIN_RTT_INTERVAL_MS, BBR_PACING_GAIN,
+    BBR_PACING_MARGIN_PERCENT, BbrMode, CaState, filter::WindowedMaxFilter, rate::RateSample,
 };
 
 /// Full BBR state machine.
@@ -112,7 +108,18 @@ impl BbrState {
     ) -> (u32, u32, Option<u32>) {
         let ssthresh_out = self.update_model(rs, cwnd, mss, delivered, lost, inflight, now);
         let pacing = self.set_pacing_rate(self.bw, mss, self.pacing_gain);
-        let new_cwnd = self.set_cwnd(rs, acked, cwnd, self.bw, self.cwnd_gain, self.min_rtt_ms, inflight, mss, ca_state, delivered);
+        let new_cwnd = self.set_cwnd(
+            rs,
+            acked,
+            cwnd,
+            self.bw,
+            self.cwnd_gain,
+            self.min_rtt_ms,
+            inflight,
+            mss,
+            ca_state,
+            delivered,
+        );
         (new_cwnd, pacing, ssthresh_out)
     }
 
@@ -145,7 +152,11 @@ impl BbrState {
 
     /// Returns the current minimum RTT in ms; never returns 0.
     pub(crate) fn min_rtt_ms(&self) -> u32 {
-        if self.min_rtt_ms == 0 { 1 } else { self.min_rtt_ms }
+        if self.min_rtt_ms == 0 {
+            1
+        } else {
+            self.min_rtt_ms
+        }
     }
 }
 
@@ -190,7 +201,8 @@ impl BbrState {
         let delivery_rate = rs.delivered as f64 / rs.interval_ms as f64;
         // Only update filter if not app-limited, or if the new rate beats the current max.
         if !rs.is_app_limited || delivery_rate > self.bw_filter.get() {
-            self.bw_filter.update(delivery_rate, self.round_count, BBR_BW_FILTER_CYCLES);
+            self.bw_filter
+                .update(delivery_rate, self.round_count, BBR_BW_FILTER_CYCLES);
             self.bw = self.bw_filter.get();
         }
     }
@@ -226,14 +238,21 @@ impl BbrState {
 
         let mut expected_acked = (elapsed_ms as f64 * self.bw) as u32;
 
-        if self.ack_epoch_acked <= expected_acked || (self.ack_epoch_acked as u64).saturating_add(rs.acked_sacked as u64) >= (u32::MAX as u64) /* bbr_ack_epoch_acked_reset_thresh = UINT32_MAX in C */ {
+        if self.ack_epoch_acked <= expected_acked
+            || (self.ack_epoch_acked as u64).saturating_add(rs.acked_sacked as u64)
+                >= (u32::MAX as u64)
+        /* bbr_ack_epoch_acked_reset_thresh = UINT32_MAX in C */
+        {
             self.ack_epoch_acked = 0;
             self.ack_epoch_stamp = Some(now);
             expected_acked = 0;
         }
 
         self.ack_epoch_acked = self.ack_epoch_acked.saturating_add(rs.acked_sacked);
-        let extra_acked = self.ack_epoch_acked.saturating_sub(expected_acked).min(cwnd);
+        let extra_acked = self
+            .ack_epoch_acked
+            .saturating_sub(expected_acked)
+            .min(cwnd);
 
         if extra_acked > self.extra_acked[self.extra_acked_idx] {
             self.extra_acked[self.extra_acked_idx] = extra_acked;
@@ -241,7 +260,13 @@ impl BbrState {
     }
 
     /// Advance the ProbeBw cycle phase when conditions are met.
-    fn update_cycle_phase(&mut self, rs: &RateSample, inflight: u32, min_rtt_ms: u32, now: Instant) {
+    fn update_cycle_phase(
+        &mut self,
+        rs: &RateSample,
+        inflight: u32,
+        min_rtt_ms: u32,
+        now: Instant,
+    ) {
         if self.mode != BbrMode::ProbeBw {
             return;
         }
@@ -316,7 +341,8 @@ impl BbrState {
             .map(|d| d.as_millis() as u64 > BBR_MIN_RTT_INTERVAL_MS)
             .unwrap_or(false);
 
-        if rs.rtt_ms > 0 && (self.min_rtt_ms == 0 || rs.rtt_ms < self.min_rtt_ms || min_rtt_expired) {
+        if rs.rtt_ms > 0 && (self.min_rtt_ms == 0 || rs.rtt_ms < self.min_rtt_ms || min_rtt_expired)
+        {
             self.min_rtt_ms = rs.rtt_ms;
             self.min_rtt_stamp = Some(now);
         }
@@ -438,7 +464,9 @@ impl BbrState {
         self.prev_ca_state = ca_state;
 
         if self.packet_conservation {
-            return new_cwnd.max(inflight.saturating_add(acked)).max(BBR_CWND_MIN_TARGET);
+            return new_cwnd
+                .max(inflight.saturating_add(acked))
+                .max(BBR_CWND_MIN_TARGET);
         }
 
         if rs.delivered == 0 {
@@ -494,7 +522,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// Construct a RateSample with the fields accessible from this crate.
-    fn make_rs(delivered: u32, interval_ms: u32, prior_delivered: u32, app_limited: bool) -> RateSample {
+    fn make_rs(
+        delivered: u32,
+        interval_ms: u32,
+        prior_delivered: u32,
+        app_limited: bool,
+    ) -> RateSample {
         let mut rs = RateSample::default();
         rs.delivered = delivered;
         rs.interval_ms = interval_ms;
@@ -632,7 +665,18 @@ mod tests {
         let mut state = BbrState::new(100);
         let rs = make_rs(1, 10, 0, false);
         // cwnd=0, acked=0 → must return at least BBR_CWND_MIN_TARGET.
-        let new_cwnd = state.set_cwnd(&rs, 0, 0, 0.0, BBR_CWND_GAIN, 100, 0, 1180, CaState::Open, 0);
+        let new_cwnd = state.set_cwnd(
+            &rs,
+            0,
+            0,
+            0.0,
+            BBR_CWND_GAIN,
+            100,
+            0,
+            1180,
+            CaState::Open,
+            0,
+        );
         assert!(new_cwnd >= BBR_CWND_MIN_TARGET);
     }
 

@@ -17,11 +17,16 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[tokio::test]
 async fn suspend_and_resume_against_a_js_testnet() {
-    let _ = tokio::time::timeout(TEST_TIMEOUT, run()).await.expect("JS suspend interop timed out");
+    let _ = tokio::time::timeout(TEST_TIMEOUT, run())
+        .await
+        .expect("JS suspend interop timed out");
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let script = format!("{}/../tests/node/hyperdht-suspend-peer.js", env!("CARGO_MANIFEST_DIR"));
+    let script = format!(
+        "{}/../tests/node/hyperdht-suspend-peer.js",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let mut child = tokio::process::Command::new("node")
         .arg(script)
         .stdin(std::process::Stdio::piped())
@@ -51,7 +56,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // A working baseline against the JS node.
     let pong = node.dht().ping("127.0.0.1", dht_port).await?;
-    assert_eq!(pong.from.port, dht_port, "ephemeral JS node replies without an id");
+    assert_eq!(
+        pong.from.port, dht_port,
+        "ephemeral JS node replies without an id"
+    );
 
     // ── Suspended ────────────────────────────────────────────────────────
     node.suspend().await?;

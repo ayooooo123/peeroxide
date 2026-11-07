@@ -1,13 +1,15 @@
 'use strict'
 
 // A JS blind relay plus one firewalled JS peer on a local testnet, for the
-// relay→direct upgrade tests. argv: server [--no-punch] | client
+// relay→direct upgrade tests. argv: server [--no-punch] | client | swarm-server | swarm-client
 //
 // server: an echo server; a Rust client connects with `relayThrough` set to
 //   the relay, so the relay lands first and the holepunch moves the stream.
 //   `--no-punch` makes the server refuse to punch, so the stream stays relayed.
 // client: reads a server key from stdin, connects with `relayThrough`, sends
 //   until the stream has left the relay (or `maxChunks`), then checks the echo.
+// swarm-server: a Hyperswarm server echoing data with forced relayThrough.
+// swarm-client: a Hyperswarm client connecting via forced relayThrough to a server key from stdin.
 //
 // Events on stdout: {ready, port, publicKey, relayKey, relayAddr},
 // {event: 'open', remote}, {event: 'done', bytes, ok, remote}.
@@ -74,8 +76,10 @@ async function main () {
   await dht.fullyBootstrapped()
   const keyPair = DHT.keyPair()
 
+  let swarm = null
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
   lines.on('close', async () => {
+    if (swarm) await swarm.destroy()
     await testnet.destroy()
     process.exit(0)
   })
@@ -100,6 +104,84 @@ async function main () {
     )
     await server.listen(keyPair)
     emit({ ready: true, port: testnet.bootstrap[0].port, publicKey: b4a.toString(keyPair.publicKey, 'hex'), relayKey: b4a.toString(relayKeyPair.publicKey, 'hex'), relayAddr })
+    return
+  }
+
+  if (mode === 'swarm-server') {
+    const Hyperswarm = require('hyperswarm')
+    swarm = new Hyperswarm({
+      dht,
+      keyPair,
+      relayThrough: () => relayKeyPair.publicKey
+    })
+    swarm.on('connection', conn => {
+      let bytes = 0
+      conn.on('error', () => {})
+      emit({ event: 'open', remote: remoteOf(conn) })
+      conn.on('data', data => {
+        if (beginPunch) beginPunch()
+        bytes += data.length
+        conn.write(data)
+      })
+      conn.on('end', () => {
+        emit({ event: 'done', bytes, ok: true, remote: remoteOf(conn) })
+        conn.end()
+      })
+    })
+    await swarm.listen()
+    emit({ ready: true, port: testnet.bootstrap[0].port, publicKey: b4a.toString(keyPair.publicKey, 'hex'), relayKey: b4a.toString(relayKeyPair.publicKey, 'hex'), relayAddr })
+    return
+  }
+
+  if (mode === 'swarm-client') {
+    // Hyperswarm's dial defaults permit a loopback LAN shortcut; test the real punch.
+    const connect = dht.connect.bind(dht)
+    dht.connect = (key, opts) => connect(key, { ...opts, localConnection: false, fastOpen: false })
+    const Hyperswarm = require('hyperswarm')
+    swarm = new Hyperswarm({
+      dht,
+      keyPair,
+      relayThrough: () => relayKeyPair.publicKey
+    })
+    swarm.on('connection', conn => {
+      conn.on('error', err => emit({ event: 'error', message: err.message }))
+      emit({ event: 'open', remote: remoteOf(conn) })
+      const maxChunks = 4096
+      let sent = 0
+      let tail = 0
+      const pump = () => {
+        while (true) {
+          const r = remoteOf(conn)
+          const left = r && (r.host !== relayAddr.host || r.port !== relayAddr.port)
+          if (left) tail++
+          if (sent >= maxChunks || tail > 8) {
+            conn.end()
+            return
+          }
+          if (!conn.write(chunk(sent++))) {
+            conn.once('drain', pump)
+            return
+          }
+        }
+      }
+      pump()
+      let bytes = 0
+      let ok = true
+      conn.on('data', data => {
+        if (beginPunch) beginPunch()
+        for (let i = 0; i < data.length; i++) {
+          if (data[i] !== expectedByte(bytes + i)) ok = false
+        }
+        bytes += data.length
+      })
+      conn.on('end', () => emit({ event: 'done', bytes, ok, remote: remoteOf(conn) }))
+    })
+    emit({ ready: true, port: testnet.bootstrap[0].port, publicKey: b4a.toString(keyPair.publicKey, 'hex'), relayKey: b4a.toString(relayKeyPair.publicKey, 'hex'), relayAddr })
+    lines.on('line', line => {
+      const serverKey = b4a.from(line.trim(), 'hex')
+      swarm.joinPeer(serverKey)
+      swarm.flush()
+    })
     return
   }
 

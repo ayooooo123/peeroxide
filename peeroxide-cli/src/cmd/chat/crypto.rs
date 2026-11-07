@@ -3,9 +3,9 @@
 //! All key-derivation functions use keyed BLAKE2b-256 MACs so that the same
 //! raw key material can produce independent outputs for different purposes.
 
+use blake2::Blake2bMac;
 use blake2::digest::consts::U32;
 use blake2::digest::{KeyInit, Mac};
-use blake2::Blake2bMac;
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use peeroxide_dht::crypto::{hash, hash_batch, sign_detached, verify_detached};
@@ -20,8 +20,8 @@ type Blake2bMac256 = Blake2bMac<U32>;
 /// (a channel key, ECDH secret, etc.) and `msg` is the domain-separated
 /// input.
 fn keyed_blake2b(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
-    let mut mac: Blake2bMac256 = KeyInit::new_from_slice(key.as_slice())
-        .expect("32-byte key is always valid for BLAKE2b");
+    let mut mac: Blake2bMac256 =
+        KeyInit::new_from_slice(key.as_slice()).expect("32-byte key is always valid for BLAKE2b");
     mac.update(msg);
     let output = mac.finalize().into_bytes();
     let mut result = [0u8; 32];
@@ -327,18 +327,15 @@ mod tests {
         let x_priv_a = ed25519_secret_to_x25519(&kp_a.secret_key);
         let x_priv_b = ed25519_secret_to_x25519(&kp_b.secret_key);
 
-        let x_pub_a = ed25519_pubkey_to_x25519(&kp_a.public_key)
-            .expect("keypair A pubkey must convert");
-        let x_pub_b = ed25519_pubkey_to_x25519(&kp_b.public_key)
-            .expect("keypair B pubkey must convert");
+        let x_pub_a =
+            ed25519_pubkey_to_x25519(&kp_a.public_key).expect("keypair A pubkey must convert");
+        let x_pub_b =
+            ed25519_pubkey_to_x25519(&kp_b.public_key).expect("keypair B pubkey must convert");
 
         let shared_ab = x25519_ecdh(&x_priv_a, &x_pub_b);
         let shared_ba = x25519_ecdh(&x_priv_b, &x_pub_a);
 
-        assert_eq!(
-            shared_ab, shared_ba,
-            "ECDH shared secret must be symmetric"
-        );
+        assert_eq!(shared_ab, shared_ba, "ECDH shared secret must be symmetric");
     }
 
     #[test]
@@ -347,11 +344,14 @@ mod tests {
         let kp_b = KeyPair::generate();
 
         let x_priv_a = ed25519_secret_to_x25519(&kp_a.secret_key);
-        let x_pub_b = ed25519_pubkey_to_x25519(&kp_b.public_key)
-            .expect("keypair B pubkey must convert");
+        let x_pub_b =
+            ed25519_pubkey_to_x25519(&kp_b.public_key).expect("keypair B pubkey must convert");
 
         let shared = x25519_ecdh(&x_priv_a, &x_pub_b);
-        assert_ne!(shared, [0u8; 32], "shared secret must not be the zero point");
+        assert_ne!(
+            shared, [0u8; 32],
+            "shared secret must not be the zero point"
+        );
     }
 
     #[test]
@@ -384,7 +384,10 @@ mod tests {
     #[test]
     fn test_current_epoch_is_reasonable() {
         let epoch = current_epoch();
-        assert!(epoch > 28_000_000, "epoch should reflect a plausible current time");
+        assert!(
+            epoch > 28_000_000,
+            "epoch should reflect a plausible current time"
+        );
     }
 
     #[test]
@@ -459,7 +462,10 @@ mod tests {
         let x_pub_b2 = ed25519_pubkey_to_x25519(&kp_b.public_key).unwrap();
         let shared2 = x25519_ecdh(&x_priv_a2, &x_pub_b2);
 
-        assert_eq!(shared1, shared2, "ECDH must be deterministic from same seeds");
+        assert_eq!(
+            shared1, shared2,
+            "ECDH must be deterministic from same seeds"
+        );
         assert_ne!(shared1, [0u8; 32]);
     }
 }

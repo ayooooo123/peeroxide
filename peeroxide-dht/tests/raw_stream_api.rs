@@ -32,15 +32,24 @@ fn local_config() -> HyperDhtConfig {
 async fn firewall_hook_accepts_the_first_packet_and_stream_moves_data() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let runtime = UdxRuntime::new().expect("runtime");
-        let (_task, node, _events) = hyperdht::spawn(&runtime, local_config()).await.expect("node");
+        let (_task, node, _events) = hyperdht::spawn(&runtime, local_config())
+            .await
+            .expect("node");
         node.fully_bootstrapped().await.expect("bootstrapped");
 
-        let primary = node.server_socket().await.expect("socket").expect("primary");
+        let primary = node
+            .server_socket()
+            .await
+            .expect("socket")
+            .expect("primary");
         let primary_addr = primary.local_addr().await.expect("addr");
 
         // The peer side: a plain UDX stream on its own socket.
         let peer_socket = runtime.create_socket().await.expect("peer socket");
-        peer_socket.bind("127.0.0.1:0".parse().unwrap()).await.expect("bind");
+        peer_socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind");
         let peer_addr = peer_socket.local_addr().await.expect("peer addr");
         let peer_id = 4242;
         let peer = runtime.create_stream(peer_id).await.expect("peer stream");
@@ -69,12 +78,19 @@ async fn firewall_hook_accepts_the_first_packet_and_stream_moves_data() {
         // the firewall hook, which accepts the source. The owner then arms
         // the peer id it learned out of band (private-overlay exchanges ids
         // over its control connection), and the retransmit is ACKed.
-        peer.connect(&peer_socket, raw.id(), primary_addr).await.expect("peer connect");
+        peer.connect(&peer_socket, raw.id(), primary_addr)
+            .await
+            .expect("peer connect");
         let writer = tokio::spawn(async move { peer.write(b"pre-connect").await });
         hit_rx.recv().await.expect("firewall hook never fired");
-        raw.connect(&primary, peer_id, peer_addr).await.expect("late connect");
+        raw.connect(&primary, peer_id, peer_addr)
+            .await
+            .expect("late connect");
         writer.await.expect("writer task").expect("peer write");
-        assert_eq!(raw.read().await.expect("read").as_deref(), Some(&b"pre-connect"[..]));
+        assert_eq!(
+            raw.read().await.expect("read").as_deref(),
+            Some(&b"pre-connect"[..])
+        );
         assert!(calls.load(Ordering::SeqCst) >= 1);
 
         // The DHT owns the stream: suspend closes it under the caller.
@@ -97,21 +113,33 @@ async fn firewall_hook_accepts_the_first_packet_and_stream_moves_data() {
 async fn firewall_hook_rejects_a_stranger_and_accepts_the_named_peer() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let runtime = UdxRuntime::new().expect("runtime");
-        let (_task, node, _events) = hyperdht::spawn(&runtime, local_config()).await.expect("node");
+        let (_task, node, _events) = hyperdht::spawn(&runtime, local_config())
+            .await
+            .expect("node");
         node.fully_bootstrapped().await.expect("bootstrapped");
 
-        let primary = node.server_socket().await.expect("socket").expect("primary");
+        let primary = node
+            .server_socket()
+            .await
+            .expect("socket")
+            .expect("primary");
         let primary_addr = primary.local_addr().await.expect("addr");
 
         // Two senders: a stranger that speaks first, then the named peer.
         let stranger_socket = runtime.create_socket().await.expect("stranger socket");
-        stranger_socket.bind("127.0.0.1:0".parse().unwrap()).await.expect("bind");
+        stranger_socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind");
         let stranger_addr = stranger_socket.local_addr().await.expect("addr");
         let stranger = runtime.create_stream(5555).await.expect("stranger stream");
         let stranger_abort = stranger.abort_handle();
 
         let peer_socket = runtime.create_socket().await.expect("peer socket");
-        peer_socket.bind("127.0.0.1:0".parse().unwrap()).await.expect("bind");
+        peer_socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind");
         let peer_addr = peer_socket.local_addr().await.expect("addr");
         let peer_id = 4242;
         let peer = runtime.create_stream(peer_id).await.expect("peer stream");
@@ -131,22 +159,34 @@ async fn firewall_hook_rejects_a_stranger_and_accepts_the_named_peer() {
             .expect("raw stream");
 
         // The stranger speaks first; its packet must not be queued.
-        stranger.connect(&stranger_socket, raw.id(), primary_addr).await.expect("stranger connect");
-        let _stranger_write = tokio::spawn(async move { let _ = stranger.write(b"stranger").await; });
+        stranger
+            .connect(&stranger_socket, raw.id(), primary_addr)
+            .await
+            .expect("stranger connect");
+        let _stranger_write = tokio::spawn(async move {
+            let _ = stranger.write(b"stranger").await;
+        });
         wait_for_hook(&mut hit_rx, stranger_addr).await;
 
         // Then the named peer sends, still before the owner arms its id.
-        peer.connect(&peer_socket, raw.id(), primary_addr).await.expect("peer connect");
+        peer.connect(&peer_socket, raw.id(), primary_addr)
+            .await
+            .expect("peer connect");
         let peer_write = tokio::spawn(async move { peer.write(b"peer").await });
         wait_for_hook(&mut hit_rx, peer_addr).await;
 
-        raw.connect(&primary, peer_id, peer_addr).await.expect("late connect");
+        raw.connect(&primary, peer_id, peer_addr)
+            .await
+            .expect("late connect");
         tokio::time::timeout(Duration::from_secs(2), peer_write)
             .await
             .expect("peer write never completed")
             .expect("writer task")
             .expect("peer write");
-        assert_eq!(raw.read().await.expect("read").as_deref(), Some(&b"peer"[..]));
+        assert_eq!(
+            raw.read().await.expect("read").as_deref(),
+            Some(&b"peer"[..])
+        );
 
         stranger_abort.abort();
         node.destroy().await.expect("destroy");

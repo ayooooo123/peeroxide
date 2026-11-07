@@ -66,7 +66,10 @@ enum UiOp {
     /// styling. Used by the keyboard task to surface the "press Ctrl-C
     /// again…" prompt without disturbing the chat scrollback. A new overlay
     /// while one is already active simply replaces it (new deadline).
-    ShowTransientOverlay { text: String, duration: std::time::Duration },
+    ShowTransientOverlay {
+        text: String,
+        duration: std::time::Duration,
+    },
     /// Clear any active transient overlay (e.g. user typed something so the
     /// armed Ctrl-C window should be cancelled).
     ClearTransientOverlay,
@@ -129,8 +132,7 @@ impl InteractiveUi {
         // the steady-state paint loop. This guarantees that by the time
         // `new()` returns, the scroll region is already in place.
         use crate::cmd::chat::tui::terminal::TerminalGuard;
-        let mut guard =
-            TerminalGuard::enter().map_err(|e| format!("terminal init failed: {e}"))?;
+        let mut guard = TerminalGuard::enter().map_err(|e| format!("terminal init failed: {e}"))?;
         let (cols, rows) =
             crossterm::terminal::size().map_err(|e| format!("terminal::size failed: {e}"))?;
         let input_height: u16 = 1;
@@ -152,7 +154,14 @@ impl InteractiveUi {
                 col: 0,
             };
             let _ = paint_status_and_input(
-                &mut out, &status, cols, rows, input_height, &snap, &mut slots, None,
+                &mut out,
+                &status,
+                cols,
+                rows,
+                input_height,
+                &snap,
+                &mut slots,
+                None,
             );
         }
 
@@ -474,7 +483,16 @@ fn paint_full(
     overlay: Option<&str>,
 ) -> std::io::Result<()> {
     // Clear status + input rows (just paint them fresh).
-    paint_status_and_input(out, status, cols, rows, input_height, editor, slots, overlay)
+    paint_status_and_input(
+        out,
+        status,
+        cols,
+        rows,
+        input_height,
+        editor,
+        slots,
+        overlay,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -636,11 +654,7 @@ fn paint_input_area(
     };
     for i in 0..input_height {
         let row = first_row + i;
-        queue!(
-            out,
-            cursor::MoveTo(0, row),
-            Clear(ClearType::CurrentLine),
-        )?;
+        queue!(out, cursor::MoveTo(0, row), Clear(ClearType::CurrentLine),)?;
         let line_idx = start as usize + i as usize;
         if line_idx < total {
             let line = &editor_lines[line_idx];
@@ -986,19 +1000,13 @@ mod tests {
             CtrlCAction::ClearBuffer
         );
         // Without arming too.
-        assert_eq!(
-            classify_ctrl_c(false, None, now),
-            CtrlCAction::ClearBuffer
-        );
+        assert_eq!(classify_ctrl_c(false, None, now), CtrlCAction::ClearBuffer);
     }
 
     #[test]
     fn classify_ctrl_c_arms_when_empty_and_cold() {
         let now = std::time::Instant::now();
-        assert_eq!(
-            classify_ctrl_c(true, None, now),
-            CtrlCAction::ArmAndPrompt
-        );
+        assert_eq!(classify_ctrl_c(true, None, now), CtrlCAction::ArmAndPrompt);
     }
 
     #[test]

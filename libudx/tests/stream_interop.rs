@@ -16,7 +16,9 @@ async fn stream_interop_large() {
     let _ = tracing_subscriber::fmt::try_init();
 
     with_timeout(Duration::from_secs(30), async {
-        run_large_transfer_test().await.expect("large transfer interop failed");
+        run_large_transfer_test()
+            .await
+            .expect("large transfer interop failed");
     })
     .await;
 }
@@ -42,9 +44,7 @@ async fn run_large_transfer_test() -> Result<(), Box<dyn std::error::Error>> {
 
     let runtime = create_runtime();
     let socket = runtime.create_socket().await?;
-    socket
-        .bind("127.0.0.1:0".parse::<SocketAddr>()?)
-        .await?;
+    socket.bind("127.0.0.1:0".parse::<SocketAddr>()?).await?;
     let local_addr = socket.local_addr().await?;
     let rust_port = local_addr.port();
 
@@ -79,7 +79,11 @@ async fn run_large_transfer_test() -> Result<(), Box<dyn std::error::Error>> {
     let result: serde_json::Value = serde_json::from_str(result_line.trim())?;
 
     let received_size = result["received"].as_u64().expect("missing received");
-    assert_eq!(received_size, payload.len() as u64, "Node received wrong size");
+    assert_eq!(
+        received_size,
+        payload.len() as u64,
+        "Node received wrong size"
+    );
 
     let received_hash = result["sha256"].as_str().expect("missing sha256");
     assert_eq!(received_hash, expected_hash, "SHA256 mismatch on Node side");
@@ -101,7 +105,9 @@ async fn async_stream_interop_pipelined_writes() {
     let _ = tracing_subscriber::fmt::try_init();
 
     with_timeout(Duration::from_secs(60), async {
-        run_pipelined_transfer_test().await.expect("pipelined transfer interop failed");
+        run_pipelined_transfer_test()
+            .await
+            .expect("pipelined transfer interop failed");
     })
     .await;
 }
@@ -127,9 +133,7 @@ async fn run_pipelined_transfer_test() -> Result<(), Box<dyn std::error::Error>>
 
     let runtime = create_runtime();
     let socket = runtime.create_socket().await?;
-    socket
-        .bind("127.0.0.1:0".parse::<SocketAddr>()?)
-        .await?;
+    socket.bind("127.0.0.1:0".parse::<SocketAddr>()?).await?;
     let rust_port = socket.local_addr().await?.port();
 
     let payload = random_payload(32 * 1024 * 1024);
@@ -160,13 +164,24 @@ async fn run_pipelined_transfer_test() -> Result<(), Box<dyn std::error::Error>>
     stream.shutdown().await?;
     let elapsed = started.elapsed();
     let mib_per_s = payload.len() as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
-    eprintln!("rust -> node: {} MiB in {elapsed:?} ({mib_per_s:.1} MiB/s)", payload.len() >> 20);
+    eprintln!(
+        "rust -> node: {} MiB in {elapsed:?} ({mib_per_s:.1} MiB/s)",
+        payload.len() >> 20
+    );
 
     let mut result_line = String::new();
     reader.read_line(&mut result_line)?;
     let result: serde_json::Value = serde_json::from_str(result_line.trim())?;
-    assert_eq!(result["received"].as_u64(), Some(payload.len() as u64), "Node received wrong size");
-    assert_eq!(result["sha256"].as_str(), Some(expected_hash.as_str()), "SHA256 mismatch on Node side");
+    assert_eq!(
+        result["received"].as_u64(),
+        Some(payload.len() as u64),
+        "Node received wrong size"
+    );
+    assert_eq!(
+        result["sha256"].as_str(),
+        Some(expected_hash.as_str()),
+        "SHA256 mismatch on Node side"
+    );
     assert!(
         elapsed < Duration::from_secs(15),
         "32 MiB took {elapsed:?}: writes are not pipelined"
@@ -191,7 +206,9 @@ async fn stream_interop_bidirectional() {
     let _ = tracing_subscriber::fmt::try_init();
 
     with_timeout(Duration::from_secs(30), async {
-        run_bidirectional_interop_test().await.expect("bidirectional interop failed");
+        run_bidirectional_interop_test()
+            .await
+            .expect("bidirectional interop failed");
     })
     .await;
 }
@@ -217,9 +234,7 @@ async fn run_bidirectional_interop_test() -> Result<(), Box<dyn std::error::Erro
 
     let runtime = create_runtime();
     let socket = runtime.create_socket().await?;
-    socket
-        .bind("127.0.0.1:0".parse::<SocketAddr>()?)
-        .await?;
+    socket.bind("127.0.0.1:0".parse::<SocketAddr>()?).await?;
     let local_addr = socket.local_addr().await?;
     let rust_port = local_addr.port();
 
@@ -266,14 +281,26 @@ async fn run_bidirectional_interop_test() -> Result<(), Box<dyn std::error::Erro
     let result: serde_json::Value = serde_json::from_str(result_line.trim())?;
 
     let node_received = result["received"].as_u64().expect("missing received") as usize;
-    assert_eq!(node_received, rust_payload.len(), "Node received wrong size from Rust");
+    assert_eq!(
+        node_received,
+        rust_payload.len(),
+        "Node received wrong size from Rust"
+    );
 
-    let node_received_hash = result["receivedSha256"].as_str().expect("missing receivedSha256");
-    assert_eq!(node_received_hash, rust_hash, "Node SHA256 mismatch for Rust data");
+    let node_received_hash = result["receivedSha256"]
+        .as_str()
+        .expect("missing receivedSha256");
+    assert_eq!(
+        node_received_hash, rust_hash,
+        "Node SHA256 mismatch for Rust data"
+    );
 
     let node_sent_hash = result["sentSha256"].as_str().expect("missing sentSha256");
     let our_received_hash = format!("{:x}", Sha256::digest(&received_from_node));
-    assert_eq!(our_received_hash, node_sent_hash, "Rust SHA256 mismatch for Node data");
+    assert_eq!(
+        our_received_hash, node_sent_hash,
+        "Rust SHA256 mismatch for Node data"
+    );
 
     stream.destroy().await?;
     socket.close().await?;

@@ -1,4 +1,4 @@
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 const ADJECTIVES: &[&str] = &[
     "abhorrent",
@@ -539,9 +539,16 @@ mod tests {
         let seed = [0u8; 32];
         let name = generate_name_from_seed(&seed);
         let parts: Vec<&str> = name.splitn(3, '_').collect();
-        assert_eq!(parts.len(), 3, "name must have exactly two underscores: {name}");
+        assert_eq!(
+            parts.len(),
+            3,
+            "name must have exactly two underscores: {name}"
+        );
         assert_eq!(parts[2].len(), 4, "suffix must be 4 digits: {name}");
-        assert!(parts[2].chars().all(|c| c.is_ascii_digit()), "suffix must be digits: {name}");
+        assert!(
+            parts[2].chars().all(|c| c.is_ascii_digit()),
+            "suffix must be digits: {name}"
+        );
     }
 
     #[test]
@@ -549,10 +556,15 @@ mod tests {
         let seed = [1u8; 32];
         let name = generate_name_from_seed(&seed);
         assert!(
-            name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
             "unexpected chars in: {name}"
         );
-        assert_eq!(name.chars().filter(|&c| c == '_').count(), 2, "expected 2 underscores in: {name}");
+        assert_eq!(
+            name.chars().filter(|&c| c == '_').count(),
+            2,
+            "expected 2 underscores in: {name}"
+        );
     }
 
     #[test]
@@ -561,6 +573,9 @@ mod tests {
         let seed_b = [1u8; 32];
         let name_a = generate_name_from_seed(&seed_a);
         let name_b = generate_name_from_seed(&seed_b);
-        assert_ne!(name_a, name_b, "different seeds should (very likely) produce different names");
+        assert_ne!(
+            name_a, name_b,
+            "different seeds should (very likely) produce different names"
+        );
     }
 }

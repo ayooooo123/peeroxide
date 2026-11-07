@@ -54,7 +54,12 @@ mod tests {
     fn remove() {
         let mut set = ConnectionSet::new();
         let pk = [2u8; 32];
-        set.add(pk, ConnectionInfo { is_initiator: false });
+        set.add(
+            pk,
+            ConnectionInfo {
+                is_initiator: false,
+            },
+        );
         assert!(set.remove(&pk));
         assert!(!set.has(&pk));
         assert_eq!(set.len(), 0);

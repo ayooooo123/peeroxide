@@ -133,13 +133,21 @@ impl RateState {
         let snd_dur = stream_first_sent_ts
             .checked_duration_since(prior_first_sent)
             .unwrap_or(Duration::ZERO);
-        let snd_ms = if snd_dur.is_zero() { 0 } else { (snd_dur.as_millis() as u32).max(1) };
+        let snd_ms = if snd_dur.is_zero() {
+            0
+        } else {
+            (snd_dur.as_millis() as u32).max(1)
+        };
 
         // ack_ms = stream.delivered_ts - acked_pkt.delivered_ts
         let ack_dur = stream_delivered_ts
             .checked_duration_since(prior_ts)
             .unwrap_or(Duration::ZERO);
-        let ack_ms = if ack_dur.is_zero() { 0 } else { (ack_dur.as_millis() as u32).max(1) };
+        let ack_ms = if ack_dur.is_zero() {
+            0
+        } else {
+            (ack_dur.as_millis() as u32).max(1)
+        };
 
         self.current.interval_ms = snd_ms.max(ack_ms);
 
@@ -218,14 +226,7 @@ mod tests {
         rs.on_packet_delivered(&pkt_info, t0, 0);
 
         // At t10: stream has delivered=1
-        let sample = rs.generate(
-            1,
-            t10,
-            t10,
-            5,
-            0,
-            1,
-        );
+        let sample = rs.generate(1, t10, t10, 5, 0, 1);
 
         assert_eq!(sample.delivered, 1);
         assert_eq!(sample.interval_ms, 10);

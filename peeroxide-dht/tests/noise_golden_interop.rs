@@ -1,5 +1,7 @@
-use peeroxide_dht::noise::{ed25519_dh, keypair_from_seed, Handshake, Keypair};
-use peeroxide_dht::secretstream::{Pull, Push, ABYTES, HEADERBYTES, KEYBYTES, TAG_FINAL, TAG_MESSAGE};
+use peeroxide_dht::noise::{Handshake, Keypair, ed25519_dh, keypair_from_seed};
+use peeroxide_dht::secretstream::{
+    ABYTES, HEADERBYTES, KEYBYTES, Pull, Push, TAG_FINAL, TAG_MESSAGE,
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -65,7 +67,8 @@ fn h(hex_str: &str) -> Vec<u8> {
 
 fn h32(hex_str: &str) -> [u8; 32] {
     let v = h(hex_str);
-    v.try_into().unwrap_or_else(|v: Vec<u8>| panic!("expected 32 bytes, got {}", v.len()))
+    v.try_into()
+        .unwrap_or_else(|v: Vec<u8>| panic!("expected 32 bytes, got {}", v.len()))
 }
 
 fn load_fixtures() -> Vec<Fixture> {
@@ -106,12 +109,28 @@ fn golden_ed25519_dh() {
         };
 
         let kp_a = kp_from_seed(&seed_a);
-        assert_eq!(hex::encode(kp_a.public_key), public_key_a, "{label}: pk_a mismatch");
-        assert_eq!(hex::encode(kp_a.secret_key), secret_key_a, "{label}: sk_a mismatch");
+        assert_eq!(
+            hex::encode(kp_a.public_key),
+            public_key_a,
+            "{label}: pk_a mismatch"
+        );
+        assert_eq!(
+            hex::encode(kp_a.secret_key),
+            secret_key_a,
+            "{label}: sk_a mismatch"
+        );
 
         let kp_b = kp_from_seed(&seed_b);
-        assert_eq!(hex::encode(kp_b.public_key), public_key_b, "{label}: pk_b mismatch");
-        assert_eq!(hex::encode(kp_b.secret_key), secret_key_b, "{label}: sk_b mismatch");
+        assert_eq!(
+            hex::encode(kp_b.public_key),
+            public_key_b,
+            "{label}: pk_b mismatch"
+        );
+        assert_eq!(
+            hex::encode(kp_b.secret_key),
+            secret_key_b,
+            "{label}: sk_b mismatch"
+        );
 
         let dh_ab = ed25519_dh(&kp_a.secret_key, &kp_b.public_key).expect("dh(a,b)");
         assert_eq!(hex::encode(dh_ab), dh_output, "{label}: dh(a,b) mismatch");
@@ -153,16 +172,32 @@ fn golden_noise_xx_handshake() {
         };
 
         let s_i = kp_from_seed(&static_initiator_seed);
-        assert_eq!(hex::encode(s_i.public_key), static_initiator_pk, "{label}: static_i pk");
+        assert_eq!(
+            hex::encode(s_i.public_key),
+            static_initiator_pk,
+            "{label}: static_i pk"
+        );
 
         let s_r = kp_from_seed(&static_responder_seed);
-        assert_eq!(hex::encode(s_r.public_key), static_responder_pk, "{label}: static_r pk");
+        assert_eq!(
+            hex::encode(s_r.public_key),
+            static_responder_pk,
+            "{label}: static_r pk"
+        );
 
         let e_i = kp_from_seed(&ephemeral_initiator_seed);
-        assert_eq!(hex::encode(e_i.public_key), ephemeral_initiator_pk, "{label}: eph_i pk");
+        assert_eq!(
+            hex::encode(e_i.public_key),
+            ephemeral_initiator_pk,
+            "{label}: eph_i pk"
+        );
 
         let e_r = kp_from_seed(&ephemeral_responder_seed);
-        assert_eq!(hex::encode(e_r.public_key), ephemeral_responder_pk, "{label}: eph_r pk");
+        assert_eq!(
+            hex::encode(e_r.public_key),
+            ephemeral_responder_pk,
+            "{label}: eph_r pk"
+        );
 
         let mut initiator = Handshake::new(true, s_i);
         initiator.set_ephemeral(e_i);
@@ -188,18 +223,34 @@ fn golden_noise_xx_handshake() {
         assert_eq!(m3.len(), message3_len, "{label}: M3 length");
         assert_eq!(hex::encode(&m3), message3, "{label}: M3 bytes");
 
-        assert!(initiator.complete(), "{label}: initiator should be complete");
+        assert!(
+            initiator.complete(),
+            "{label}: initiator should be complete"
+        );
         let ir = initiator.result().expect("initiator result");
 
-        let rr = responder.recv(&m3).expect("recv M3").expect("responder result");
-        assert!(responder.complete(), "{label}: responder should be complete");
+        let rr = responder
+            .recv(&m3)
+            .expect("recv M3")
+            .expect("responder result");
+        assert!(
+            responder.complete(),
+            "{label}: responder should be complete"
+        );
 
         assert_eq!(hex::encode(ir.tx), initiator_tx, "{label}: initiator tx");
         assert_eq!(hex::encode(ir.rx), initiator_rx, "{label}: initiator rx");
         assert_eq!(hex::encode(rr.tx), responder_tx, "{label}: responder tx");
         assert_eq!(hex::encode(rr.rx), responder_rx, "{label}: responder rx");
-        assert_eq!(hex::encode(ir.handshake_hash), handshake_hash, "{label}: handshake hash");
-        assert_eq!(ir.handshake_hash, rr.handshake_hash, "{label}: hash agreement");
+        assert_eq!(
+            hex::encode(ir.handshake_hash),
+            handshake_hash,
+            "{label}: handshake hash"
+        );
+        assert_eq!(
+            ir.handshake_hash, rr.handshake_hash,
+            "{label}: hash agreement"
+        );
     }
 }
 
@@ -246,12 +297,15 @@ fn golden_secretstream_decrypt() {
 
         for (i, msg) in messages.iter().enumerate() {
             let ct = h(&msg.ciphertext);
-            let (plaintext, tag) = pull.next(&ct).unwrap_or_else(|e| {
-                panic!("{label} msg[{i}]: decrypt failed: {e}")
-            });
+            let (plaintext, tag) = pull
+                .next(&ct)
+                .unwrap_or_else(|e| panic!("{label} msg[{i}]: decrypt failed: {e}"));
 
             let expected_pt = h(&msg.plaintext);
-            assert_eq!(plaintext, expected_pt, "{label} msg[{i}]: plaintext mismatch");
+            assert_eq!(
+                plaintext, expected_pt,
+                "{label} msg[{i}]: plaintext mismatch"
+            );
 
             let expected_tag = match msg.tag.as_str() {
                 "message" => TAG_MESSAGE,

@@ -31,7 +31,15 @@ async fn spawn_bootstrap() -> (u16, BootstrapNode) {
     let (task, handle, rx) = hyperdht::spawn(&rt, cfg).await.unwrap();
     let port = handle.local_port().await.unwrap();
 
-    (port, BootstrapNode { _rt: rt, _task: task, _handle: handle, _rx: rx })
+    (
+        port,
+        BootstrapNode {
+            _rt: rt,
+            _task: task,
+            _handle: handle,
+            _rx: rx,
+        },
+    )
 }
 
 struct BootstrapNode {
@@ -64,7 +72,12 @@ async fn spawn_dht_cluster(n: usize) -> (Vec<u16>, Vec<BootstrapNode>) {
         let port = handle.local_port().await.unwrap();
 
         ports.push(port);
-        nodes.push(BootstrapNode { _rt: rt, _task: task, _handle: handle, _rx: rx });
+        nodes.push(BootstrapNode {
+            _rt: rt,
+            _task: task,
+            _handle: handle,
+            _rx: rx,
+        });
     }
 
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -83,7 +96,14 @@ fn kill_child(child: &mut Child) {
 async fn test_node_starts_and_binds() {
     let result = tokio::time::timeout(Duration::from_secs(15), async {
         let mut child = Command::new(bin_path())
-            .args(["--no-default-config", "node", "--port", "0", "--host", "127.0.0.1"])
+            .args([
+                "--no-default-config",
+                "node",
+                "--port",
+                "0",
+                "--host",
+                "127.0.0.1",
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -130,8 +150,10 @@ async fn test_lookup_empty_topic() {
             Command::new(bin_path())
                 .args([
                     "--no-default-config",
-                    "lookup", "nonexistent-topic-12345",
-                    "--bootstrap", &bs_addr,
+                    "lookup",
+                    "nonexistent-topic-12345",
+                    "--bootstrap",
+                    &bs_addr,
                     "--json",
                 ])
                 .output()
@@ -167,10 +189,14 @@ async fn test_announce_then_lookup() {
 
         let mut announce = Command::new(bin_path())
             .args([
-                "--no-default-config", "--no-public",
-                "announce", "local-test-announce-lookup",
-                "--bootstrap", &bs_addr,
-                "--duration", "20",
+                "--no-default-config",
+                "--no-public",
+                "announce",
+                "local-test-announce-lookup",
+                "--bootstrap",
+                &bs_addr,
+                "--duration",
+                "20",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -183,9 +209,12 @@ async fn test_announce_then_lookup() {
         let output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "lookup", "local-test-announce-lookup",
-                    "--bootstrap", &bs_addr_clone,
+                    "--no-default-config",
+                    "--no-public",
+                    "lookup",
+                    "local-test-announce-lookup",
+                    "--bootstrap",
+                    &bs_addr_clone,
                     "--json",
                 ])
                 .output()
@@ -199,10 +228,7 @@ async fn test_announce_then_lookup() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        assert!(
-            output.status.success(),
-            "lookup failed: {stderr}"
-        );
+        assert!(output.status.success(), "lookup failed: {stderr}");
 
         // Single-bootstrap DHT cannot propagate announcements, so we only
         // verify the lookup executes successfully and produces valid JSON.
@@ -232,10 +258,7 @@ async fn test_config_file_loading() {
         let config_str = config_path.to_str().unwrap().to_string();
         let output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
-                .args([
-                    "--config", &config_str,
-                    "lookup", "--help",
-                ])
+                .args(["--config", &config_str, "lookup", "--help"])
                 .output()
                 .expect("failed to run with --config")
         })
@@ -271,10 +294,15 @@ async fn test_dd_local_roundtrip() {
         let bs_addr_clone = bs_addr.clone();
         let mut leave = Command::new(bin_path())
             .args([
-                "--no-default-config", "--no-public",
-                "dd", "put", &input_path_str,
-                "--bootstrap", &bs_addr_clone,
-                "--ttl", "35",
+                "--no-default-config",
+                "--no-public",
+                "dd",
+                "put",
+                &input_path_str,
+                "--bootstrap",
+                &bs_addr_clone,
+                "--ttl",
+                "35",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -305,11 +333,17 @@ async fn test_dd_local_roundtrip() {
         let pickup_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "dd", "get", &pickup_key,
-                    "--bootstrap", &bs_addr_clone2,
-                    "--output", &output_path_str,
-                    "--timeout", "20",
+                    "--no-default-config",
+                    "--no-public",
+                    "dd",
+                    "get",
+                    &pickup_key,
+                    "--bootstrap",
+                    &bs_addr_clone2,
+                    "--output",
+                    &output_path_str,
+                    "--timeout",
+                    "20",
                     "--no-ack",
                 ])
                 .output()
@@ -321,10 +355,7 @@ async fn test_dd_local_roundtrip() {
         kill_child(&mut leave);
 
         let stderr = String::from_utf8_lossy(&pickup_output.stderr);
-        assert!(
-            pickup_output.status.success(),
-            "dd get failed: {stderr}"
-        );
+        assert!(pickup_output.status.success(), "dd get failed: {stderr}");
 
         let received = std::fs::read(&output_path).expect("output file not found");
         assert_eq!(received, msg, "payload mismatch.\nstderr: {stderr}");
@@ -383,10 +414,7 @@ async fn test_help_all_subcommands() {
             );
 
             let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                !stdout.is_empty(),
-                "{subcmd} --help produced no output"
-            );
+            assert!(!stdout.is_empty(), "{subcmd} --help produced no output");
         }
     })
     .await;
@@ -419,7 +447,10 @@ async fn test_init_creates_config() {
 
     assert!(config_path.exists(), "config file not created");
     let content = std::fs::read_to_string(&config_path).unwrap();
-    assert!(content.contains("[network]"), "config missing [network] section");
+    assert!(
+        content.contains("[network]"),
+        "config missing [network] section"
+    );
     assert!(content.contains("[node]"), "config missing [node] section");
 }
 
@@ -479,7 +510,10 @@ async fn test_init_existing_no_force() {
     );
 
     let content = std::fs::read_to_string(&config_path).unwrap();
-    assert_eq!(content, "[network]\npublic = true\n", "config should not be modified");
+    assert_eq!(
+        content, "[network]\npublic = true\n",
+        "config should not be modified"
+    );
 }
 
 // ── Test: init --force overwrites existing config ───────────────────────────
@@ -507,7 +541,10 @@ async fn test_init_force_overwrites() {
     );
 
     let content = std::fs::read_to_string(&config_path).unwrap();
-    assert!(content.contains("[network]"), "config should be regenerated");
+    assert!(
+        content.contains("[network]"),
+        "config should be regenerated"
+    );
     assert_ne!(content, "old content", "config should be overwritten");
 }
 
@@ -517,7 +554,11 @@ async fn test_init_force_overwrites() {
 async fn test_init_update_patches() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "[network]\n# public = false\n\n[node]\nport = 49737\n").unwrap();
+    std::fs::write(
+        &config_path,
+        "[network]\n# public = false\n\n[node]\nport = 49737\n",
+    )
+    .unwrap();
     let config_str = config_path.to_str().unwrap().to_string();
 
     let output = tokio::task::spawn_blocking(move || {
@@ -799,7 +840,10 @@ async fn test_init_respects_peeroxide_config_env() {
         "init with PEEROXIDE_CONFIG failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(config_path.exists(), "config not created at PEEROXIDE_CONFIG path");
+    assert!(
+        config_path.exists(),
+        "config not created at PEEROXIDE_CONFIG path"
+    );
 }
 
 // ── Test: init --man-pages default path (no argument) ───────────────────────
@@ -964,8 +1008,10 @@ async fn test_ping_direct_json() {
             Command::new(bin_path())
                 .args([
                     "--no-default-config",
-                    "ping", &target,
-                    "--bootstrap", &bs_addr,
+                    "ping",
+                    &target,
+                    "--bootstrap",
+                    &bs_addr,
                     "--json",
                 ])
                 .output()
@@ -998,7 +1044,10 @@ async fn test_ping_direct_json() {
         assert_eq!(probe["type"], "probe");
         assert_eq!(probe["seq"], 1);
         assert_eq!(probe["status"], "ok");
-        assert!(probe["rtt_ms"].as_f64().unwrap() > 0.0, "rtt_ms should be positive");
+        assert!(
+            probe["rtt_ms"].as_f64().unwrap() > 0.0,
+            "rtt_ms should be positive"
+        );
     })
     .await;
 
@@ -1018,10 +1067,14 @@ async fn test_ping_count_repeated() {
             Command::new(bin_path())
                 .args([
                     "--no-default-config",
-                    "ping", &target,
-                    "--bootstrap", &bs_addr,
-                    "--count", "3",
-                    "--interval", "0.1",
+                    "ping",
+                    &target,
+                    "--bootstrap",
+                    &bs_addr,
+                    "--count",
+                    "3",
+                    "--interval",
+                    "0.1",
                     "--json",
                 ])
                 .output()
@@ -1081,9 +1134,12 @@ async fn test_ping_by_topic() {
         let mut announce = Command::new(bin_path())
             .args([
                 "--no-default-config",
-                "announce", topic,
-                "--bootstrap", &bs_for_announce,
-                "--duration", "25",
+                "announce",
+                topic,
+                "--bootstrap",
+                &bs_for_announce,
+                "--duration",
+                "25",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1099,8 +1155,10 @@ async fn test_ping_by_topic() {
             Command::new(bin_path())
                 .args([
                     "--no-default-config",
-                    "ping", &topic_owned,
-                    "--bootstrap", &bs_for_ping,
+                    "ping",
+                    &topic_owned,
+                    "--bootstrap",
+                    &bs_for_ping,
                     "--json",
                 ])
                 .output()
@@ -1176,9 +1234,13 @@ async fn test_cp_local_roundtrip() {
         let src_str = src_path.to_str().unwrap().to_string();
         let mut sender = Command::new(bin_path())
             .args([
-                "--no-default-config", "--no-public",
-                "cp", "send", &src_str,
-                "--bootstrap", &bs_for_send,
+                "--no-default-config",
+                "--no-public",
+                "cp",
+                "send",
+                &src_str,
+                "--bootstrap",
+                &bs_for_send,
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1213,13 +1275,18 @@ async fn test_cp_local_roundtrip() {
         let recv_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "cp", "recv", &topic,
+                    "--no-default-config",
+                    "--no-public",
+                    "cp",
+                    "recv",
+                    &topic,
                     &dest_str,
-                    "--bootstrap", &bs_for_recv,
+                    "--bootstrap",
+                    &bs_for_recv,
                     "--yes",
                     "--force",
-                    "--timeout", "30",
+                    "--timeout",
+                    "30",
                 ])
                 .output()
                 .expect("failed to run cp recv")
@@ -1230,16 +1297,15 @@ async fn test_cp_local_roundtrip() {
         kill_child(&mut sender);
 
         let stderr = String::from_utf8_lossy(&recv_output.stderr);
-        assert!(
-            recv_output.status.success(),
-            "cp recv failed: {stderr}"
-        );
+        assert!(recv_output.status.success(), "cp recv failed: {stderr}");
 
         // Verify file content
-        let received = std::fs::read(&dest_path)
-            .unwrap_or_else(|_| panic!("output file not found at {dest_str_display}\nstderr: {stderr}"));
+        let received = std::fs::read(&dest_path).unwrap_or_else(|_| {
+            panic!("output file not found at {dest_str_display}\nstderr: {stderr}")
+        });
         assert_eq!(
-            received, payload,
+            received,
+            payload,
             "file content mismatch.\nexpected: {:?}\ngot: {:?}\nstderr: {stderr}",
             String::from_utf8_lossy(payload),
             String::from_utf8_lossy(&received)
@@ -1250,7 +1316,11 @@ async fn test_cp_local_roundtrip() {
     assert!(result.is_ok(), "test_cp_local_roundtrip timed out");
 }
 
-async fn cp_roundtrip_with_flags(sender_no_public: bool, receiver_no_public: bool, test_name: &str) {
+async fn cp_roundtrip_with_flags(
+    sender_no_public: bool,
+    receiver_no_public: bool,
+    test_name: &str,
+) {
     let (port, _bs) = spawn_bootstrap().await;
     let bs_addr = format!("127.0.0.1:{port}");
     let dir = tempfile::tempdir().unwrap();
@@ -1337,10 +1407,12 @@ async fn cp_roundtrip_with_flags(sender_no_public: bool, receiver_no_public: boo
     );
 
     let dest_str_display = dest_path.to_str().unwrap().to_string();
-    let received = std::fs::read(&dest_path)
-        .unwrap_or_else(|_| panic!("[{test_name}] output file not found at {dest_str_display}\nstderr: {stderr}"));
+    let received = std::fs::read(&dest_path).unwrap_or_else(|_| {
+        panic!("[{test_name}] output file not found at {dest_str_display}\nstderr: {stderr}")
+    });
     assert_eq!(
-        received, payload,
+        received,
+        payload,
         "[{test_name}] file content mismatch.\nexpected: {:?}\ngot: {:?}\nstderr: {stderr}",
         String::from_utf8_lossy(payload),
         String::from_utf8_lossy(&received)
@@ -1353,7 +1425,10 @@ async fn test_cp_sender_default_receiver_public() {
         cp_roundtrip_with_flags(false, true, "sender_default_receiver_no_public").await;
     })
     .await;
-    assert!(result.is_ok(), "test_cp_sender_default_receiver_public timed out");
+    assert!(
+        result.is_ok(),
+        "test_cp_sender_default_receiver_public timed out"
+    );
 }
 
 #[tokio::test]
@@ -1362,7 +1437,10 @@ async fn test_cp_sender_public_receiver_default() {
         cp_roundtrip_with_flags(true, false, "sender_no_public_receiver_default").await;
     })
     .await;
-    assert!(result.is_ok(), "test_cp_sender_public_receiver_default timed out");
+    assert!(
+        result.is_ok(),
+        "test_cp_sender_public_receiver_default timed out"
+    );
 }
 
 #[tokio::test]
@@ -1394,9 +1472,13 @@ async fn test_cp_no_public_flag_roundtrip() {
 
         let mut sender = Command::new(bin_path())
             .args([
-                "--no-default-config", "--no-public",
-                "cp", "send", &src_str,
-                "--bootstrap", &bs_for_send,
+                "--no-default-config",
+                "--no-public",
+                "cp",
+                "send",
+                &src_str,
+                "--bootstrap",
+                &bs_for_send,
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1427,13 +1509,18 @@ async fn test_cp_no_public_flag_roundtrip() {
         let recv_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "cp", "recv", &topic,
+                    "--no-default-config",
+                    "--no-public",
+                    "cp",
+                    "recv",
+                    &topic,
                     &dest_str,
-                    "--bootstrap", &bs_for_recv,
+                    "--bootstrap",
+                    &bs_for_recv,
                     "--yes",
                     "--force",
-                    "--timeout", "30",
+                    "--timeout",
+                    "30",
                 ])
                 .output()
                 .expect("failed to run cp recv with --no-public")
@@ -1471,12 +1558,15 @@ async fn test_cp_isolated_no_bootstrap_times_out() {
             Command::new(bin_path())
                 .args([
                     "--no-default-config",
-                    "cp", "recv",
+                    "--no-public",
+                    "cp",
+                    "recv",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     &dest_str,
                     "--yes",
                     "--force",
-                    "--timeout", "5",
+                    "--timeout",
+                    "5",
                 ])
                 .output()
                 .expect("failed to run cp recv")
@@ -1494,7 +1584,10 @@ async fn test_cp_isolated_no_bootstrap_times_out() {
         );
     })
     .await;
-    assert!(result.is_ok(), "test_cp_isolated_no_bootstrap_times_out timed out");
+    assert!(
+        result.is_ok(),
+        "test_cp_isolated_no_bootstrap_times_out timed out"
+    );
 }
 
 #[tokio::test]
@@ -1515,11 +1608,17 @@ async fn test_dd_passphrase_roundtrip() {
         let mut leave_cmd = Command::new(bin_path());
         leave_cmd
             .args([
-                "--no-default-config", "--no-public",
-                "dd", "put", &input_path_str,
-                "--bootstrap", &bs_addr_clone,
-                "--ttl", "40",
-                "--passphrase", "dd-test-pass-abc",
+                "--no-default-config",
+                "--no-public",
+                "dd",
+                "put",
+                &input_path_str,
+                "--bootstrap",
+                &bs_addr_clone,
+                "--ttl",
+                "40",
+                "--passphrase",
+                "dd-test-pass-abc",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1527,11 +1626,20 @@ async fn test_dd_passphrase_roundtrip() {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
-            unsafe extern "C" { fn setsid() -> i32; }
-            unsafe { leave_cmd.pre_exec(|| { setsid(); Ok(()) }); }
+            unsafe extern "C" {
+                fn setsid() -> i32;
+            }
+            unsafe {
+                leave_cmd.pre_exec(|| {
+                    setsid();
+                    Ok(())
+                });
+            }
         }
 
-        let mut leave = leave_cmd.spawn().expect("failed to spawn dd put --passphrase");
+        let mut leave = leave_cmd
+            .spawn()
+            .expect("failed to spawn dd put --passphrase");
 
         let stdout = leave.stdout.take().unwrap();
         let pickup_key = tokio::task::spawn_blocking(move || {
@@ -1557,11 +1665,17 @@ async fn test_dd_passphrase_roundtrip() {
         let pickup_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "dd", "get", &pickup_key,
-                    "--bootstrap", &bs_addr_clone2,
-                    "--output", &output_path_str,
-                    "--timeout", "20",
+                    "--no-default-config",
+                    "--no-public",
+                    "dd",
+                    "get",
+                    &pickup_key,
+                    "--bootstrap",
+                    &bs_addr_clone2,
+                    "--output",
+                    &output_path_str,
+                    "--timeout",
+                    "20",
                     "--no-ack",
                 ])
                 .output()
@@ -1579,7 +1693,10 @@ async fn test_dd_passphrase_roundtrip() {
         );
 
         let received = std::fs::read(&output_path).expect("output file not found");
-        assert_eq!(received, msg, "payload mismatch after passphrase put.\nstderr: {stderr}");
+        assert_eq!(
+            received, msg,
+            "payload mismatch after passphrase put.\nstderr: {stderr}"
+        );
     })
     .await;
 
@@ -1602,10 +1719,15 @@ async fn test_dd_large_payload() {
         let bs_addr_clone = bs_addr.clone();
         let mut leave = Command::new(bin_path())
             .args([
-                "--no-default-config", "--no-public",
-                "dd", "put", &input_path_str,
-                "--bootstrap", &bs_addr_clone,
-                "--ttl", "40",
+                "--no-default-config",
+                "--no-public",
+                "dd",
+                "put",
+                &input_path_str,
+                "--bootstrap",
+                &bs_addr_clone,
+                "--ttl",
+                "40",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1636,11 +1758,17 @@ async fn test_dd_large_payload() {
         let pickup_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "dd", "get", &pickup_key,
-                    "--bootstrap", &bs_addr_clone2,
-                    "--output", &output_path_str,
-                    "--timeout", "25",
+                    "--no-default-config",
+                    "--no-public",
+                    "dd",
+                    "get",
+                    &pickup_key,
+                    "--bootstrap",
+                    &bs_addr_clone2,
+                    "--output",
+                    &output_path_str,
+                    "--timeout",
+                    "25",
                     "--no-ack",
                 ])
                 .output()
@@ -1659,7 +1787,8 @@ async fn test_dd_large_payload() {
 
         let received = std::fs::read(&output_path).expect("output file not found (large payload)");
         assert_eq!(
-            received, msg,
+            received,
+            msg,
             "large payload mismatch ({} bytes expected, {} bytes received).\nstderr: {stderr}",
             msg.len(),
             received.len()
@@ -1681,10 +1810,15 @@ async fn test_dd_stdin_stdout() {
         let bs_addr_clone = bs_addr.clone();
         let mut leave = Command::new(bin_path())
             .args([
-                "--no-default-config", "--no-public",
-                "dd", "put", "-",
-                "--bootstrap", &bs_addr_clone,
-                "--ttl", "40",
+                "--no-default-config",
+                "--no-public",
+                "dd",
+                "put",
+                "-",
+                "--bootstrap",
+                &bs_addr_clone,
+                "--ttl",
+                "40",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1712,7 +1846,9 @@ async fn test_dd_stdin_stdout() {
         });
 
         let (_, pickup_key_result) = tokio::join!(stdin_writer, key_reader);
-        let pickup_key = pickup_key_result.unwrap().expect("dd put (stdin) did not output pickup key");
+        let pickup_key = pickup_key_result
+            .unwrap()
+            .expect("dd put (stdin) did not output pickup key");
 
         tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -1720,10 +1856,15 @@ async fn test_dd_stdin_stdout() {
         let pickup_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "dd", "get", &pickup_key,
-                    "--bootstrap", &bs_addr_clone2,
-                    "--timeout", "20",
+                    "--no-default-config",
+                    "--no-public",
+                    "dd",
+                    "get",
+                    &pickup_key,
+                    "--bootstrap",
+                    &bs_addr_clone2,
+                    "--timeout",
+                    "20",
                     "--no-ack",
                 ])
                 .output()
@@ -1761,10 +1902,15 @@ async fn test_dd_get_timeout() {
         let pickup_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "dd", "get", nonexistent_key,
-                    "--bootstrap", &bs_addr,
-                    "--timeout", "5",
+                    "--no-default-config",
+                    "--no-public",
+                    "dd",
+                    "get",
+                    nonexistent_key,
+                    "--bootstrap",
+                    &bs_addr,
+                    "--timeout",
+                    "5",
                     "--no-ack",
                 ])
                 .output()
@@ -1806,11 +1952,17 @@ async fn test_dd_wrong_passphrase_fails() {
         let mut leave_cmd = Command::new(bin_path());
         leave_cmd
             .args([
-                "--no-default-config", "--no-public",
-                "dd", "put", &input_path_str,
-                "--bootstrap", &bs_addr_clone,
-                "--ttl", "40",
-                "--passphrase", "correct-secret-passphrase",
+                "--no-default-config",
+                "--no-public",
+                "dd",
+                "put",
+                &input_path_str,
+                "--bootstrap",
+                &bs_addr_clone,
+                "--ttl",
+                "40",
+                "--passphrase",
+                "correct-secret-passphrase",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1818,11 +1970,20 @@ async fn test_dd_wrong_passphrase_fails() {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
-            unsafe extern "C" { fn setsid() -> i32; }
-            unsafe { leave_cmd.pre_exec(|| { setsid(); Ok(()) }); }
+            unsafe extern "C" {
+                fn setsid() -> i32;
+            }
+            unsafe {
+                leave_cmd.pre_exec(|| {
+                    setsid();
+                    Ok(())
+                });
+            }
         }
 
-        let mut leave = leave_cmd.spawn().expect("failed to spawn dd put (wrong passphrase test)");
+        let mut leave = leave_cmd
+            .spawn()
+            .expect("failed to spawn dd put (wrong passphrase test)");
 
         let stdout = leave.stdout.take().unwrap();
         let leave_key_result = tokio::task::spawn_blocking(move || {
@@ -1848,10 +2009,15 @@ async fn test_dd_wrong_passphrase_fails() {
         let pickup_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "dd", "get", wrong_key,
-                    "--bootstrap", &bs_addr_clone2,
-                    "--timeout", "8",
+                    "--no-default-config",
+                    "--no-public",
+                    "dd",
+                    "get",
+                    wrong_key,
+                    "--bootstrap",
+                    &bs_addr_clone2,
+                    "--timeout",
+                    "8",
                     "--no-ack",
                 ])
                 .output()
@@ -1888,10 +2054,15 @@ async fn test_dd_v2_multi_index() {
         let bs_clone = bs_addr.clone();
         let mut leave = Command::new(bin_path())
             .args([
-                "--no-default-config", "--no-public",
-                "dd", "put", &input_str,
-                "--bootstrap", &bs_clone,
-                "--ttl", "60",
+                "--no-default-config",
+                "--no-public",
+                "dd",
+                "put",
+                &input_str,
+                "--bootstrap",
+                &bs_clone,
+                "--ttl",
+                "60",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1921,11 +2092,17 @@ async fn test_dd_v2_multi_index() {
         let get_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "dd", "get", &pickup_key,
-                    "--bootstrap", &bs_clone2,
-                    "--output", &out_str,
-                    "--timeout", "40",
+                    "--no-default-config",
+                    "--no-public",
+                    "dd",
+                    "get",
+                    &pickup_key,
+                    "--bootstrap",
+                    &bs_clone2,
+                    "--output",
+                    &out_str,
+                    "--timeout",
+                    "40",
                     "--no-ack",
                 ])
                 .output()
@@ -1964,10 +2141,15 @@ async fn test_dd_v2_empty_file() {
         let bs_clone = bs_addr.clone();
         let mut leave = Command::new(bin_path())
             .args([
-                "--no-default-config", "--no-public",
-                "dd", "put", &input_str,
-                "--bootstrap", &bs_clone,
-                "--ttl", "40",
+                "--no-default-config",
+                "--no-public",
+                "dd",
+                "put",
+                &input_str,
+                "--bootstrap",
+                &bs_clone,
+                "--ttl",
+                "40",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1997,11 +2179,17 @@ async fn test_dd_v2_empty_file() {
         let get_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "dd", "get", &pickup_key,
-                    "--bootstrap", &bs_clone2,
-                    "--output", &out_str,
-                    "--timeout", "20",
+                    "--no-default-config",
+                    "--no-public",
+                    "dd",
+                    "get",
+                    &pickup_key,
+                    "--bootstrap",
+                    &bs_clone2,
+                    "--output",
+                    &out_str,
+                    "--timeout",
+                    "20",
                     "--no-ack",
                 ])
                 .output()
@@ -2019,7 +2207,11 @@ async fn test_dd_v2_empty_file() {
         );
 
         let received = std::fs::read(&output_path).expect("output file not found");
-        assert!(received.is_empty(), "expected empty output, got {} bytes. stderr: {stderr}", received.len());
+        assert!(
+            received.is_empty(),
+            "expected empty output, got {} bytes. stderr: {stderr}",
+            received.len()
+        );
     })
     .await;
     assert!(result.is_ok(), "test_dd_v2_empty_file timed out");
@@ -2041,11 +2233,16 @@ async fn test_dd_v1_flag_roundtrip() {
         let bs_clone = bs_addr.clone();
         let mut leave = Command::new(bin_path())
             .args([
-                "--no-default-config", "--no-public",
-                "dd", "put", &input_str,
+                "--no-default-config",
+                "--no-public",
+                "dd",
+                "put",
+                &input_str,
                 "--v1",
-                "--bootstrap", &bs_clone,
-                "--ttl", "40",
+                "--bootstrap",
+                &bs_clone,
+                "--ttl",
+                "40",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2075,11 +2272,17 @@ async fn test_dd_v1_flag_roundtrip() {
         let get_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "dd", "get", &pickup_key,
-                    "--bootstrap", &bs_clone2,
-                    "--output", &out_str,
-                    "--timeout", "20",
+                    "--no-default-config",
+                    "--no-public",
+                    "dd",
+                    "get",
+                    &pickup_key,
+                    "--bootstrap",
+                    &bs_clone2,
+                    "--output",
+                    &out_str,
+                    "--timeout",
+                    "20",
                     "--no-ack",
                 ])
                 .output()
@@ -2097,7 +2300,10 @@ async fn test_dd_v1_flag_roundtrip() {
         );
 
         let received = std::fs::read(&output_path).expect("output file not found");
-        assert_eq!(received, msg, "v1 flag roundtrip payload mismatch. stderr: {stderr}");
+        assert_eq!(
+            received, msg,
+            "v1 flag roundtrip payload mismatch. stderr: {stderr}"
+        );
     })
     .await;
     assert!(result.is_ok(), "test_dd_v1_flag_roundtrip timed out");
@@ -2121,11 +2327,17 @@ async fn test_dd_v2_passphrase_roundtrip() {
         let mut leave_cmd = Command::new(bin_path());
         leave_cmd
             .args([
-                "--no-default-config", "--no-public",
-                "dd", "put", &input_str,
-                "--bootstrap", &bs_clone,
-                "--ttl", "40",
-                "--passphrase", "v2-test-passphrase-xyz",
+                "--no-default-config",
+                "--no-public",
+                "dd",
+                "put",
+                &input_str,
+                "--bootstrap",
+                &bs_clone,
+                "--ttl",
+                "40",
+                "--passphrase",
+                "v2-test-passphrase-xyz",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2133,11 +2345,20 @@ async fn test_dd_v2_passphrase_roundtrip() {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
-            unsafe extern "C" { fn setsid() -> i32; }
-            unsafe { leave_cmd.pre_exec(|| { setsid(); Ok(()) }); }
+            unsafe extern "C" {
+                fn setsid() -> i32;
+            }
+            unsafe {
+                leave_cmd.pre_exec(|| {
+                    setsid();
+                    Ok(())
+                });
+            }
         }
 
-        let mut leave = leave_cmd.spawn().expect("failed to spawn dd put v2 passphrase");
+        let mut leave = leave_cmd
+            .spawn()
+            .expect("failed to spawn dd put v2 passphrase");
 
         let stdout = leave.stdout.take().unwrap();
         let pickup_key = tokio::task::spawn_blocking(move || {
@@ -2162,11 +2383,17 @@ async fn test_dd_v2_passphrase_roundtrip() {
         let get_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--no-public",
-                    "dd", "get", &pickup_key,
-                    "--bootstrap", &bs_clone2,
-                    "--output", &out_str,
-                    "--timeout", "20",
+                    "--no-default-config",
+                    "--no-public",
+                    "dd",
+                    "get",
+                    &pickup_key,
+                    "--bootstrap",
+                    &bs_clone2,
+                    "--output",
+                    &out_str,
+                    "--timeout",
+                    "20",
                     "--no-ack",
                 ])
                 .output()
@@ -2184,7 +2411,10 @@ async fn test_dd_v2_passphrase_roundtrip() {
         );
 
         let received = std::fs::read(&output_path).expect("output file not found");
-        assert_eq!(received, msg, "v2 passphrase payload mismatch. stderr: {stderr}");
+        assert_eq!(
+            received, msg,
+            "v2 passphrase payload mismatch. stderr: {stderr}"
+        );
     })
     .await;
     assert!(result.is_ok(), "test_dd_v2_passphrase_roundtrip timed out");

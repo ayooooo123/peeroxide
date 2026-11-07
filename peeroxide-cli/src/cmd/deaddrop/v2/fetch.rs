@@ -18,14 +18,14 @@ use crate::cmd::deaddrop::progress::reporter::ProgressReporter;
 use crate::cmd::deaddrop::progress::state::ProgressState;
 
 use super::super::GetArgs;
+use super::PARALLEL_FETCH_CAP;
 use super::keys::{ack_topic, need_topic};
 use super::need::{coalesce_missing_ranges, encode_need_list};
 use super::stream::StreamSink;
 use super::tree::{compute_layout, data_chunk_count};
 use super::wire::{
-    decode_data_chunk, decode_non_root_index, decode_root_index, NON_ROOT_INDEX_SLOT_CAP,
+    NON_ROOT_INDEX_SLOT_CAP, decode_data_chunk, decode_non_root_index, decode_root_index,
 };
-use super::PARALLEL_FETCH_CAP;
 
 /// Per-task fetch result variants.
 enum TaskOutcome {
@@ -102,7 +102,8 @@ impl OutputSink {
                     out.write_all(&bytes)
                         .map_err(|e| format!("stdout write failed: {e}"))?;
                 }
-                out.flush().map_err(|e| format!("stdout flush failed: {e}"))?;
+                out.flush()
+                    .map_err(|e| format!("stdout flush failed: {e}"))?;
                 Ok(())
             }
             OutputSink::EmptyFile { .. } | OutputSink::EmptyStdout => {
@@ -121,7 +122,8 @@ impl OutputSink {
                 temp_path,
                 final_path,
             } => {
-                mmap.flush().map_err(|e| format!("mmap flush failed: {e}"))?;
+                mmap.flush()
+                    .map_err(|e| format!("mmap flush failed: {e}"))?;
                 drop(mmap);
                 std::fs::rename(&temp_path, &final_path)
                     .map_err(|e| format!("rename to {final_path:?} failed: {e}"))?;
@@ -172,7 +174,10 @@ fn open_output_sink(args: &GetArgs, file_size: u64) -> Result<OutputSink, String
     use super::wire::DATA_PAYLOAD_MAX;
     if let Some(path) = args.output.as_ref() {
         let path = std::path::PathBuf::from(path);
-        let dir = path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
+        let dir = path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
         let temp_name = format!(".peeroxide-pickup-{}", std::process::id());
         let temp_path = dir.join(temp_name);
 
@@ -199,9 +204,8 @@ fn open_output_sink(args: &GetArgs, file_size: u64) -> Result<OutputSink, String
             .map_err(|e| format!("failed to open temp file {temp_path:?}: {e}"))?;
         file.set_len(alloc_size)
             .map_err(|e| format!("failed to size temp file: {e}"))?;
-        let mmap = unsafe {
-            memmap2::MmapMut::map_mut(&file).map_err(|e| format!("mmap failed: {e}"))?
-        };
+        let mmap =
+            unsafe { memmap2::MmapMut::map_mut(&file).map_err(|e| format!("mmap failed: {e}"))? };
         drop(file); // mmap holds the underlying mapping
         Ok(OutputSink::File {
             mmap,
@@ -304,9 +308,7 @@ pub async fn get_from_root(
     root_data: Vec<u8>,
     root_pk: [u8; 32],
     handle: HyperDhtHandle,
-    task_handle: tokio::task::JoinHandle<
-        Result<(), peeroxide_dht::hyperdht::HyperDhtError>,
-    >,
+    task_handle: tokio::task::JoinHandle<Result<(), peeroxide_dht::hyperdht::HyperDhtError>>,
     args: &GetArgs,
     progress: Arc<ProgressState>,
     reporter: ProgressReporter,
@@ -470,9 +472,7 @@ pub async fn get_from_root(
                                 .await;
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "error: invalid non-root index at base={base}: {e}"
-                                );
+                                eprintln!("error: invalid non-root index at base={base}: {e}");
                                 had_error = true;
                                 break;
                             }
@@ -523,11 +523,8 @@ pub async fn get_from_root(
                         );
                         // Transition InFlight → Failed so the next need-list
                         // cycle advertises it and re-spawns a fetch.
-                        if let ChunkState::InFlight { address } =
-                            chunk_states[position as usize]
-                        {
-                            chunk_states[position as usize] =
-                                ChunkState::Failed { address };
+                        if let ChunkState::InFlight { address } = chunk_states[position as usize] {
+                            chunk_states[position as usize] = ChunkState::Failed { address };
                         }
                     }
                 },
@@ -554,8 +551,8 @@ pub async fn get_from_root(
                 let entries = coalesce_missing_ranges(&missing);
                 let encoded = encode_need_list(&entries);
                 let unchanged = last_published_encoded.as_deref() == Some(encoded.as_slice());
-                let needs_keepalive = last_actual_publish_at
-                    .is_none_or(|t| t.elapsed() >= need_keepalive_interval);
+                let needs_keepalive =
+                    last_actual_publish_at.is_none_or(|t| t.elapsed() >= need_keepalive_interval);
                 if !unchanged || needs_keepalive {
                     need_seq += 1;
                     let _ = handle.mutable_put(&need_kp, &encoded, need_seq).await;
@@ -572,11 +569,9 @@ pub async fn get_from_root(
                         let permit_sem = sem.clone();
                         tasks.spawn(async move {
                             let _permit = permit_sem.acquire_owned().await.unwrap();
-                            let task_deadline =
-                                tokio::time::Instant::now() + chunk_timeout;
+                            let task_deadline = tokio::time::Instant::now() + chunk_timeout;
                             let result =
-                                fetch_immutable_with_retry(&h, &address, task_deadline)
-                                    .await;
+                                fetch_immutable_with_retry(&h, &address, task_deadline).await;
                             TaskOutcome::Data {
                                 position: pos as u64,
                                 result,
@@ -617,10 +612,7 @@ pub async fn get_from_root(
         .filter(|s| matches!(s, ChunkState::Done))
         .count() as u64;
     if done_count != n {
-        eprintln!(
-            "error: only {} of {} data chunks received",
-            done_count, n
-        );
+        eprintln!("error: only {} of {} data chunks received", done_count, n);
         output.discard();
         return cleanup(handle, task_handle, reporter, Some(need_kp), 1).await;
     }
@@ -765,9 +757,7 @@ fn verify_crc(output: &OutputSink, file_size: u64, expected_crc: u32) -> Result<
 /// reporter, and returns the exit code.
 async fn cleanup(
     handle: HyperDhtHandle,
-    task_handle: tokio::task::JoinHandle<
-        Result<(), peeroxide_dht::hyperdht::HyperDhtError>,
-    >,
+    task_handle: tokio::task::JoinHandle<Result<(), peeroxide_dht::hyperdht::HyperDhtError>>,
     reporter: ProgressReporter,
     _need_kp: Option<KeyPair>,
     code: i32,

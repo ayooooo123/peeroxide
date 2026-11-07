@@ -229,11 +229,6 @@ pub use query::QueryReply;
 /// associated action / result / error types appear in [`Router`]'s public
 /// method signatures and in the [`hyperdht::HyperDhtError::Router`] variant.
 pub use router::{
-    ForwardEntry,
-    HandshakeAction,
-    HandshakeResult,
-    HolepunchAction,
-    HolepunchResult,
-    Router,
+    ForwardEntry, HandshakeAction, HandshakeResult, HolepunchAction, HolepunchResult, Router,
     RouterError,
 };

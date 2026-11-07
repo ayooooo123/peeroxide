@@ -48,7 +48,10 @@ async fn run_interop() -> Result<(), Box<dyn std::error::Error>> {
 
     let info: serde_json::Value = serde_json::from_str(line.trim())?;
     let js_port = info["port"].as_u64().expect("missing port") as u16;
-    assert!(info["ready"].as_bool().unwrap_or(false), "JS node not ready");
+    assert!(
+        info["ready"].as_bool().unwrap_or(false),
+        "JS node not ready"
+    );
     tracing::info!(js_port, "JS bootstrapper ready");
 
     // ── Create Rust DHT node that bootstraps from the JS node ────────────
@@ -69,7 +72,10 @@ async fn run_interop() -> Result<(), Box<dyn std::error::Error>> {
 
     let table_sz = handle.table_size().await?;
     tracing::info!(table_sz, "routing table size after bootstrap");
-    assert!(table_sz >= 1, "expected at least 1 node in table, got {table_sz}");
+    assert!(
+        table_sz >= 1,
+        "expected at least 1 node in table, got {table_sz}"
+    );
 
     // ── Ping the JS bootstrapper ─────────────────────────────────────────
     tracing::info!("sending ping to JS bootstrapper...");
@@ -78,7 +84,11 @@ async fn run_interop() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(?ping_resp, "ping response received");
     assert_eq!(ping_resp.from.host, "127.0.0.1");
     assert_eq!(ping_resp.from.port, js_port);
-    assert!(ping_resp.rtt < Duration::from_secs(5), "RTT too high: {:?}", ping_resp.rtt);
+    assert!(
+        ping_resp.rtt < Duration::from_secs(5),
+        "RTT too high: {:?}",
+        ping_resp.rtt
+    );
 
     let expected_id = peer_id("127.0.0.1", js_port);
     assert_eq!(
@@ -129,7 +139,9 @@ async fn rust_node_detects_reachable_server_socket() {
         config.port = 0;
         config.host = "127.0.0.1".to_string();
         config.firewalled = true;
-        let (task, handle) = peeroxide_dht::rpc::spawn(&runtime, config).await.expect("spawn dht");
+        let (task, handle) = peeroxide_dht::rpc::spawn(&runtime, config)
+            .await
+            .expect("spawn dht");
         handle.bootstrapped().await.expect("bootstrapped");
 
         assert_eq!(
@@ -163,10 +175,15 @@ async fn isolated_js_node_pings_isolated_rust_node() {
     config.host = "127.0.0.1".into();
     config.ephemeral = Some(false);
     config.firewalled = false;
-    let (task, handle) = peeroxide_dht::rpc::spawn(&runtime, config).await.expect("spawn");
+    let (task, handle) = peeroxide_dht::rpc::spawn(&runtime, config)
+        .await
+        .expect("spawn");
     handle.fully_bootstrapped().await.expect("bootstrap");
     let port = handle.local_port().await.expect("port");
-    let script = format!("{}/../tests/node/isolated-ping.js", env!("CARGO_MANIFEST_DIR"));
+    let script = format!(
+        "{}/../tests/node/isolated-ping.js",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let output = tokio::time::timeout(
         Duration::from_secs(15),
         tokio::process::Command::new("node")
@@ -178,7 +195,11 @@ async fn isolated_js_node_pings_isolated_rust_node() {
     .await
     .expect("JS peer timed out")
     .expect("start JS peer");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     handle.destroy().await.expect("destroy");
     task.await.expect("task").expect("node");
 }

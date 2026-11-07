@@ -16,27 +16,29 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::compact_encoding::{decode_uint, State};
+use crate::compact_encoding::{State, decode_uint};
 use crate::crypto::{
-    ann_signable, hash, mutable_signable, verify_detached, NS_ANNOUNCE, NS_MUTABLE_PUT,
-    NS_UNANNOUNCE,
+    NS_ANNOUNCE, NS_MUTABLE_PUT, NS_UNANNOUNCE, ann_signable, hash, mutable_signable,
+    verify_detached,
 };
 use crate::hyperdht_messages::{
-    decode_announce_from_bytes, decode_mutable_get_response_from_bytes,
-    decode_mutable_put_request_from_bytes, encode_hyper_peer_to_bytes,
-    encode_lookup_raw_reply_to_bytes, encode_mutable_get_response_to_bytes, HyperPeer,
-    LookupRawReply, MutableGetResponse,
+    HyperPeer, LookupRawReply, MutableGetResponse, decode_announce_from_bytes,
+    decode_mutable_get_response_from_bytes, decode_mutable_put_request_from_bytes,
+    encode_hyper_peer_to_bytes, encode_lookup_raw_reply_to_bytes,
+    encode_mutable_get_response_to_bytes,
 };
 use crate::messages::Ipv4Peer;
 use crate::peer::NodeId;
 
 fn to_hex(bytes: impl AsRef<[u8]>) -> String {
     let bytes = bytes.as_ref();
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        use std::fmt::Write;
-        write!(s, "{b:02x}").ok();
-        s
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            use std::fmt::Write;
+            write!(s, "{b:02x}").ok();
+            s
+        })
 }
 
 // ── Error codes ───────────────────────────────────────────────────────────────
@@ -141,16 +143,12 @@ impl RecordCache {
 
         let bucket_len = self.entries.get(&key_str).map_or(0, |b| b.len());
         if bucket_len >= self.max_per_key {
-            if let Some(oldest_idx) = self
-                .entries
-                .get(&key_str)
-                .and_then(|b| {
-                    b.iter()
-                        .enumerate()
-                        .min_by_key(|(_, e)| e.inserted_at)
-                        .map(|(i, _)| i)
-                })
-            {
+            if let Some(oldest_idx) = self.entries.get(&key_str).and_then(|b| {
+                b.iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| e.inserted_at)
+                    .map(|(i, _)| i)
+            }) {
                 self.entries.get_mut(&key_str).map(|b| b.remove(oldest_idx));
                 self.total = self.total.saturating_sub(1);
             }
@@ -394,17 +392,13 @@ impl Persistent {
             .records
             .get(&key, MAX_RECORDS_PER_LOOKUP)
             .into_iter()
-            .filter_map(|bytes| {
-                crate::hyperdht_messages::decode_hyper_peer_from_bytes(&bytes).ok()
-            })
+            .filter_map(|bytes| crate::hyperdht_messages::decode_hyper_peer_from_bytes(&bytes).ok())
             .collect();
 
         // Append self-announce from router if we haven't hit the max.
         if peers.len() < MAX_RECORDS_PER_LOOKUP {
             if let Some(record) = self.router.get(&key) {
-                if let Ok(peer) =
-                    crate::hyperdht_messages::decode_hyper_peer_from_bytes(record)
-                {
+                if let Ok(peer) = crate::hyperdht_messages::decode_hyper_peer_from_bytes(record) {
                     peers.push(peer);
                 }
             }
@@ -433,11 +427,7 @@ impl Persistent {
     // ── ANNOUNCE ──────────────────────────────────────────────────────────────
 
     /// Handle an incoming ANNOUNCE request.
-    pub fn on_announce(
-        &mut self,
-        req: &IncomingHyperRequest,
-        node_id: &[u8; 32],
-    ) -> HandlerReply {
+    pub fn on_announce(&mut self, req: &IncomingHyperRequest, node_id: &[u8; 32]) -> HandlerReply {
         let target = match &req.target {
             Some(t) => *t,
             None => return HandlerReply::Silent,
@@ -483,11 +473,7 @@ impl Persistent {
             Err(_) => return HandlerReply::Silent,
         };
 
-        let refresh_bytes: &[u8] = msg
-            .refresh
-            .as_ref()
-            .map(|r| r.as_slice())
-            .unwrap_or(&[]);
+        let refresh_bytes: &[u8] = msg.refresh.as_ref().map(|r| r.as_slice()).unwrap_or(&[]);
 
         let signable = ann_signable(
             &target,
@@ -586,11 +572,7 @@ impl Persistent {
             Err(_) => return HandlerReply::Silent,
         };
 
-        let refresh_bytes: &[u8] = msg
-            .refresh
-            .as_ref()
-            .map(|r| r.as_slice())
-            .unwrap_or(&[]);
+        let refresh_bytes: &[u8] = msg.refresh.as_ref().map(|r| r.as_slice()).unwrap_or(&[]);
 
         let signable = ann_signable(
             &target,
@@ -1113,8 +1095,7 @@ mod tests {
             signature: Some([0xffu8; 64]),
             bump: 0,
         };
-        let ann_bytes =
-            crate::hyperdht_messages::encode_announce_to_bytes(&ann).unwrap();
+        let ann_bytes = crate::hyperdht_messages::encode_announce_to_bytes(&ann).unwrap();
 
         let req = IncomingHyperRequest {
             command: crate::hyperdht_messages::ANNOUNCE,
@@ -1197,4 +1178,3 @@ mod tests {
         assert_eq!(s.immutables, 1);
     }
 }
-

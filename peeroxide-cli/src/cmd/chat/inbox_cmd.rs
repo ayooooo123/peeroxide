@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use crate::cmd::chat::inbox_monitor::{format_invite_lines, InboxMonitor};
+use crate::cmd::chat::inbox_monitor::{InboxMonitor, format_invite_lines};
 use crate::cmd::chat::known_users;
 use crate::cmd::chat::profile;
 use crate::cmd::{build_dht_config, sigterm_recv};

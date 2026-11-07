@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HyperDhtHandle::mutable_put_signed`: store a mutable record with a caller-supplied signature (Node `mutablePut` with a precomputed `opts.signMutable`), so a guard can forward an endpoint-signed record. `mutable_put` now queries with `seq = 0` like Node; the stored seq is unchanged.
 - `SecretStream::remote_handle` exposes libudx's `UdxStreamRemote` for the connection's UDX stream.
 - `ConnectOpts::relay_through` and `ServerConfig::relay_through` race blind relay pairing with a direct path and migrate the same encrypted stream when the punch lands.
+- `HyperDhtServer::take_connections` lets an actor own server controls and connection publication; `ServerConfig::for_swarm` applies hyperswarm's randomized-NAT relay policy.
 
 ### Changed
 
@@ -25,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Open servers accept relayed handshakes, handshake staging runs independently per client, and client holepunch errors stop staged punches.
 - Suspend closes outgoing connection streams and bootstrap waiters; resume retries bootstrap and falls back to an ephemeral client port when needed.
 - Raw stream firewalls use Node's `true`-means-reject convention; random stream IDs replace counters and dead abort handles are pruned.
+- Direct hooks are armed before relay pairing starts. Delayed relay data and ACKs remain accepted during migration without confirming the direct path.
+- Raw-stream allocation reserves IDs atomically, closed handles are pruned on close, and relayed application closure also releases its control mux.
+- Keep the remote-client interop fixture firewalled throughout NAT sampling so loopback reachability cannot silently disable its holepunch addresses.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.3...peeroxide-dht-v1.7.4) - 2026-11-02
 

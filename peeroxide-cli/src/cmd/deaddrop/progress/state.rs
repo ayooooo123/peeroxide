@@ -121,12 +121,8 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         );
-        let state = ProgressState::new_with_wire(
-            Phase::Put,
-            2,
-            Arc::<str>::from("file.txt"),
-            wire.clone(),
-        );
+        let state =
+            ProgressState::new_with_wire(Phase::Put, 2, Arc::<str>::from("file.txt"), wire.clone());
         wire.bytes_sent.store(12_345, Ordering::Relaxed);
         wire.bytes_received.store(67_890, Ordering::Relaxed);
         assert_eq!(state.wire_bytes_sent.load(Ordering::Relaxed), 12_345);

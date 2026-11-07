@@ -155,7 +155,10 @@ async fn publish_nexus_once(
     let prof = match profile::load_profile(profile_name) {
         Ok(p) => p,
         Err(e) => {
-            emit_notice(notices, format!("warning: failed to load profile for nexus: {e}"));
+            emit_notice(
+                notices,
+                format!("warning: failed to load profile for nexus: {e}"),
+            );
             return;
         }
     };

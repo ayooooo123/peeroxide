@@ -1,19 +1,18 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::Waker;
 use std::time::Instant;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::error::{Result, UdxError};
 use super::congestion::CaState;
 use super::header::{
-    Header, SackRange,
-    FLAG_DATA, FLAG_END, FLAG_DESTROY, FLAG_MESSAGE, FLAG_SACK, FLAG_HEARTBEAT,
-    HEADER_SIZE, encode_sack, decode_sack,
+    FLAG_DATA, FLAG_DESTROY, FLAG_END, FLAG_HEARTBEAT, FLAG_MESSAGE, FLAG_SACK, HEADER_SIZE,
+    Header, SackRange, decode_sack, encode_sack,
 };
+use crate::error::{Result, UdxError};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -76,7 +75,6 @@ pub(crate) enum MtuState {
 fn seq_after(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b)) as i32 > 0
 }
-
 
 // ── Packet types ─────────────────────────────────────────────────────────────
 
@@ -149,14 +147,26 @@ type StreamMap = Arc<Mutex<std::collections::HashMap<u32, mpsc::UnboundedSender<
 /// Stream maps of the sockets a stream is registered on. Shared by the
 /// stream handle and its processor task.
 type Registrations = Arc<Mutex<Vec<StreamMap>>>;
-type FirewallHook =
-    Box<dyn FnMut(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send>;
+type FirewallHook = Box<dyn FnMut(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send>;
 
 /// Remove `local_id` from every socket map in `registrations`.
-fn deregister(local_id: u32, registrations: &Registrations) {
+fn deregister(
+    local_id: u32,
+    registrations: &Registrations,
+    tx: Option<&mpsc::UnboundedSender<IncomingPacket>>,
+) {
     let maps = std::mem::take(&mut *registrations.lock().unwrap_or_else(|e| e.into_inner()));
     for map in maps {
-        map.lock().unwrap_or_else(|e| e.into_inner()).remove(&local_id);
+        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = guard.get(&local_id) {
+            if let Some(tx) = tx {
+                if existing.same_channel(tx) {
+                    guard.remove(&local_id);
+                }
+            } else {
+                guard.remove(&local_id);
+            }
+        }
     }
 }
 
@@ -218,6 +228,8 @@ pub(crate) struct StreamInner {
     pub(crate) udp: Option<Arc<tokio::net::UdpSocket>>,
     pub(crate) read_tx: mpsc::UnboundedSender<StreamEvent>,
     close_tx: Option<oneshot::Sender<()>>,
+    close_watch_tx: watch::Sender<bool>,
+    close_watch_rx: watch::Receiver<bool>,
     pub(crate) notify_tx: Option<mpsc::UnboundedSender<StreamNotify>>,
 
     // ── Congestion control (BBR) ──
@@ -243,6 +255,7 @@ pub(crate) struct StreamInner {
     /// Released by data or a message from the current remote on this socket.
     remote_observed: Option<oneshot::Sender<()>>,
     observed_current_remote: bool,
+    pub(crate) runtime: Option<Weak<super::runtime::RuntimeHandle>>,
 }
 
 impl StreamInner {
@@ -251,7 +264,7 @@ impl StreamInner {
     /// Drain all pending writes with `StreamClosed`, wake blocked writers,
     /// mark the stream disconnected, and drop `notify_tx` so future sends
     /// fail fast. Idempotent — safe to call more than once.
-    fn terminate(&mut self) {
+    pub(crate) fn terminate(&mut self) {
         self.connected = false;
         self.terminated = true;
         self.notify_tx = None;
@@ -262,10 +275,18 @@ impl StreamInner {
         let _ = self.read_tx.send(StreamEvent::End);
         // Release the socket so a suspended DHT socket can be rebound.
         self.udp = None;
+        deregister(
+            self.local_id,
+            &self.registrations,
+            self.incoming_tx.as_ref(),
+        );
         if let Some(tx) = self.close_tx.take() {
             let _ = tx.send(());
         }
-
+        let _ = self.close_watch_tx.send(true);
+        if let Some(rt) = self.runtime.as_ref().and_then(|w| w.upgrade()) {
+            rt.unregister_stream(self.local_id);
+        }
         for mut pw in self.pending_writes.drain(..) {
             if let Some(tx) = pw.tx.take() {
                 let _ = tx.send(Err(UdxError::StreamClosed));
@@ -277,6 +298,10 @@ impl StreamInner {
         if let Some(w) = self.flush_waker.take() {
             w.wake();
         }
+    }
+
+    pub(crate) fn close_observer(&self) -> watch::Receiver<bool> {
+        self.close_watch_rx.clone()
     }
 
     // ── MTU ──────────────────────────────────────────────────────────────────
@@ -324,11 +349,7 @@ impl StreamInner {
         packet[3] = padding as u8;
 
         self.mtu_probe_wanted = false;
-        tracing::trace!(
-            probe_size = target_size,
-            padding,
-            "mtu: probeify"
-        );
+        tracing::trace!(probe_size = target_size, padding, "mtu: probeify");
         true
     }
 
@@ -355,15 +376,14 @@ impl StreamInner {
     // ── Write preparation ────────────────────────────────────────────────────
 
     /// Reserve sequence numbers for a write of `data_len` bytes.
-    pub(crate) fn prepare_write(
-        &mut self,
-        data_len: usize,
-    ) -> Result<WritePrep> {
+    pub(crate) fn prepare_write(&mut self, data_len: usize) -> Result<WritePrep> {
         if !self.connected && self.firewall_hook.is_none() {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
         if self.ended {
-            return Err(UdxError::Io(std::io::Error::other("stream already shut down")));
+            return Err(UdxError::Io(std::io::Error::other(
+                "stream already shut down",
+            )));
         }
         // `terminate()` drops the processor's channel: nothing would ever send.
         if self.udp.is_none() || self.notify_tx.is_none() {
@@ -403,7 +423,9 @@ impl StreamInner {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
         if self.ended {
-            return Err(UdxError::Io(std::io::Error::other("stream already shut down")));
+            return Err(UdxError::Io(std::io::Error::other(
+                "stream already shut down",
+            )));
         }
         if self.udp.is_none() || self.notify_tx.is_none() {
             return Err(UdxError::StreamClosed);
@@ -472,31 +494,49 @@ impl StreamInner {
         let now = Instant::now();
         let inflight = self.inflight();
         let rate_info = self.congestion.on_packet_sent(seq, inflight, now);
-        tracing::trace!(seq, is_mtu_probe, "register_sent: packet placed in outgoing");
-        self.unacked_bytes += packet.len();
-        self.outgoing.insert(seq, SentPacket {
-            packet,
-            remote_addr,
-            time_sent: now,
-            retransmit_count: 0,
-            sacked: false,
+        tracing::trace!(
+            seq,
             is_mtu_probe,
-            lost: false,
-            rate_info: Some(rate_info),
-        });
+            "register_sent: packet placed in outgoing"
+        );
+        self.unacked_bytes += packet.len();
+        self.outgoing.insert(
+            seq,
+            SentPacket {
+                packet,
+                remote_addr,
+                time_sent: now,
+                retransmit_count: 0,
+                sacked: false,
+                is_mtu_probe,
+                lost: false,
+                rate_info: Some(rate_info),
+            },
+        );
     }
 
     pub(crate) fn inflight(&self) -> u32 {
-        self.outgoing.values().filter(|p| !p.sacked && !p.lost).count() as u32
+        self.outgoing
+            .values()
+            .filter(|p| !p.sacked && !p.lost)
+            .count() as u32
     }
 
     pub(crate) fn queue_for_send(&mut self, packets: Vec<(u32, Vec<u8>)>, remote_addr: SocketAddr) {
         let count = packets.len();
         for (seq, packet) in packets {
             self.queued_bytes += packet.len();
-            self.send_queue.push_back(QueuedPacket { packet, seq, remote_addr });
+            self.send_queue.push_back(QueuedPacket {
+                packet,
+                seq,
+                remote_addr,
+            });
         }
-        tracing::trace!(count, queue_len = self.send_queue.len(), "queue_for_send: packets staged");
+        tracing::trace!(
+            count,
+            queue_len = self.send_queue.len(),
+            "queue_for_send: packets staged"
+        );
         if let Some(tx) = &self.notify_tx {
             let _ = tx.send(StreamNotify::DataQueued);
         }
@@ -558,10 +598,7 @@ impl StreamInner {
     ///
     /// Congestion control is NOT called here — the caller must combine this
     /// rate info with SACK rate info and loss count, then call `congestion.on_ack`.
-    fn on_cumulative_ack(
-        &mut self,
-        ack: u32,
-    ) -> (WriteSenders, AckedRateInfo) {
+    fn on_cumulative_ack(&mut self, ack: u32) -> (WriteSenders, AckedRateInfo) {
         if !seq_after(ack, self.remote_acked) {
             return (Vec::new(), Vec::new());
         }
@@ -570,7 +607,11 @@ impl StreamInner {
 
         // Everything sent to the old remote is ACKed: the migration is done
         // (C udx.c:1754).
-        if self.remote_change.as_ref().is_some_and(|(seq, _)| !seq_after(*seq, ack)) {
+        if self
+            .remote_change
+            .as_ref()
+            .is_some_and(|(seq, _)| !seq_after(*seq, ack))
+        {
             if let Some((_, done)) = self.remote_change.take() {
                 let _ = done.send(());
             }
@@ -635,7 +676,10 @@ impl StreamInner {
     /// Ranges are untrusted input: only packets actually in `outgoing` are
     /// visited, so a block like `0..0xFFFFFFFF` costs one tree walk, not four
     /// billion lookups (C `udx_sack_is_valid` rejects it outright).
-    fn on_sack(&mut self, ranges: &[SackRange]) -> Vec<(u32, super::congestion::rate::PacketRateInfo)> {
+    fn on_sack(
+        &mut self,
+        ranges: &[SackRange],
+    ) -> Vec<(u32, super::congestion::rate::PacketRateInfo)> {
         let mut sack_rate_info = Vec::new();
         let mut delivered = Vec::new();
         for range in ranges {
@@ -754,7 +798,9 @@ impl StreamInner {
             }
         } else {
             // Out-of-order: buffer for later delivery
-            self.recv_buf.entry(seq).or_insert(RecvdPacket { payload, flags });
+            self.recv_buf
+                .entry(seq)
+                .or_insert(RecvdPacket { payload, flags });
         }
 
         events
@@ -842,6 +888,15 @@ impl StreamInner {
     }
 }
 
+impl Drop for StreamInner {
+    fn drop(&mut self) {
+        let _ = self.close_watch_tx.send(true);
+        if let Some(runtime) = self.runtime.as_ref().and_then(|runtime| runtime.upgrade()) {
+            runtime.unregister_stream(self.local_id);
+        }
+    }
+}
+
 /// Strip MTU probe padding from a packet: remove zero bytes between header and payload,
 /// reset data_offset to 0.
 fn strip_probe_padding(packet: &mut Vec<u8>) {
@@ -914,9 +969,13 @@ pub struct UdxStream {
 }
 
 impl UdxStream {
-    pub(crate) fn new(local_id: u32) -> Self {
+    pub(crate) fn new_with_runtime(
+        local_id: u32,
+        runtime: Option<Weak<super::runtime::RuntimeHandle>>,
+    ) -> Self {
         let (read_tx, read_rx) = mpsc::unbounded_channel();
         let (close_tx, close_rx) = oneshot::channel();
+        let (close_watch_tx, close_watch_rx) = watch::channel(false);
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let registrations = Registrations::default();
 
@@ -951,6 +1010,8 @@ impl UdxStream {
             udp: None,
             read_tx,
             close_tx: Some(close_tx),
+            close_watch_tx,
+            close_watch_rx,
             notify_tx: None,
             congestion: super::congestion::CongestionController::new(
                 crate::native::stream::MAX_PAYLOAD as u32,
@@ -965,6 +1026,7 @@ impl UdxStream {
             remote_change: None,
             remote_observed: None,
             observed_current_remote: false,
+            runtime,
         };
 
         Self {
@@ -977,6 +1039,11 @@ impl UdxStream {
             close_rx: Some(close_rx),
             registrations,
         }
+    }
+
+    /// Return the local stream identifier assigned to this stream.
+    pub fn local_id(&self) -> u32 {
+        self.local_id
     }
 
     /// Consume this stream and return a tokio-compatible async I/O adapter.
@@ -1042,6 +1109,9 @@ impl UdxStream {
         if processor_started {
             {
                 let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if inner.terminated {
+                    return Err(UdxError::StreamClosed);
+                }
                 // Only a hooked stream may re-arm its peer; C returns EISCONN.
                 if inner.connected && inner.firewall_hook.is_none() {
                     return Err(UdxError::Io(std::io::Error::new(
@@ -1066,7 +1136,12 @@ impl UdxStream {
                 }
             }
             self.register_on(socket)?;
-            tracing::debug!(local_id = self.local_id, remote_id, ?remote_addr, "stream connected (primed)");
+            tracing::debug!(
+                local_id = self.local_id,
+                remote_id,
+                ?remote_addr,
+                "stream connected (primed)"
+            );
             return Ok(());
         }
 
@@ -1074,6 +1149,9 @@ impl UdxStream {
 
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.terminated {
+                return Err(UdxError::StreamClosed);
+            }
             inner.remote_id = remote_id;
             inner.remote_addr = Some(remote_addr);
             inner.udp = Some(udp);
@@ -1084,7 +1162,12 @@ impl UdxStream {
         self.register_on(socket)?;
         self.start_processor(notify_rx)?;
 
-        tracing::debug!(local_id = self.local_id, remote_id, ?remote_addr, "stream connected");
+        tracing::debug!(
+            local_id = self.local_id,
+            remote_id,
+            ?remote_addr,
+            "stream connected"
+        );
         Ok(())
     }
 
@@ -1127,7 +1210,10 @@ impl UdxStream {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let prep = inner.prepare_end()?;
             let ack_rx = inner.watch_ack(prep.ack_threshold);
-            inner.queue_write(vec![(prep.first_seq, build_end_packet(&prep))], prep.remote_addr);
+            inner.queue_write(
+                vec![(prep.first_seq, build_end_packet(&prep))],
+                prep.remote_addr,
+            );
             ack_rx
         };
 
@@ -1167,6 +1253,9 @@ impl UdxStream {
 
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.terminated {
+                return Err(UdxError::StreamClosed);
+            }
             inner.remote_id = remote_id;
             inner.udp = Some(udp);
             inner.notify_tx = Some(notify_tx);
@@ -1176,7 +1265,11 @@ impl UdxStream {
         self.register_on(socket)?;
         self.start_processor(notify_rx)?;
 
-        tracing::debug!(local_id = self.local_id, remote_id, "stream listening (firewall hook set)");
+        tracing::debug!(
+            local_id = self.local_id,
+            remote_id,
+            "stream listening (firewall hook set)"
+        );
         Ok(())
     }
 
@@ -1185,24 +1278,40 @@ impl UdxStream {
     /// socket and the DHT socket, say). The hook commits whichever socket
     /// the accepted packet arrives on.
     pub fn listen_on(&self, socket: &super::socket::UdxSocket) -> Result<()> {
-        if self.inner.lock().unwrap_or_else(|e| e.into_inner()).firewall_hook.is_none() {
-            return Err(UdxError::Io(std::io::Error::other("stream has no firewall hook")));
+        if self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .firewall_hook
+            .is_none()
+        {
+            return Err(UdxError::Io(std::io::Error::other(
+                "stream has no firewall hook",
+            )));
         }
         self.register_on(socket)
     }
 
     /// Register for `socket`'s demux and remember the map for deregistration.
     fn register_on(&self, socket: &super::socket::UdxSocket) -> Result<()> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.terminated {
+            return Err(UdxError::StreamClosed);
+        }
         let tx = self
             .incoming_tx
             .as_ref()
             .ok_or_else(|| UdxError::Io(std::io::Error::other("stream already consumed")))?
             .clone();
         socket.register_stream(self.local_id, tx)?;
-        self.registrations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(socket.streams_ref());
+        let streams_ref = socket.streams_ref();
+        let mut reg = self.registrations.lock().unwrap_or_else(|e| e.into_inner());
+        if !reg
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &streams_ref))
+        {
+            reg.push(streams_ref);
+        }
         Ok(())
     }
 
@@ -1217,19 +1326,20 @@ impl UdxStream {
         let inner = Arc::clone(&self.inner);
         let registrations = Arc::clone(&self.registrations);
         let local_id = self.local_id;
+        let incoming_tx = self.incoming_tx.clone();
         let handle = tokio::spawn(async move {
             process_incoming(inner, incoming_rx, notify_rx).await;
-            deregister(local_id, &registrations);
+            deregister(local_id, &registrations, incoming_tx.as_ref());
         });
         *self.processor.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         Ok(())
     }
 
-    /// Destroy the stream, sending a DESTROY packet to the remote peer.
+    /// Destroy the stream, sending DESTROY unless it is a relay leg (C libudx parity).
     pub async fn destroy(mut self) -> Result<()> {
         let destroy_info = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if inner.connected {
+            if inner.connected && inner.relay_target.is_none() {
                 inner.udp.clone().zip(inner.remote_addr).map(|(udp, addr)| {
                     let header = Header {
                         type_flags: FLAG_DESTROY,
@@ -1250,27 +1360,20 @@ impl UdxStream {
             let _ = udp.send_to(&header.encode(), addr).await;
         }
 
-        let processor_handle = self
-            .processor
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take());
+        let processor_handle = self.processor.lock().ok().and_then(|mut g| g.take());
         if let Some(handle) = processor_handle {
             handle.abort();
             let _ = handle.await;
         }
 
-        self.incoming_tx = None;
+        let incoming_tx = self.incoming_tx.take();
 
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.terminate();
-            if let Some(tx) = inner.close_tx.take() {
-                let _ = tx.send(());
-            }
         }
 
-        deregister(self.local_id, &self.registrations);
+        deregister(self.local_id, &self.registrations, incoming_tx.as_ref());
 
         tracing::debug!(local_id = self.local_id, "stream destroyed");
         Ok(())
@@ -1293,10 +1396,10 @@ impl UdxStreamAbort {
         Self { inner }
     }
 
-    /// Send DESTROY to the peer, fail pending writes and turn reads into EOF.
+    /// Fail pending writes and reads; send DESTROY unless this is a relay leg.
     pub fn abort(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.connected {
+        if inner.connected && inner.relay_target.is_none() {
             if let (Some(udp), Some(addr)) = (inner.udp.clone(), inner.remote_addr) {
                 let header = Header {
                     type_flags: FLAG_DESTROY,
@@ -1322,7 +1425,32 @@ impl UdxStreamAbort {
 
     /// Whether the stream is still running (not aborted, closed or dropped).
     pub fn is_alive(&self) -> bool {
-        !self.inner.lock().unwrap_or_else(|e| e.into_inner()).terminated
+        !self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .terminated
+    }
+
+    /// Asynchronously wait for the stream to close.
+    ///
+    /// Resolves when the stream is destroyed, aborted, or disconnected.
+    /// Safe to call concurrently from multiple observers both before and
+    /// after closure.
+    pub async fn closed(&self) {
+        let mut rx = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.terminated {
+                return;
+            }
+            inner.close_watch_rx.clone()
+        };
+
+        while !*rx.borrow() {
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
     }
 }
 
@@ -1344,7 +1472,10 @@ impl UdxStreamRemote {
     /// The peer address the stream currently sends to (Node
     /// `rawStream.remoteHost`/`remotePort`); moves with `change_remote`.
     pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).remote_addr
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remote_addr
     }
 
     /// Send to `remote_id` at `remote_addr` over `socket` from now on
@@ -1369,7 +1500,7 @@ impl UdxStreamRemote {
                 "remote port is 0",
             )));
         }
-        let (local_id, incoming_tx, registrations, done) = {
+        let (local_id, done) = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if !inner.connected || !inner.is_alive() {
                 return Err(UdxError::Io(std::io::Error::new(
@@ -1378,7 +1509,24 @@ impl UdxStreamRemote {
                 )));
             }
             if inner.remote_change.is_some() {
-                return Err(UdxError::Io(std::io::Error::other("remote already changing")));
+                return Err(UdxError::Io(std::io::Error::other(
+                    "remote already changing",
+                )));
+            }
+            let incoming_tx = inner.incoming_tx.clone().ok_or(UdxError::StreamClosed)?;
+            socket.register_stream(inner.local_id, incoming_tx)?;
+            {
+                let streams_ref = socket.streams_ref();
+                let mut registrations = inner
+                    .registrations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if !registrations
+                    .iter()
+                    .any(|existing| Arc::ptr_eq(existing, &streams_ref))
+                {
+                    registrations.push(streams_ref);
+                }
             }
             inner.remote_id = remote_id;
             inner.remote_addr = Some(remote_addr);
@@ -1395,15 +1543,15 @@ impl UdxStreamRemote {
                 inner.remote_change = Some((last.wrapping_add(1), tx));
                 rx
             });
-            let incoming_tx = inner.incoming_tx.clone().ok_or(UdxError::StreamClosed)?;
-            (inner.local_id, incoming_tx, Arc::clone(&inner.registrations), done)
+            (inner.local_id, done)
         };
-        socket.register_stream(local_id, incoming_tx)?;
-        registrations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(socket.streams_ref());
-        tracing::debug!(local_id, remote_id, ?remote_addr, deferred = done.is_some(), "change_remote");
+        tracing::debug!(
+            local_id,
+            remote_id,
+            ?remote_addr,
+            deferred = done.is_some(),
+            "change_remote"
+        );
         if let Some(rx) = done {
             rx.await.map_err(|_| UdxError::StreamClosed)?;
         }
@@ -1458,14 +1606,18 @@ impl UdxStreamRemote {
 impl Drop for UdxStream {
     fn drop(&mut self) {
         if self.read_rx.is_some() {
-            self.inner.lock().unwrap_or_else(|e| e.into_inner()).terminate();
-        }
-        if let Ok(mut guard) = self.processor.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
+            let incoming_tx = self.incoming_tx.take();
+            self.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .terminate();
+            if let Ok(mut guard) = self.processor.lock() {
+                if let Some(handle) = guard.take() {
+                    handle.abort();
+                }
             }
+            deregister(self.local_id, &self.registrations, incoming_tx.as_ref());
         }
-        deregister(self.local_id, &self.registrations);
     }
 }
 
@@ -1515,6 +1667,7 @@ async fn process_incoming(
                 {
                     let (is_connected, foreign) = {
                         let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.terminated { break; }
                         let same = match (&guard.udp, packet.socket.udp_arc().ok()) {
                             (Some(ours), Some(arrival)) => Arc::ptr_eq(ours, &arrival),
                             _ => false,
@@ -1990,12 +2143,7 @@ async fn process_incoming(
 // ── Packet building ──────────────────────────────────────────────────────────
 
 /// Build a wire-format DATA packet (header + payload).
-pub(crate) fn build_data_packet(
-    remote_id: u32,
-    seq: u32,
-    ack: u32,
-    payload: &[u8],
-) -> Vec<u8> {
+pub(crate) fn build_data_packet(remote_id: u32, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
     let header = Header {
         type_flags: FLAG_DATA,
         data_offset: 0,
@@ -2027,7 +2175,10 @@ pub(crate) fn build_data_packets(
         .enumerate()
         .map(|(i, chunk)| {
             let seq = prep.first_seq + i as u32;
-            (seq, build_data_packet(prep.remote_id, seq, prep.current_ack, chunk))
+            (
+                seq,
+                build_data_packet(prep.remote_id, seq, prep.current_ack, chunk),
+            )
         })
         .collect()
 }
@@ -2088,6 +2239,7 @@ mod mtu_tests {
 
     fn make_stream_inner() -> StreamInner {
         let (read_tx, _read_rx) = mpsc::unbounded_channel();
+        let (close_watch_tx, close_watch_rx) = watch::channel(false);
         StreamInner {
             remote_id: 0,
             remote_addr: None,
@@ -2118,6 +2270,8 @@ mod mtu_tests {
             udp: None,
             read_tx,
             close_tx: None,
+            close_watch_tx,
+            close_watch_rx,
             notify_tx: None,
             congestion: crate::native::congestion::CongestionController::new(
                 MAX_PAYLOAD as u32,
@@ -2133,6 +2287,7 @@ mod mtu_tests {
             remote_change: None,
             remote_observed: None,
             observed_current_remote: false,
+            runtime: None,
         }
     }
 
@@ -2157,24 +2312,40 @@ mod mtu_tests {
 
         let payload = vec![0xABu8; MTU_BASE - HEADER_SIZE];
         let packet = build_data_packet(0, 0, 0, &payload);
-        inner.outgoing.insert(0, SentPacket {
-            packet,
-            remote_addr: "0.0.0.0:0".parse().unwrap(),
-            time_sent: Instant::now(),
-            retransmit_count: 0,
-            sacked: false,
-            is_mtu_probe: true,
-            lost: false,
-            rate_info: None,
-        });
+        inner.outgoing.insert(
+            0,
+            SentPacket {
+                packet,
+                remote_addr: "0.0.0.0:0".parse().unwrap(),
+                time_sent: Instant::now(),
+                retransmit_count: 0,
+                sacked: false,
+                is_mtu_probe: true,
+                lost: false,
+                rate_info: None,
+            },
+        );
 
         let retransmits = inner.collect_retransmits(false);
         assert_eq!(retransmits.len(), 1);
         assert_eq!(inner.mtu_probe_count, 1);
-        assert!(!inner.outgoing[&0].is_mtu_probe, "probe flag should be cleared after retransmit");
-        assert_eq!(inner.outgoing[&0].packet[3], 0, "data_offset should be reset");
-        assert_eq!(inner.mtu_state, MtuState::Search, "still searching after 1 failure");
-        assert!(inner.mtu_probe_wanted, "should want another probe after non-terminal failure");
+        assert!(
+            !inner.outgoing[&0].is_mtu_probe,
+            "probe flag should be cleared after retransmit"
+        );
+        assert_eq!(
+            inner.outgoing[&0].packet[3], 0,
+            "data_offset should be reset"
+        );
+        assert_eq!(
+            inner.mtu_state,
+            MtuState::Search,
+            "still searching after 1 failure"
+        );
+        assert!(
+            inner.mtu_probe_wanted,
+            "should want another probe after non-terminal failure"
+        );
     }
 
     // T6: Probe uses data_offset padding — probeify inflates packet to probe size
@@ -2191,11 +2362,22 @@ mod mtu_tests {
 
         let ok = inner.mtu_probeify_packet(&mut packet);
         assert!(ok, "probeify should succeed for nearly-full packet");
-        assert_eq!(packet.len(), MTU_BASE + MTU_STEP, "packet should be inflated to probe size");
-        assert_eq!(packet[3] as usize, MTU_STEP, "data_offset should equal padding size");
+        assert_eq!(
+            packet.len(),
+            MTU_BASE + MTU_STEP,
+            "packet should be inflated to probe size"
+        );
+        assert_eq!(
+            packet[3] as usize, MTU_STEP,
+            "data_offset should equal padding size"
+        );
 
         let payload_start = HEADER_SIZE + MTU_STEP;
-        assert_eq!(&packet[payload_start..], &payload[..], "original payload should be intact after padding");
+        assert_eq!(
+            &packet[payload_start..],
+            &payload[..],
+            "original payload should be intact after padding"
+        );
     }
 
     /// A SACK block spanning the whole sequence space (one 28-byte packet
@@ -2205,15 +2387,26 @@ mod mtu_tests {
     fn sack_ranges_are_bounded_by_outgoing() {
         let mut inner = make_stream_inner();
         for seq in [5u32, 6, 9] {
-            inner.register_sent(seq, build_data_packet(0, seq, 0, b"x"), "0.0.0.0:0".parse().unwrap(), false);
+            inner.register_sent(
+                seq,
+                build_data_packet(0, seq, 0, b"x"),
+                "0.0.0.0:0".parse().unwrap(),
+                false,
+            );
         }
 
         let started = Instant::now();
         let sacked = inner.on_sack(&[
             SackRange { start: 9, end: 6 },
-            SackRange { start: 0, end: 0xFFFF_FFFF },
+            SackRange {
+                start: 0,
+                end: 0xFFFF_FFFF,
+            },
         ]);
-        assert!(started.elapsed() < std::time::Duration::from_millis(100), "SACK walk is not bounded");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "SACK walk is not bounded"
+        );
 
         let seqs: Vec<u32> = sacked.iter().map(|(seq, _)| *seq).collect();
         assert_eq!(seqs, vec![5, 6, 9]);
@@ -2235,7 +2428,11 @@ mod mtu_tests {
         assert_eq!(inner.mtu_probe_count, 0);
         assert_eq!(inner.mtu_probe_size, MTU_BASE + 2 * MTU_STEP);
         assert!(inner.mtu_probe_wanted, "should want next probe");
-        assert_eq!(inner.mtu_state, MtuState::Search, "still searching — haven't reached max");
+        assert_eq!(
+            inner.mtu_state,
+            MtuState::Search,
+            "still searching — haven't reached max"
+        );
     }
 
     // T8: MTU_MAX_PROBES consecutive failures → SearchComplete
@@ -2248,23 +2445,30 @@ mod mtu_tests {
         for i in 0..MTU_MAX_PROBES {
             let payload = vec![0xEFu8; MTU_BASE - HEADER_SIZE];
             let packet = build_data_packet(0, i, 0, &payload);
-            inner.outgoing.insert(i, SentPacket {
-                packet,
-                remote_addr: "0.0.0.0:0".parse().unwrap(),
-                time_sent: Instant::now(),
-                retransmit_count: 0,
-                sacked: false,
-                is_mtu_probe: true,
-                lost: false,
-                rate_info: None,
-            });
+            inner.outgoing.insert(
+                i,
+                SentPacket {
+                    packet,
+                    remote_addr: "0.0.0.0:0".parse().unwrap(),
+                    time_sent: Instant::now(),
+                    retransmit_count: 0,
+                    sacked: false,
+                    is_mtu_probe: true,
+                    lost: false,
+                    rate_info: None,
+                },
+            );
 
             let _ = inner.collect_retransmits(false);
         }
 
         assert_eq!(inner.mtu_state, MtuState::SearchComplete);
         assert!(!inner.mtu_probe_wanted);
-        assert_eq!(inner.mtu, MTU_BASE + MTU_STEP, "MTU frozen at last successful value");
+        assert_eq!(
+            inner.mtu,
+            MTU_BASE + MTU_STEP,
+            "MTU frozen at last successful value"
+        );
     }
 }
 
@@ -2273,6 +2477,81 @@ mod abort_tests {
     use super::*;
     use std::time::Duration;
 
+    #[tokio::test]
+    async fn closed_id_can_be_reused_before_old_handles_and_processor_are_dropped() {
+        let runtime = crate::UdxRuntime::new().unwrap();
+        let socket = runtime.create_socket().await.unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old = runtime.create_stream(77).await.unwrap();
+        old.connect(&socket, 42, peer.local_addr().unwrap())
+            .await
+            .unwrap();
+        let old_abort = old.abort_handle();
+        old_abort.abort();
+        assert!(matches!(
+            old.connect(&socket, 42, peer.local_addr().unwrap()).await,
+            Err(UdxError::StreamClosed)
+        ));
+        let mut fresh = runtime.create_stream(77).await.unwrap();
+        fresh
+            .connect(&socket, 42, peer.local_addr().unwrap())
+            .await
+            .unwrap();
+        drop(old);
+        let mut bytes = Header {
+            type_flags: FLAG_DATA,
+            data_offset: 0,
+            remote_id: 77,
+            recv_window: 65536,
+            seq: 0,
+            ack: 0,
+        }
+        .encode()
+        .to_vec();
+        bytes.extend_from_slice(b"fresh");
+        peer.send_to(&bytes, socket.local_addr().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), fresh.read())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_deref(),
+            Some(&b"fresh"[..])
+        );
+        assert!(!old_abort.is_alive());
+    }
+
+    #[tokio::test]
+    async fn destroying_relay_legs_does_not_send_destroy_to_upgraded_peers() {
+        let runtime = crate::UdxRuntime::new().unwrap();
+        let socket = runtime.create_socket().await.unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for id in [10, 20] {
+            let leg = runtime.create_stream(id).await.unwrap();
+            let other = runtime.create_stream(id + 1).await.unwrap();
+            leg.connect(&socket, 42, peer.local_addr().unwrap())
+                .await
+                .unwrap();
+            leg.relay_to(&other).unwrap();
+            if id == 10 {
+                leg.abort_handle().abort();
+            } else {
+                leg.destroy().await.unwrap();
+            }
+            let mut bytes = [0; 20];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), peer.recv_from(&mut bytes))
+                    .await
+                    .is_err(),
+                "C libudx closes relayed streams without a DESTROY packet"
+            );
+        }
+    }
+
     /// `abort` must stop the processor task, not just disconnect the stream:
     /// the task owns a clone of `StreamInner`, so a task that keeps running
     /// (ticking its keepalive) pins the stream for the life of the process.
@@ -2280,13 +2559,21 @@ mod abort_tests {
     async fn abort_ends_the_processor_task() {
         let runtime = crate::UdxRuntime::new().expect("runtime");
         let socket = runtime.create_socket().await.expect("socket");
-        socket.bind("127.0.0.1:0".parse().unwrap()).await.expect("bind");
+        socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind");
         let peer = runtime.create_socket().await.expect("peer socket");
-        peer.bind("127.0.0.1:0".parse().unwrap()).await.expect("peer bind");
+        peer.bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("peer bind");
         let peer_addr = peer.local_addr().await.expect("peer addr");
 
         let stream = runtime.create_stream(1).await.expect("stream");
-        stream.connect(&socket, 2, peer_addr).await.expect("connect");
+        stream
+            .connect(&socket, 2, peer_addr)
+            .await
+            .expect("connect");
 
         let weak = Arc::downgrade(&stream.inner);
         let abort = stream.abort_handle();
@@ -2305,5 +2592,93 @@ mod abort_tests {
         }
         panic!("processor task still holds the stream one second after abort");
     }
-}
 
+    #[tokio::test]
+    async fn close_subscription_before_and_after_abort() {
+        let runtime = crate::UdxRuntime::new().expect("runtime");
+        let stream = runtime.create_stream(10).await.expect("stream");
+        let abort = stream.abort_handle();
+
+        // 1. Observer subscribed BEFORE abort
+        let abort_before = abort.clone();
+        let before_task = tokio::spawn(async move {
+            abort_before.closed().await;
+        });
+
+        tokio::task::yield_now().await;
+
+        // Abort the stream
+        abort.abort();
+
+        // Observer subscribed before abort must resolve
+        tokio::time::timeout(Duration::from_secs(1), before_task)
+            .await
+            .expect("before task must complete within timeout")
+            .expect("before task must not panic");
+
+        // 2. Observer subscribed AFTER abort must resolve immediately
+        let abort_after = abort.clone();
+        tokio::time::timeout(Duration::from_millis(50), abort_after.closed())
+            .await
+            .expect("after abort closed() must resolve immediately");
+    }
+
+    #[tokio::test]
+    async fn multiple_concurrent_observers_all_notified_on_close() {
+        let runtime = crate::UdxRuntime::new().expect("runtime");
+        let stream = runtime.create_stream(20).await.expect("stream");
+        let abort = stream.abort_handle();
+
+        const NUM_OBSERVERS: usize = 5;
+        let mut handles = Vec::new();
+
+        for _ in 0..NUM_OBSERVERS {
+            let abort_clone = abort.clone();
+            handles.push(tokio::spawn(async move {
+                abort_clone.closed().await;
+            }));
+        }
+
+        tokio::task::yield_now().await;
+
+        // Abort stream
+        abort.abort();
+
+        // All observers must resolve
+        for handle in handles {
+            tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .expect("observer must complete within timeout")
+                .expect("observer task must not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_observers_notified_on_destroy() {
+        let runtime = crate::UdxRuntime::new().expect("runtime");
+        let stream = runtime.create_stream(30).await.expect("stream");
+        let abort = stream.abort_handle();
+
+        const NUM_OBSERVERS: usize = 3;
+        let mut handles = Vec::new();
+
+        for _ in 0..NUM_OBSERVERS {
+            let abort_clone = abort.clone();
+            handles.push(tokio::spawn(async move {
+                abort_clone.closed().await;
+            }));
+        }
+
+        tokio::task::yield_now().await;
+
+        // Destroy stream directly
+        stream.destroy().await.expect("destroy");
+
+        for handle in handles {
+            tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .expect("observer must complete within timeout")
+                .expect("observer task must not panic");
+        }
+    }
+}

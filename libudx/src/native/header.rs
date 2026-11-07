@@ -244,14 +244,26 @@ mod tests {
             ack: 3,
         };
         // Two C-style blocks after the header.
-        assert_eq!(sack(0).sack_region(HEADER_SIZE + 16), Some(HEADER_SIZE..HEADER_SIZE + 16));
+        assert_eq!(
+            sack(0).sack_region(HEADER_SIZE + 16),
+            Some(HEADER_SIZE..HEADER_SIZE + 16)
+        );
         // data_offset set: only that many bytes are SACK.
-        assert_eq!(sack(8).sack_region(HEADER_SIZE + 16), Some(HEADER_SIZE..HEADER_SIZE + 8));
+        assert_eq!(
+            sack(8).sack_region(HEADER_SIZE + 16),
+            Some(HEADER_SIZE..HEADER_SIZE + 8)
+        );
         // Partial trailing block is ignored, like C's integer division.
-        assert_eq!(sack(0).sack_region(HEADER_SIZE + 13), Some(HEADER_SIZE..HEADER_SIZE + 8));
+        assert_eq!(
+            sack(0).sack_region(HEADER_SIZE + 13),
+            Some(HEADER_SIZE..HEADER_SIZE + 8)
+        );
         assert_eq!(sack(0).sack_region(HEADER_SIZE), None);
         assert_eq!(sack(0).sack_region(HEADER_SIZE + 7), None);
-        let plain = Header { type_flags: 0, ..sack(0) };
+        let plain = Header {
+            type_flags: 0,
+            ..sack(0)
+        };
         assert_eq!(plain.sack_region(HEADER_SIZE + 16), None);
     }
 
@@ -393,7 +405,10 @@ mod tests {
 
     #[test]
     fn sack_known_bytes() {
-        let ranges = vec![SackRange { start: 100, end: 200 }];
+        let ranges = vec![SackRange {
+            start: 100,
+            end: 200,
+        }];
         let mut buf = [0u8; 8];
         encode_sack(&ranges, &mut buf);
         assert_eq!(&buf[0..4], &100u32.to_le_bytes());

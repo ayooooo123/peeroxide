@@ -21,7 +21,11 @@ async fn mtu_baseline_payload_transfer() {
 
         let mut received = Vec::new();
         while received.len() < payload.len() {
-            let chunk = stream_b.read().await.expect("read failed").expect("unexpected EOF");
+            let chunk = stream_b
+                .read()
+                .await
+                .expect("read failed")
+                .expect("unexpected EOF");
             received.extend_from_slice(&chunk);
         }
         verify_payload(&payload, &received);
@@ -43,7 +47,11 @@ async fn mtu_large_write_chunked() {
 
         let mut received = Vec::new();
         while received.len() < payload.len() {
-            let chunk = stream_b.read().await.expect("read failed").expect("unexpected EOF");
+            let chunk = stream_b
+                .read()
+                .await
+                .expect("read failed")
+                .expect("unexpected EOF");
             received.extend_from_slice(&chunk);
         }
         verify_payload(&payload, &received);
@@ -65,12 +73,19 @@ async fn mtu_probing_increases_effective_mtu() {
 
         let mut received = Vec::new();
         while received.len() < payload.len() {
-            let chunk = stream_b.read().await.expect("read failed").expect("unexpected EOF");
+            let chunk = stream_b
+                .read()
+                .await
+                .expect("read failed")
+                .expect("unexpected EOF");
             received.extend_from_slice(&chunk);
         }
         verify_payload(&payload, &received);
 
-        assert!(stream_a.effective_mtu() > 1200, "MTU should have increased above 1200 after probing");
+        assert!(
+            stream_a.effective_mtu() > 1200,
+            "MTU should have increased above 1200 after probing"
+        );
     })
     .await;
 }
@@ -89,7 +104,11 @@ async fn mtu_probing_does_not_interfere_with_sack() {
 
         let mut received = Vec::new();
         while received.len() < payload.len() {
-            let chunk = stream_b.read().await.expect("read failed").expect("unexpected EOF");
+            let chunk = stream_b
+                .read()
+                .await
+                .expect("read failed")
+                .expect("unexpected EOF");
             received.extend_from_slice(&chunk);
         }
         verify_payload(&payload, &received);
@@ -111,7 +130,11 @@ async fn mtu_data_integrity_across_mtu_change() {
 
         let mut received = Vec::new();
         while received.len() < payload.len() {
-            let chunk = stream_b.read().await.expect("read failed").expect("unexpected EOF");
+            let chunk = stream_b
+                .read()
+                .await
+                .expect("read failed")
+                .expect("unexpected EOF");
             received.extend_from_slice(&chunk);
         }
         verify_payload(&payload, &received);

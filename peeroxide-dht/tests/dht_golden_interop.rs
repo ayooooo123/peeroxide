@@ -1,6 +1,6 @@
 use peeroxide_dht::messages::{
-    decode_message, encode_request_to_bytes, encode_response_to_bytes, Ipv4Peer, Message, Request,
-    Response,
+    Ipv4Peer, Message, Request, Response, decode_message, encode_request_to_bytes,
+    encode_response_to_bytes,
 };
 use peeroxide_dht::peer::peer_id;
 use serde::Deserialize;
@@ -77,8 +77,7 @@ fn golden_requests() {
         let target = opt_fixed32(&flds["target"]);
         let value = opt_bytes(&flds["value"]);
 
-        let msg = decode_message(&expected)
-            .unwrap_or_else(|e| panic!("DECODE {}: {e}", f.label));
+        let msg = decode_message(&expected).unwrap_or_else(|e| panic!("DECODE {}: {e}", f.label));
         let Message::Request(decoded) = msg else {
             panic!("Expected Request for fixture {}", f.label);
         };
@@ -106,8 +105,8 @@ fn golden_requests() {
             target,
             value,
         };
-        let encoded = encode_request_to_bytes(&req)
-            .unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
+        let encoded =
+            encode_request_to_bytes(&req).unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
         assert_eq!(
             encoded,
             expected,
@@ -142,8 +141,7 @@ fn golden_responses() {
         let error = flds["error"].as_u64().expect("error");
         let value = opt_bytes(&flds["value"]);
 
-        let msg = decode_message(&expected)
-            .unwrap_or_else(|e| panic!("DECODE {}: {e}", f.label));
+        let msg = decode_message(&expected).unwrap_or_else(|e| panic!("DECODE {}: {e}", f.label));
         let Message::Response(decoded) = msg else {
             panic!("Expected Response for fixture {}", f.label);
         };
@@ -191,8 +189,8 @@ fn golden_responses() {
             error,
             value,
         };
-        let encoded = encode_response_to_bytes(&res)
-            .unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
+        let encoded =
+            encode_response_to_bytes(&res).unwrap_or_else(|e| panic!("ENCODE {}: {e}", f.label));
         assert_eq!(
             encoded,
             expected,

@@ -7,16 +7,16 @@ use libudx::UdxRuntime;
 use peeroxide::KeyPair;
 use peeroxide_dht::hyperdht::{self, HyperDhtHandle, MutablePutResult};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::signal;
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::config::ResolvedConfig;
 use super::{build_dht_config, to_hex};
 use crate::cmd::deaddrop::progress::reporter::ProgressReporter;
 use crate::cmd::deaddrop::progress::state::{Phase, ProgressState};
+use crate::config::ResolvedConfig;
 
 const MAX_PAYLOAD: usize = 1000;
 
@@ -185,7 +185,10 @@ async fn run_get(args: GetArgs, cfg: &ResolvedConfig) -> i32 {
     let root_data = match fetch_with_retry(&handle, &root_public_key, chunk_timeout).await {
         Some(d) => d,
         None => {
-            eprintln!("error: root chunk not found (timeout after {}s)", args.timeout);
+            eprintln!(
+                "error: root chunk not found (timeout after {}s)",
+                args.timeout
+            );
             let _ = handle.destroy().await;
             let _ = task_handle.await;
             return 1;
@@ -217,10 +220,18 @@ async fn run_get(args: GetArgs, cfg: &ResolvedConfig) -> i32 {
                 get_filename,
                 handle.wire_counters(),
             );
-            let reporter =
-                ProgressReporter::from_args(state.clone(), args.no_progress, args.json);
+            let reporter = ProgressReporter::from_args(state.clone(), args.no_progress, args.json);
             reporter.on_start();
-            v1::get_from_root(root_data, root_public_key, handle, task_handle, &args, state, reporter).await
+            v1::get_from_root(
+                root_data,
+                root_public_key,
+                handle,
+                task_handle,
+                &args,
+                state,
+                reporter,
+            )
+            .await
         }
         0x02 => {
             let get_filename: Arc<str> = match args.output.as_deref() {
@@ -239,10 +250,18 @@ async fn run_get(args: GetArgs, cfg: &ResolvedConfig) -> i32 {
                 get_filename,
                 handle.wire_counters(),
             );
-            let reporter =
-                ProgressReporter::from_args(state.clone(), args.no_progress, args.json);
+            let reporter = ProgressReporter::from_args(state.clone(), args.no_progress, args.json);
             reporter.on_start();
-            v2::get_from_root(root_data, root_public_key, handle, task_handle, &args, state, reporter).await
+            v2::get_from_root(
+                root_data,
+                root_public_key,
+                handle,
+                task_handle,
+                &args,
+                state,
+                reporter,
+            )
+            .await
         }
         v => {
             eprintln!("error: unknown dead drop version 0x{v:02x}");
@@ -280,13 +299,18 @@ fn rpassword_read() -> String {
         Err(_) => {
             let mut line = String::new();
             std::io::stdin().read_line(&mut line).unwrap_or(0);
-            return line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+            return line
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .to_string();
         }
     };
     let mut reader = BufReader::new(tty);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap_or(0);
-    line.trim_end_matches('\n').trim_end_matches('\r').to_string()
+    line.trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .to_string()
 }
 
 fn derive_pk_from_passphrase(passphrase: &str) -> [u8; 32] {
@@ -383,7 +407,10 @@ async fn publish_chunks(
     let sem = Arc::new(Semaphore::new(initial_concurrency));
     let active_target = Arc::new(AtomicUsize::new(initial_concurrency));
     let permits_to_forget = Arc::new(AtomicUsize::new(0));
-    let controller = Arc::new(Mutex::new(AimdController::new(initial_concurrency, max_concurrency)));
+    let controller = Arc::new(Mutex::new(AimdController::new(
+        initial_concurrency,
+        max_concurrency,
+    )));
 
     let mut handles: Vec<tokio::task::JoinHandle<Result<MutablePutResult, String>>> = Vec::new();
     let mut chunk_byte_sizes: Vec<usize> = Vec::new();
@@ -486,4 +513,3 @@ async fn publish_chunks(
 
     Ok(())
 }
-

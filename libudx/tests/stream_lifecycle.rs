@@ -3,8 +3,8 @@
 mod common;
 
 use common::{
-    create_connected_pair, create_runtime, random_payload, verify_payload, with_timeout,
-    DEFAULT_TIMEOUT,
+    DEFAULT_TIMEOUT, create_connected_pair, create_runtime, random_payload, verify_payload,
+    with_timeout,
 };
 use std::time::Duration;
 
@@ -14,8 +14,7 @@ async fn stream_connect_basic() {
 
     with_timeout(DEFAULT_TIMEOUT, async {
         let runtime = create_runtime();
-        let (_stream_a, _stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (_stream_a, _stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
     })
     .await;
 }
@@ -26,13 +25,16 @@ async fn stream_write_read_small() {
 
     with_timeout(DEFAULT_TIMEOUT, async {
         let runtime = create_runtime();
-        let (stream_a, mut stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, mut stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         let payload = random_payload(100);
         stream_a.write(&payload).await.expect("write failed");
 
-        let received = stream_b.read().await.expect("read failed").expect("unexpected EOF");
+        let received = stream_b
+            .read()
+            .await
+            .expect("read failed")
+            .expect("unexpected EOF");
         verify_payload(&payload, &received);
     })
     .await;
@@ -44,15 +46,18 @@ async fn stream_write_read_1kb() {
 
     with_timeout(DEFAULT_TIMEOUT, async {
         let runtime = create_runtime();
-        let (stream_a, mut stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, mut stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         let payload = random_payload(1024);
         stream_a.write(&payload).await.expect("write failed");
 
         let mut received = Vec::new();
         while received.len() < payload.len() {
-            let chunk = stream_b.read().await.expect("read failed").expect("unexpected EOF");
+            let chunk = stream_b
+                .read()
+                .await
+                .expect("read failed")
+                .expect("unexpected EOF");
             received.extend_from_slice(&chunk);
         }
         verify_payload(&payload, &received);
@@ -66,15 +71,18 @@ async fn stream_write_read_64kb() {
 
     with_timeout(Duration::from_secs(30), async {
         let runtime = create_runtime();
-        let (stream_a, mut stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, mut stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         let payload = random_payload(64 * 1024);
         stream_a.write(&payload).await.expect("write failed");
 
         let mut received = Vec::new();
         while received.len() < payload.len() {
-            let chunk = stream_b.read().await.expect("read failed").expect("unexpected EOF");
+            let chunk = stream_b
+                .read()
+                .await
+                .expect("read failed")
+                .expect("unexpected EOF");
             received.extend_from_slice(&chunk);
         }
         verify_payload(&payload, &received);
@@ -88,15 +96,18 @@ async fn stream_write_read_1mb() {
 
     with_timeout(Duration::from_secs(30), async {
         let runtime = create_runtime();
-        let (stream_a, mut stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, mut stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         let payload = random_payload(1024 * 1024);
         stream_a.write(&payload).await.expect("write failed");
 
         let mut received = Vec::new();
         while received.len() < payload.len() {
-            let chunk = stream_b.read().await.expect("read failed").expect("unexpected EOF");
+            let chunk = stream_b
+                .read()
+                .await
+                .expect("read failed")
+                .expect("unexpected EOF");
             received.extend_from_slice(&chunk);
         }
         verify_payload(&payload, &received);
@@ -110,15 +121,18 @@ async fn stream_write_read_10mb() {
 
     with_timeout(Duration::from_secs(60), async {
         let runtime = create_runtime();
-        let (stream_a, mut stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, mut stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         let payload = random_payload(10 * 1024 * 1024);
         stream_a.write(&payload).await.expect("write failed");
 
         let mut received = Vec::new();
         while received.len() < payload.len() {
-            let chunk = stream_b.read().await.expect("read failed").expect("unexpected EOF");
+            let chunk = stream_b
+                .read()
+                .await
+                .expect("read failed")
+                .expect("unexpected EOF");
             received.extend_from_slice(&chunk);
         }
         verify_payload(&payload, &received);
@@ -132,8 +146,7 @@ async fn stream_multiple_writes() {
 
     with_timeout(Duration::from_secs(30), async {
         let runtime = create_runtime();
-        let (stream_a, mut stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, mut stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         let mut all_sent = Vec::new();
         for i in 0u32..100 {
@@ -145,7 +158,11 @@ async fn stream_multiple_writes() {
 
         let mut all_received = Vec::new();
         while all_received.len() < all_sent.len() {
-            let chunk = stream_b.read().await.expect("read failed").expect("unexpected EOF");
+            let chunk = stream_b
+                .read()
+                .await
+                .expect("read failed")
+                .expect("unexpected EOF");
             all_received.extend_from_slice(&chunk);
         }
         verify_payload(&all_sent, &all_received);
@@ -159,8 +176,7 @@ async fn stream_bidirectional() {
 
     with_timeout(Duration::from_secs(30), async {
         let runtime = create_runtime();
-        let (stream_a, stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         let payload_a = random_payload(10_000);
         let payload_b = random_payload(10_000);
@@ -191,14 +207,22 @@ async fn stream_bidirectional() {
 
         let mut recv_a = Vec::new();
         while recv_a.len() < payload_b.len() {
-            let chunk = stream_a.read().await.expect("read_a failed").expect("unexpected EOF");
+            let chunk = stream_a
+                .read()
+                .await
+                .expect("read_a failed")
+                .expect("unexpected EOF");
             recv_a.extend_from_slice(&chunk);
         }
         verify_payload(&payload_b, &recv_a);
 
         let mut recv_b = Vec::new();
         while recv_b.len() < payload_a.len() {
-            let chunk = stream_b.read().await.expect("read_b failed").expect("unexpected EOF");
+            let chunk = stream_b
+                .read()
+                .await
+                .expect("read_b failed")
+                .expect("unexpected EOF");
             recv_b.extend_from_slice(&chunk);
         }
         verify_payload(&payload_a, &recv_b);
@@ -212,13 +236,16 @@ async fn stream_shutdown_graceful() {
 
     with_timeout(DEFAULT_TIMEOUT, async {
         let runtime = create_runtime();
-        let (stream_a, mut stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, mut stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         let payload = b"before shutdown";
         stream_a.write(payload).await.expect("write failed");
 
-        let received = stream_b.read().await.expect("read failed").expect("unexpected EOF");
+        let received = stream_b
+            .read()
+            .await
+            .expect("read failed")
+            .expect("unexpected EOF");
         assert_eq!(received, payload);
 
         stream_a.shutdown().await.expect("shutdown failed");
@@ -235,8 +262,7 @@ async fn stream_read_after_eof() {
 
     with_timeout(DEFAULT_TIMEOUT, async {
         let runtime = create_runtime();
-        let (stream_a, mut stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, mut stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         stream_a.shutdown().await.expect("shutdown failed");
 
@@ -244,8 +270,10 @@ async fn stream_read_after_eof() {
         assert!(first.is_none(), "expected None on first read after EOF");
 
         let second = stream_b.read().await;
-        assert!(second.is_err() || second.unwrap().is_none(),
-            "expected error or None on repeated read after EOF");
+        assert!(
+            second.is_err() || second.unwrap().is_none(),
+            "expected error or None on repeated read after EOF"
+        );
     })
     .await;
 }
@@ -256,8 +284,7 @@ async fn stream_destroy_immediate() {
 
     with_timeout(DEFAULT_TIMEOUT, async {
         let runtime = create_runtime();
-        let (stream_a, _stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, _stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         stream_a.destroy().await.expect("destroy failed");
     })
@@ -270,8 +297,7 @@ async fn stream_write_after_shutdown() {
 
     with_timeout(DEFAULT_TIMEOUT, async {
         let runtime = create_runtime();
-        let (stream_a, _stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, _stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         stream_a.shutdown().await.expect("shutdown failed");
 

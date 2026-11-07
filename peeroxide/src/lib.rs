@@ -77,11 +77,11 @@ mod swarm;
 
 pub use error::SwarmError;
 pub use peer_info::{PeerInfo, Priority};
-pub use swarm::{spawn, JoinOpts, SwarmConfig, SwarmConnection, SwarmHandle};
+pub use swarm::{JoinOpts, SwarmConfig, SwarmConnection, SwarmHandle, spawn};
 
 // Re-export commonly used types from peeroxide-dht.
 pub use peeroxide_dht::crypto::hash as discovery_key;
 pub use peeroxide_dht::hyperdht::{
-    HyperDhtHandle, ImmutablePutResult, KeyPair, MutableGetResult, MutablePutResult,
-    DEFAULT_BOOTSTRAP,
+    DEFAULT_BOOTSTRAP, HyperDhtHandle, ImmutablePutResult, KeyPair, MutableGetResult,
+    MutablePutResult,
 };

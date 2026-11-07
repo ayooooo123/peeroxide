@@ -91,9 +91,7 @@ pub fn parse_force_relay_env() -> Result<Option<([u8; 32], std::net::SocketAddr)
     };
 
     let (pk_hex, addr_str) = raw.split_once('@').ok_or_else(|| {
-        format!(
-            "PEEROXIDE_FORCE_RELAY: expected <pubkey_hex>@<host:port>, got {raw:?}"
-        )
+        format!("PEEROXIDE_FORCE_RELAY: expected <pubkey_hex>@<host:port>, got {raw:?}")
     })?;
 
     if pk_hex.len() != 64 {
@@ -103,9 +101,8 @@ pub fn parse_force_relay_env() -> Result<Option<([u8; 32], std::net::SocketAddr)
         ));
     }
 
-    let pk_bytes = hex::decode(pk_hex).map_err(|e| {
-        format!("PEEROXIDE_FORCE_RELAY: invalid hex in pubkey: {e}")
-    })?;
+    let pk_bytes = hex::decode(pk_hex)
+        .map_err(|e| format!("PEEROXIDE_FORCE_RELAY: invalid hex in pubkey: {e}"))?;
     if pk_bytes.len() != 32 {
         return Err(format!(
             "PEEROXIDE_FORCE_RELAY: decoded pubkey is {} bytes, expected 32",
@@ -152,7 +149,7 @@ pub fn apply_force_relay_env(swarm_config: &mut peeroxide::SwarmConfig) -> bool 
 
 #[cfg(unix)]
 pub async fn sigterm_recv() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut s = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
     s.recv().await;
 }
@@ -252,8 +249,14 @@ mod tests {
             node: Default::default(),
         };
         let bootstrap = resolve_bootstrap(&cfg);
-        let default: Vec<String> = peeroxide::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect();
-        assert_eq!(bootstrap, default, "bare command with no config should auto-public");
+        let default: Vec<String> = peeroxide::DEFAULT_BOOTSTRAP
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            bootstrap, default,
+            "bare command with no config should auto-public"
+        );
     }
 
     #[test]
@@ -264,7 +267,10 @@ mod tests {
             node: Default::default(),
         };
         let bootstrap = resolve_bootstrap(&cfg);
-        let default: Vec<String> = peeroxide::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect();
+        let default: Vec<String> = peeroxide::DEFAULT_BOOTSTRAP
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(bootstrap, default);
     }
 
@@ -276,7 +282,10 @@ mod tests {
             node: Default::default(),
         };
         let bootstrap = resolve_bootstrap(&cfg);
-        assert!(bootstrap.is_empty(), "--no-public with no custom bootstrap → empty");
+        assert!(
+            bootstrap.is_empty(),
+            "--no-public with no custom bootstrap → empty"
+        );
     }
 
     #[test]
@@ -299,9 +308,15 @@ mod tests {
         };
         let bootstrap = resolve_bootstrap(&cfg);
         assert!(bootstrap.contains(&"x:1234".to_string()));
-        let default: Vec<String> = peeroxide::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect();
+        let default: Vec<String> = peeroxide::DEFAULT_BOOTSTRAP
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         for addr in &default {
-            assert!(bootstrap.contains(addr), "public should add default bootstrap");
+            assert!(
+                bootstrap.contains(addr),
+                "public should add default bootstrap"
+            );
         }
     }
 
@@ -313,7 +328,11 @@ mod tests {
             node: Default::default(),
         };
         let bootstrap = resolve_bootstrap(&cfg);
-        assert_eq!(bootstrap, vec!["x:1234"], "--no-public keeps custom, removes defaults");
+        assert_eq!(
+            bootstrap,
+            vec!["x:1234"],
+            "--no-public keeps custom, removes defaults"
+        );
     }
 
     #[test]
@@ -325,7 +344,10 @@ mod tests {
         };
         let bootstrap = resolve_bootstrap(&cfg);
         assert!(bootstrap.contains(&"y:5678".to_string()));
-        let default: Vec<String> = peeroxide::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect();
+        let default: Vec<String> = peeroxide::DEFAULT_BOOTSTRAP
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         for addr in &default {
             assert!(bootstrap.contains(addr));
         }
@@ -661,9 +683,7 @@ mod tests {
         let pk_hex = "0123456789abcdef".repeat(4);
         let value = format!("{pk_hex}@1.2.3.4:49737");
         with_force_relay_env(Some(&value), || {
-            let (pk, addr) = parse_force_relay_env()
-                .expect("ok")
-                .expect("some");
+            let (pk, addr) = parse_force_relay_env().expect("ok").expect("some");
             assert_eq!(hex::encode(pk), pk_hex);
             assert_eq!(addr.to_string(), "1.2.3.4:49737");
         });
@@ -674,9 +694,7 @@ mod tests {
         let pk_hex = "0".repeat(64);
         let value = format!("{pk_hex}@8.8.8.8:49737");
         with_force_relay_env(Some(&value), || {
-            let (pk, addr) = parse_force_relay_env()
-                .expect("ok")
-                .expect("some");
+            let (pk, addr) = parse_force_relay_env().expect("ok").expect("some");
             assert_eq!(pk, [0u8; 32]);
             assert_eq!(addr.to_string(), "8.8.8.8:49737");
         });

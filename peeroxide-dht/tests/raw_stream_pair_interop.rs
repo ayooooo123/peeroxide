@@ -22,7 +22,10 @@ async fn raw_stream_connect_over_a_control_connection() {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let script = format!("{}/../tests/node/raw-stream-pair.js", env!("CARGO_MANIFEST_DIR"));
+    let script = format!(
+        "{}/../tests/node/raw-stream-pair.js",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let mut child = tokio::process::Command::new("node")
         .arg(script)
         .stdin(std::process::Stdio::piped())
@@ -62,9 +65,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut raw = node
         .create_raw_stream(
             &runtime,
-            RawStreamOptions::new().with_firewall(move |_, port, host| {
-                host != remote_ip || port != remote_port
-            }),
+            RawStreamOptions::new()
+                .with_firewall(move |_, port, host| host != remote_ip || port != remote_port),
         )
         .await?;
 

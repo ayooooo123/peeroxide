@@ -163,9 +163,9 @@ pub async fn run(config: SessionConfig, cfg: &ResolvedConfig) -> i32 {
         None
     };
 
-    let ownership_proof = feed_keypair.as_ref().map(|fkp| {
-        crypto::ownership_proof(&id_keypair.secret_key, &fkp.public_key, &channel_key)
-    });
+    let ownership_proof = feed_keypair
+        .as_ref()
+        .map(|fkp| crypto::ownership_proof(&id_keypair.secret_key, &fkp.public_key, &channel_key));
 
     let feed_state = feed_keypair.as_ref().map(|fkp| {
         feed::FeedState::new(
@@ -199,9 +199,11 @@ pub async fn run(config: SessionConfig, cfg: &ResolvedConfig) -> i32 {
     } else {
         None
     };
-    if let (Some(dm_extras), Some(inv_kp), Some(fs)) =
-        (dm.as_ref(), invite_feed_keypair.as_ref(), feed_state.as_ref())
-    {
+    if let (Some(dm_extras), Some(inv_kp), Some(fs)) = (
+        dm.as_ref(),
+        invite_feed_keypair.as_ref(),
+        feed_state.as_ref(),
+    ) {
         if let Some(msg_text) = dm_extras.initial_message.as_ref() {
             if let Err(e) = inbox::send_dm_invite(
                 &handle,

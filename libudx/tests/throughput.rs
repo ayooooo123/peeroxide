@@ -18,8 +18,7 @@ async fn throughput_sustained() {
 
     with_timeout(Duration::from_secs(120), async {
         let runtime = create_runtime();
-        let (stream_a, mut stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, mut stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         let total = 50 * 1024 * 1024;
         let payload = random_payload(total);
@@ -77,8 +76,12 @@ async fn throughput_multiple_streams() {
 
             let sa = rt.create_stream(id_a).await.expect("create sa");
             let mut sb = rt.create_stream(id_b).await.expect("create sb");
-            sa.connect(&socket_a, id_b, addr_b).await.expect("connect sa");
-            sb.connect(&socket_b, id_a, addr_a).await.expect("connect sb");
+            sa.connect(&socket_a, id_b, addr_b)
+                .await
+                .expect("connect sa");
+            sb.connect(&socket_b, id_a, addr_a)
+                .await
+                .expect("connect sb");
 
             let payload = random_payload(per_stream + i as usize);
 
@@ -124,8 +127,7 @@ async fn heartbeat_keeps_alive() {
 
     with_timeout(Duration::from_secs(15), async {
         let runtime = create_runtime();
-        let (stream_a, mut stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&runtime).await;
+        let (stream_a, mut stream_b, _socket_a, _socket_b) = create_connected_pair(&runtime).await;
 
         stream_a.write(b"before idle").await.expect("write 1");
         let received = stream_b.read().await.expect("read 1").expect("EOF");

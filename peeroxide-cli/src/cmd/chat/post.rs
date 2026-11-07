@@ -189,18 +189,15 @@ pub fn post_message(
     let h = handle.clone();
     tokio::spawn(async move {
         // immutable_put for message (and summary if needed)
-        let (msg_put, _) = tokio::join!(
-            h.immutable_put(&encrypted),
-            async {
-                if let Some(data) = summary_data {
-                    if let Err(e) = h.immutable_put(&data).await {
-                        crate::cmd::chat::tui::emit_notice(format!(
-                            "warning: summary immutable_put failed: {e}"
-                        ));
-                    }
+        let (msg_put, _) = tokio::join!(h.immutable_put(&encrypted), async {
+            if let Some(data) = summary_data {
+                if let Err(e) = h.immutable_put(&data).await {
+                    crate::cmd::chat::tui::emit_notice(format!(
+                        "warning: summary immutable_put failed: {e}"
+                    ));
                 }
             }
-        );
+        });
 
         if let Err(e) = msg_put {
             crate::cmd::chat::tui::emit_notice(format!(
@@ -241,9 +238,7 @@ pub fn post_message(
         );
 
         if let Err(e) = put_res {
-            crate::cmd::chat::tui::emit_notice(format!(
-                "warning: feed mutable_put failed: {e}"
-            ));
+            crate::cmd::chat::tui::emit_notice(format!("warning: feed mutable_put failed: {e}"));
         }
     });
 

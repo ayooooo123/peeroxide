@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use peeroxide::{spawn, JoinOpts, KeyPair, SwarmConfig};
+use peeroxide::{JoinOpts, KeyPair, SwarmConfig, spawn};
 use peeroxide_dht::crypto::hash;
 
 fn test_topic() -> [u8; 32] {
@@ -68,7 +68,11 @@ impl NodeRelay {
         let addr = std::net::SocketAddr::new(ip, port);
 
         println!("[relay] started — pk: {pk_hex}, addr: {addr}");
-        Self { child, public_key, addr }
+        Self {
+            child,
+            public_key,
+            addr,
+        }
     }
 }
 
@@ -101,10 +105,7 @@ async fn main() {
     // 2. Start Rust server with relay_through pointing to the Node.js relay.
     let server_kp = KeyPair::generate();
     let server_pk = server_kp.public_key;
-    println!(
-        "[server] pk: {}",
-        hex::encode(&server_pk[..8])
-    );
+    println!("[server] pk: {}", hex::encode(&server_pk[..8]));
 
     let mut server_config = SwarmConfig::with_public_bootstrap();
     server_config.key_pair = Some(server_kp);
@@ -115,14 +116,11 @@ async fn main() {
         spawn(server_config).await.expect("server spawn");
 
     server_handle
-        .join(
-            topic,
-            {
-                let mut opts = JoinOpts::default();
-                opts.client = false;
-                opts
-            },
-        )
+        .join(topic, {
+            let mut opts = JoinOpts::default();
+            opts.client = false;
+            opts
+        })
         .await
         .expect("server join");
     server_handle.flush().await.expect("server flush");
@@ -130,10 +128,7 @@ async fn main() {
 
     // 3. Start Rust client.
     let client_kp = KeyPair::generate();
-    println!(
-        "[client] pk: {}",
-        hex::encode(&client_kp.public_key[..8])
-    );
+    println!("[client] pk: {}", hex::encode(&client_kp.public_key[..8]));
 
     let mut client_config = SwarmConfig::with_public_bootstrap();
     client_config.key_pair = Some(client_kp);
@@ -142,14 +137,11 @@ async fn main() {
         spawn(client_config).await.expect("client spawn");
 
     client_handle
-        .join(
-            topic,
-            {
-                let mut opts = JoinOpts::default();
-                opts.server = false;
-                opts
-            },
-        )
+        .join(topic, {
+            let mut opts = JoinOpts::default();
+            opts.server = false;
+            opts
+        })
         .await
         .expect("client join");
 
@@ -198,10 +190,7 @@ async fn main() {
         .expect("server read timeout")
         .expect("server read error")
         .expect("server got EOF");
-    println!(
-        "[server] recv: {}",
-        String::from_utf8_lossy(&server_recv)
-    );
+    println!("[server] recv: {}", String::from_utf8_lossy(&server_recv));
     assert_eq!(server_recv, client_msg);
 
     let server_msg = b"hello through relay from server";
@@ -218,10 +207,7 @@ async fn main() {
         .expect("client read timeout")
         .expect("client read error")
         .expect("client got EOF");
-    println!(
-        "[client] recv: {}",
-        String::from_utf8_lossy(&client_recv)
-    );
+    println!("[client] recv: {}", String::from_utf8_lossy(&client_recv));
     assert_eq!(client_recv, server_msg);
 
     println!("\n=== PASS: bidirectional data exchange through relay ===");

@@ -5,13 +5,11 @@
 //! Usage:
 //!   cargo run --example hello -p peeroxide
 
-use peeroxide::{discovery_key, spawn, JoinOpts, SwarmConfig};
+use peeroxide::{JoinOpts, SwarmConfig, discovery_key, spawn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let config = SwarmConfig::with_public_bootstrap();
     let (_task, handle, mut conn_rx) = spawn(config).await?;

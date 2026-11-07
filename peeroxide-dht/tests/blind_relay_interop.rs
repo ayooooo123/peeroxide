@@ -30,7 +30,10 @@ fn plain_config(bootstrap: Vec<String>) -> HyperDhtConfig {
 #[tokio::test]
 async fn peeroxide_client_relayed_through_a_js_relay() {
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let script = format!("{}/../tests/node/relay-through-peer.js", env!("CARGO_MANIFEST_DIR"));
+        let script = format!(
+            "{}/../tests/node/relay-through-peer.js",
+            env!("CARGO_MANIFEST_DIR")
+        );
         let mut child = tokio::process::Command::new("node")
             .arg(script)
             .stdin(std::process::Stdio::piped())
@@ -50,16 +53,17 @@ async fn peeroxide_client_relayed_through_a_js_relay() {
             .expect("key length");
 
         let runtime = UdxRuntime::new().expect("runtime");
-        let (_task, dht, _events) = hyperdht::spawn(
-            &runtime,
-            plain_config(vec![format!("127.0.0.1:{port}")]),
-        )
-        .await
-        .expect("DHT");
+        let (_task, dht, _events) =
+            hyperdht::spawn(&runtime, plain_config(vec![format!("127.0.0.1:{port}")]))
+                .await
+                .expect("DHT");
         dht.fully_bootstrapped().await.expect("bootstrapped");
 
         let keys = KeyPair::generate();
-        let mut conn = dht.connect(&keys, echo_key, &runtime).await.expect("relayed connect");
+        let mut conn = dht
+            .connect(&keys, echo_key, &runtime)
+            .await
+            .expect("relayed connect");
         conn.stream.write(b"through-js-relay").await.expect("write");
         assert_eq!(
             conn.stream.read().await.expect("read").as_deref(),
@@ -93,7 +97,10 @@ async fn js_peers_pair_through_a_peeroxide_relay() {
             RelayServiceConfig::default(),
         );
 
-        let script = format!("{}/../tests/node/relay-via-rust.js", env!("CARGO_MANIFEST_DIR"));
+        let script = format!(
+            "{}/../tests/node/relay-via-rust.js",
+            env!("CARGO_MANIFEST_DIR")
+        );
         let mut child = tokio::process::Command::new("node")
             .arg(script)
             .arg(port.to_string())
@@ -109,10 +116,21 @@ async fn js_peers_pair_through_a_peeroxide_relay() {
         output.read_line(&mut line).await.expect("JS result");
         let result: serde_json::Value = serde_json::from_str(&line).expect("result JSON");
         assert_eq!(result["data"], "js-through-rust-relay", "JS result: {line}");
-        assert_eq!(result["relayed"], true, "echo did not arrive from the relay socket: {line}");
+        assert_eq!(
+            result["relayed"], true,
+            "echo did not arrive from the relay socket: {line}"
+        );
         let stats = relay.stats();
-        assert!(stats.pairings_matched >= 1, "relay matched {} pairings", stats.pairings_matched);
-        assert!(stats.sessions_accepted >= 2, "relay saw {} sessions, expected both peers", stats.sessions_accepted);
+        assert!(
+            stats.pairings_matched >= 1,
+            "relay matched {} pairings",
+            stats.pairings_matched
+        );
+        assert!(
+            stats.sessions_accepted >= 2,
+            "relay saw {} sessions, expected both peers",
+            stats.sessions_accepted
+        );
 
         let _ = input.write_all(b"\n").await;
         dht.destroy().await.expect("destroy");

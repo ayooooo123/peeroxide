@@ -11,7 +11,7 @@ use crate::cmd::chat::crypto;
 use crate::cmd::chat::debug;
 use crate::cmd::chat::display::DisplayMessage;
 use crate::cmd::chat::known_users;
-use crate::cmd::chat::ordering::{chain_sort, ChainGate, DedupRing, PendingMessage, SubmitOutcome};
+use crate::cmd::chat::ordering::{ChainGate, DedupRing, PendingMessage, SubmitOutcome, chain_sort};
 use crate::cmd::chat::probe;
 use crate::cmd::chat::tui::{DhtActivityGuard, RecvFetchGuard, StatusState};
 use crate::cmd::chat::wire::{self, FeedRecord, MessageEnvelope, SummaryBlock};
@@ -263,7 +263,9 @@ pub async fn run_reader(
             }
             for result in &results {
                 for peer in &result.peers {
-                    known_feeds.entry(peer.public_key).or_insert_with(KnownFeed::new);
+                    known_feeds
+                        .entry(peer.public_key)
+                        .or_insert_with(KnownFeed::new);
                 }
             }
         }
@@ -469,8 +471,7 @@ pub async fn run_reader(
 
         // Expire feeds inactive for longer than DHT TTL
         let now = Instant::now();
-        known_feeds
-            .retain(|_pk, f| now.duration_since(f.last_active).as_secs() < FEED_EXPIRY_SECS);
+        known_feeds.retain(|_pk, f| now.duration_since(f.last_active).as_secs() < FEED_EXPIRY_SECS);
 
         // --- Feed polling: fetch all due feeds concurrently ---
         let due_feeds: Vec<([u8; 32], u64)> = known_feeds
@@ -487,7 +488,11 @@ pub async fn run_reader(
             debug::log_event(
                 "Feed poll batch",
                 "mutable_get",
-                &format!("feeds_due={}, total_known={}", due_feeds.len(), known_feeds.len()),
+                &format!(
+                    "feeds_due={}, total_known={}",
+                    due_feeds.len(),
+                    known_feeds.len()
+                ),
             );
         }
 

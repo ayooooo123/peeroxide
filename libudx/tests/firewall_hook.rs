@@ -3,7 +3,10 @@
 mod common;
 
 use common::{create_bound_socket, create_runtime, with_timeout};
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 #[tokio::test]
@@ -45,8 +48,14 @@ async fn firewall_hook_accepts_first_packet() {
             .expect("stream_a read")
             .expect("stream_a unexpected EOF");
         assert_eq!(&data[..], msg.as_ref());
-        stream_b.write(b"second packet").await.expect("second write");
-        assert_eq!(stream_a.read().await.expect("second read").unwrap(), b"second packet");
+        stream_b
+            .write(b"second packet")
+            .await
+            .expect("second write");
+        assert_eq!(
+            stream_a.read().await.expect("second read").unwrap(),
+            b"second packet"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     })
     .await;
@@ -88,12 +97,18 @@ async fn write_before_hook_fires_is_delivered_after_it() {
             .set_firewall_hook(&socket_a, 42, |_, _, _| true)
             .expect("firewall");
         let early = tokio::spawn(async move {
-            stream_a.write(b"queued before the peer was known").await.expect("early write");
+            stream_a
+                .write(b"queued before the peer was known")
+                .await
+                .expect("early write");
             stream_a
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         let mut stream_b = rt.create_stream(42).await.expect("stream b");
-        stream_b.connect(&socket_b, 41, addr_a).await.expect("connect b");
+        stream_b
+            .connect(&socket_b, 41, addr_a)
+            .await
+            .expect("connect b");
         stream_b.write(b"knock").await.expect("knock");
         assert_eq!(
             stream_b.read().await.expect("read").unwrap(),
@@ -113,8 +128,14 @@ async fn async_stream_reports_remote_destroy() {
         let (socket_b, addr_b) = create_bound_socket(&rt).await;
         let stream_a = rt.create_stream(31).await.expect("stream a");
         let stream_b = rt.create_stream(32).await.expect("stream b");
-        stream_a.connect(&socket_a, 32, addr_b).await.expect("connect a");
-        stream_b.connect(&socket_b, 31, addr_a).await.expect("connect b");
+        stream_a
+            .connect(&socket_a, 32, addr_b)
+            .await
+            .expect("connect a");
+        stream_b
+            .connect(&socket_b, 31, addr_a)
+            .await
+            .expect("connect b");
         let mut stream = stream_a.into_async_stream();
         let closed = stream.take_close_notification().expect("notification");
         stream_b.destroy().await.expect("destroy");

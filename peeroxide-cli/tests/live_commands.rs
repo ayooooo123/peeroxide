@@ -34,8 +34,11 @@ async fn test_live_lookup() {
         let output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--public",
-                    "lookup", &topic, "--json",
+                    "--no-default-config",
+                    "--public",
+                    "lookup",
+                    &topic,
+                    "--json",
                 ])
                 .output()
                 .expect("failed to run lookup")
@@ -62,8 +65,12 @@ async fn test_live_announce_then_lookup() {
 
         let mut announce = Command::new(bin_path())
             .args([
-                "--no-default-config", "--public",
-                "announce", &topic, "--duration", "30",
+                "--no-default-config",
+                "--public",
+                "announce",
+                &topic,
+                "--duration",
+                "30",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -76,8 +83,11 @@ async fn test_live_announce_then_lookup() {
         let output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--public",
-                    "lookup", &topic_clone, "--json",
+                    "--no-default-config",
+                    "--public",
+                    "lookup",
+                    &topic_clone,
+                    "--json",
                 ])
                 .output()
                 .expect("failed to run lookup")
@@ -90,10 +100,7 @@ async fn test_live_announce_then_lookup() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        assert!(
-            output.status.success(),
-            "live lookup failed: {stderr}"
-        );
+        assert!(output.status.success(), "live lookup failed: {stderr}");
 
         assert!(
             stdout.contains("\"peers_found\""),
@@ -102,7 +109,10 @@ async fn test_live_announce_then_lookup() {
     })
     .await;
 
-    assert!(result.is_ok(), "test_live_announce_then_lookup timed out after 60s");
+    assert!(
+        result.is_ok(),
+        "test_live_announce_then_lookup timed out after 60s"
+    );
 }
 
 #[tokio::test]
@@ -116,8 +126,13 @@ async fn test_live_dd_roundtrip() {
         let msg_path_str = msg_path.to_str().unwrap().to_string();
         let mut leave_child = Command::new(bin_path())
             .args([
-                "--no-default-config", "--public",
-                "dd", "put", &msg_path_str, "--ttl", "45",
+                "--no-default-config",
+                "--public",
+                "dd",
+                "put",
+                &msg_path_str,
+                "--ttl",
+                "45",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -146,9 +161,13 @@ async fn test_live_dd_roundtrip() {
         let pickup_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--public",
-                    "dd", "get", &pickup_key,
-                    "--timeout", "30",
+                    "--no-default-config",
+                    "--public",
+                    "dd",
+                    "get",
+                    &pickup_key,
+                    "--timeout",
+                    "30",
                     "--no-ack",
                 ])
                 .output()
@@ -168,7 +187,8 @@ async fn test_live_dd_roundtrip() {
         );
 
         assert_eq!(
-            pickup_stdout.as_ref(), "live dd test message",
+            pickup_stdout.as_ref(),
+            "live dd test message",
             "get content mismatch.\nstdout: {pickup_stdout}\nstderr: {pickup_stderr}"
         );
     })
@@ -191,8 +211,11 @@ async fn test_live_cp_send_recv() {
 
         let mut send_child = Command::new(bin_path())
             .args([
-                "--no-default-config", "--public",
-                "cp", "send", &send_path_str,
+                "--no-default-config",
+                "--public",
+                "cp",
+                "send",
+                &send_path_str,
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -222,10 +245,15 @@ async fn test_live_cp_send_recv() {
         let recv_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--public",
-                    "cp", "recv", &topic, &recv_path_str,
+                    "--no-default-config",
+                    "--public",
+                    "cp",
+                    "recv",
+                    &topic,
+                    &recv_path_str,
                     "--yes",
-                    "--timeout", "30",
+                    "--timeout",
+                    "30",
                 ])
                 .output()
                 .expect("failed to run cp recv")
@@ -273,8 +301,11 @@ async fn test_live_cp_send_recv_no_lan() {
 
         let mut send_child = Command::new(bin_path())
             .args([
-                "--no-default-config", "--public",
-                "cp", "send", &send_path_str,
+                "--no-default-config",
+                "--public",
+                "cp",
+                "send",
+                &send_path_str,
             ])
             .env("PEEROXIDE_LOCAL_CONNECTION", "false")
             .stdout(Stdio::piped())
@@ -309,10 +340,15 @@ async fn test_live_cp_send_recv_no_lan() {
         let recv_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--public",
-                    "cp", "recv", &topic, &recv_path_str,
+                    "--no-default-config",
+                    "--public",
+                    "cp",
+                    "recv",
+                    &topic,
+                    &recv_path_str,
                     "--yes",
-                    "--timeout", "45",
+                    "--timeout",
+                    "45",
                 ])
                 .env("PEEROXIDE_LOCAL_CONNECTION", "false")
                 .env("RUST_LOG", "peeroxide_dht=debug")
@@ -356,7 +392,10 @@ async fn test_live_cp_send_recv_no_lan() {
     })
     .await;
 
-    assert!(result.is_ok(), "test_live_cp_send_recv_no_lan timed out after 90s");
+    assert!(
+        result.is_ok(),
+        "test_live_cp_send_recv_no_lan timed out after 90s"
+    );
 }
 
 /// Force the data path through a blind-relay by advertising `relay_through` from the
@@ -389,8 +428,11 @@ async fn test_live_cp_send_recv_force_relay() {
 
         let mut send_child = Command::new(bin_path())
             .args([
-                "--no-default-config", "--public",
-                "cp", "send", &send_path_str,
+                "--no-default-config",
+                "--public",
+                "cp",
+                "send",
+                &send_path_str,
             ])
             .env("PEEROXIDE_FORCE_RELAY", &placeholder_relay)
             .env("NO_COLOR", "1")
@@ -422,10 +464,15 @@ async fn test_live_cp_send_recv_force_relay() {
         let recv_output = tokio::task::spawn_blocking(move || {
             Command::new(bin_path())
                 .args([
-                    "--no-default-config", "--public",
-                    "cp", "recv", &topic, &recv_path_str,
+                    "--no-default-config",
+                    "--public",
+                    "cp",
+                    "recv",
+                    &topic,
+                    &recv_path_str,
                     "--yes",
-                    "--timeout", "30",
+                    "--timeout",
+                    "30",
                 ])
                 .env("RUST_LOG", "peeroxide_dht=debug,peeroxide=debug")
                 .env("NO_COLOR", "1")

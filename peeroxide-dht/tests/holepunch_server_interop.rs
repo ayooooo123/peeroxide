@@ -39,7 +39,14 @@ impl JsPeer {
         let mut line = String::new();
         output.read_line(&mut line).await?;
         let ready = serde_json::from_str(&line)?;
-        Ok((Self { child, output, input }, ready))
+        Ok((
+            Self {
+                child,
+                output,
+                input,
+            },
+            ready,
+        ))
     }
 
     async fn read_json(&mut self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -64,12 +71,15 @@ fn firewalled_config(bootstrap: u64) -> HyperDhtConfig {
 async fn js_client_holepunches_into_a_rust_server() {
     let _ = tracing_subscriber::fmt::try_init();
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let (mut js, ready) = JsPeer::start("holepunch-client.js").await.expect("JS client");
+        let (mut js, ready) = JsPeer::start("holepunch-client.js")
+            .await
+            .expect("JS client");
         let port = ready["port"].as_u64().expect("port");
 
         let runtime = UdxRuntime::new().expect("runtime");
-        let (_task, dht, events) =
-            hyperdht::spawn(&runtime, firewalled_config(port)).await.expect("DHT");
+        let (_task, dht, events) = hyperdht::spawn(&runtime, firewalled_config(port))
+            .await
+            .expect("DHT");
         dht.fully_bootstrapped().await.expect("bootstrapped");
 
         let keys = KeyPair::generate();
@@ -85,8 +95,16 @@ async fn js_client_holepunches_into_a_rust_server() {
             .await
             .expect("ask JS to dial");
 
-        let mut accepted = server.accept().await.expect("server accepted the punched client");
-        let data = accepted.stream.read().await.expect("read JS").expect("payload");
+        let mut accepted = server
+            .accept()
+            .await
+            .expect("server accepted the punched client");
+        let data = accepted
+            .stream
+            .read()
+            .await
+            .expect("read JS")
+            .expect("payload");
         assert_eq!(data, b"js-client");
         accepted.stream.write(&data).await.expect("echo");
         let echoed = js.read_json().await.expect("JS echo");
@@ -104,7 +122,9 @@ async fn js_client_holepunches_into_a_rust_server() {
 async fn rust_client_holepunches_into_a_js_server() {
     let _ = tracing_subscriber::fmt::try_init();
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let (_js, ready) = JsPeer::start("holepunch-server.js").await.expect("JS server");
+        let (_js, ready) = JsPeer::start("holepunch-server.js")
+            .await
+            .expect("JS server");
         let port = ready["port"].as_u64().expect("port");
         let js_key: [u8; 32] = hex::decode(ready["publicKey"].as_str().expect("key"))
             .expect("key hex")
@@ -112,12 +132,16 @@ async fn rust_client_holepunches_into_a_js_server() {
             .expect("key length");
 
         let runtime = UdxRuntime::new().expect("runtime");
-        let (_task, dht, _events) =
-            hyperdht::spawn(&runtime, firewalled_config(port)).await.expect("DHT");
+        let (_task, dht, _events) = hyperdht::spawn(&runtime, firewalled_config(port))
+            .await
+            .expect("DHT");
         dht.fully_bootstrapped().await.expect("bootstrapped");
 
         let keys = KeyPair::generate();
-        let mut client = dht.connect(&keys, js_key, &runtime).await.expect("punched connect");
+        let mut client = dht
+            .connect(&keys, js_key, &runtime)
+            .await
+            .expect("punched connect");
         client.stream.write(b"rust-client").await.expect("write");
         assert_eq!(
             client.stream.read().await.expect("read").as_deref(),
@@ -149,12 +173,15 @@ fn open_config(bootstrap: u64) -> HyperDhtConfig {
 async fn js_client_reaches_an_open_rust_server() {
     let _ = tracing_subscriber::fmt::try_init();
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let (mut js, ready) = JsPeer::start("holepunch-client.js").await.expect("JS client");
+        let (mut js, ready) = JsPeer::start("holepunch-client.js")
+            .await
+            .expect("JS client");
         let port = ready["port"].as_u64().expect("port");
 
         let runtime = UdxRuntime::new().expect("runtime");
-        let (_task, dht, events) =
-            hyperdht::spawn(&runtime, open_config(port)).await.expect("DHT");
+        let (_task, dht, events) = hyperdht::spawn(&runtime, open_config(port))
+            .await
+            .expect("DHT");
         dht.fully_bootstrapped().await.expect("bootstrapped");
 
         let keys = KeyPair::generate();
@@ -170,8 +197,16 @@ async fn js_client_reaches_an_open_rust_server() {
             .await
             .expect("ask JS to dial");
 
-        let mut accepted = server.accept().await.expect("server accepted the firewalled client");
-        let data = accepted.stream.read().await.expect("read JS").expect("payload");
+        let mut accepted = server
+            .accept()
+            .await
+            .expect("server accepted the firewalled client");
+        let data = accepted
+            .stream
+            .read()
+            .await
+            .expect("read JS")
+            .expect("payload");
         assert_eq!(data, b"js-client");
         accepted.stream.write(&data).await.expect("echo");
         let echoed = js.read_json().await.expect("JS echo");

@@ -66,7 +66,9 @@ async fn settle() {
 
 #[tokio::test]
 async fn suspend_silences_the_node_and_resume_restores_it() {
-    let _ = tokio::time::timeout(TEST_TIMEOUT, run()).await.expect("suspend/resume timed out");
+    let _ = tokio::time::timeout(TEST_TIMEOUT, run())
+        .await
+        .expect("suspend/resume timed out");
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -103,12 +105,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut seen = watcher.recv_start()?;
 
     // Baseline: while running, the node's request reaches the watcher.
-    assert!(node
-        .dht()
-        .request(short_request(), "127.0.0.1", watcher_port)
-        .await
-        .is_err());
-    assert!(next_datagram(&mut seen).await.is_some(), "no baseline datagram");
+    assert!(
+        node.dht()
+            .request(short_request(), "127.0.0.1", watcher_port)
+            .await
+            .is_err()
+    );
+    assert!(
+        next_datagram(&mut seen).await.is_some(),
+        "no baseline datagram"
+    );
 
     // ── Suspend ──────────────────────────────────────────────────────────
     node.suspend().await?;
@@ -121,7 +127,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .dht()
         .request(short_request(), "127.0.0.1", watcher_port)
         .await;
-    assert!(matches!(refused, Err(DhtError::Suspended)), "got {refused:?}");
+    assert!(
+        matches!(refused, Err(DhtError::Suspended)),
+        "got {refused:?}"
+    );
     let lookup = node.lookup([7u8; 32]).await;
     assert!(lookup.is_err(), "lookup ran while suspended");
     let ping = bootstrap.dht().ping("127.0.0.1", address.port()).await;
@@ -139,7 +148,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     client.stream.write(b"after-resume").await?;
     let mut accepted = server.accept().await.expect("server accepted after resume");
-    assert_eq!(accepted.stream.read().await?, Some(b"after-resume".to_vec()));
+    assert_eq!(
+        accepted.stream.read().await?,
+        Some(b"after-resume".to_vec())
+    );
     accepted.stream.write(b"pong").await?;
     assert_eq!(client.stream.read().await?, Some(b"pong".to_vec()));
 
@@ -166,7 +178,10 @@ async fn suspend_fails_inflight_queries() {
         node.fully_bootstrapped().await.expect("bootstrapped");
 
         let watcher = runtime.create_socket().await.expect("socket");
-        watcher.bind("127.0.0.1:0".parse().unwrap()).await.expect("bind");
+        watcher
+            .bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind");
         let watcher_port = watcher.local_addr().await.expect("addr").port();
         let mut seen = watcher.recv_start().expect("recv");
         while seen.try_recv().is_ok() {}
@@ -186,7 +201,10 @@ async fn suspend_fails_inflight_queries() {
             .await
             .expect("in-flight request did not fail")
             .expect("task");
-        assert!(matches!(outcome, Err(DhtError::Suspended)), "got {outcome:?}");
+        assert!(
+            matches!(outcome, Err(DhtError::Suspended)),
+            "got {outcome:?}"
+        );
 
         while seen.try_recv().is_ok() {}
         settle().await;
@@ -210,18 +228,25 @@ async fn resume_falls_back_when_the_client_port_is_taken() {
         node.fully_bootstrapped().await.expect("bootstrapped");
 
         let watcher = runtime.create_socket().await.expect("socket");
-        watcher.bind("127.0.0.1:0".parse().unwrap()).await.expect("bind");
+        watcher
+            .bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind");
         let watcher_port = watcher.local_addr().await.expect("addr").port();
         let mut seen = watcher.recv_start().expect("recv");
 
         // A firewalled node sends from its client socket, so the datagram
         // source is the port `resume()` will try to rebind.
-        assert!(node
-            .dht()
-            .request(short_request(), "127.0.0.1", watcher_port)
+        assert!(
+            node.dht()
+                .request(short_request(), "127.0.0.1", watcher_port)
+                .await
+                .is_err()
+        );
+        let client_addr = next_datagram(&mut seen)
             .await
-            .is_err());
-        let client_addr = next_datagram(&mut seen).await.expect("no client datagram").addr;
+            .expect("no client datagram")
+            .addr;
 
         node.suspend().await.expect("suspend");
 
@@ -229,17 +254,27 @@ async fn resume_falls_back_when_the_client_port_is_taken() {
         let squatter = runtime.create_socket().await.expect("squatter");
         squatter.bind(client_addr).await.expect("squatter bind");
 
-        node.resume().await.expect("resume with the client port taken");
+        node.resume()
+            .await
+            .expect("resume with the client port taken");
 
         // The client socket moved to an ephemeral port and still works.
         while seen.try_recv().is_ok() {}
-        assert!(node
-            .dht()
-            .request(short_request(), "127.0.0.1", watcher_port)
+        assert!(
+            node.dht()
+                .request(short_request(), "127.0.0.1", watcher_port)
+                .await
+                .is_err()
+        );
+        let after = next_datagram(&mut seen)
             .await
-            .is_err());
-        let after = next_datagram(&mut seen).await.expect("no datagram after resume").addr;
-        assert_ne!(after.port(), client_addr.port(), "client socket kept the squatted port");
+            .expect("no datagram after resume")
+            .addr;
+        assert_ne!(
+            after.port(),
+            client_addr.port(),
+            "client socket kept the squatted port"
+        );
 
         node.destroy().await.expect("destroy");
     })
@@ -279,7 +314,10 @@ async fn suspend_closes_connections_made_by_connect() {
             .expect("connect");
         client.stream.write(b"hello").await.expect("write");
         let mut accepted = server.accept().await.expect("accepted");
-        assert_eq!(accepted.stream.read().await.expect("read"), Some(b"hello".to_vec()));
+        assert_eq!(
+            accepted.stream.read().await.expect("read"),
+            Some(b"hello".to_vec())
+        );
 
         b.suspend().await.expect("suspend");
 
@@ -291,7 +329,10 @@ async fn suspend_closes_connections_made_by_connect() {
         let peer_closed = tokio::time::timeout(Duration::from_secs(5), accepted.stream.read())
             .await
             .expect("server stream stayed open after the suspend");
-        assert!(matches!(peer_closed, Ok(None) | Err(_)), "got {peer_closed:?}");
+        assert!(
+            matches!(peer_closed, Ok(None) | Err(_)),
+            "got {peer_closed:?}"
+        );
 
         server.close().await;
         b.destroy().await.expect("client destroy");
@@ -310,7 +351,10 @@ async fn suspend_fails_bootstrap_waiters_and_resume_retries() {
 
         // A plain socket that never answers: the only bootstrap node.
         let watcher = runtime.create_socket().await.expect("socket");
-        watcher.bind("127.0.0.1:0".parse().unwrap()).await.expect("bind");
+        watcher
+            .bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind");
         let watcher_port = watcher.local_addr().await.expect("addr").port();
         let mut seen = watcher.recv_start().expect("recv");
 
@@ -327,7 +371,10 @@ async fn suspend_fails_bootstrap_waiters_and_resume_retries() {
         });
 
         // The bootstrap query is on the wire when the suspend lands.
-        assert!(next_datagram(&mut seen).await.is_some(), "no bootstrap datagram");
+        assert!(
+            next_datagram(&mut seen).await.is_some(),
+            "no bootstrap datagram"
+        );
 
         node.suspend().await.expect("suspend");
 

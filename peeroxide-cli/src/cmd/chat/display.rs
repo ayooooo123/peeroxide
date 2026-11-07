@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::cmd::chat::known_users::SharedKnownUsers;
 use super::names;
+use crate::cmd::chat::known_users::SharedKnownUsers;
 use crate::cmd::chat::profile::Friend;
 
 pub struct DisplayMessage {
@@ -313,10 +313,16 @@ mod tests {
             late: false,
         };
         let name_during_cooldown = state.format_display_name(&msg, 1100);
-        assert!(name_during_cooldown.ends_with('!'), "should show ! during 300s cooldown");
+        assert!(
+            name_during_cooldown.ends_with('!'),
+            "should show ! during 300s cooldown"
+        );
 
         let name_after_cooldown = state.format_display_name(&msg, 1400);
-        assert!(!name_after_cooldown.ends_with('!'), "should NOT show ! after 300s");
+        assert!(
+            !name_after_cooldown.ends_with('!'),
+            "should NOT show ! after 300s"
+        );
     }
 
     #[test]
@@ -432,7 +438,11 @@ mod tests {
             late: false,
         };
         let name = state.format_display_name(&msg, 0);
-        assert!(name.starts_with("(bestie)"), "friend alias should take priority: {}", name);
+        assert!(
+            name.starts_with("(bestie)"),
+            "friend alias should take priority: {}",
+            name
+        );
     }
 
     #[test]

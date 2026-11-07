@@ -17,8 +17,7 @@ async fn proxy_passthrough_no_impairments() {
         let runtime = create_runtime();
         let config = ProxyConfig::default();
 
-        let (stream_a, mut stream_b, _sa, _sb, _proxy) =
-            create_lossy_pair(&runtime, config).await;
+        let (stream_a, mut stream_b, _sa, _sb, _proxy) = create_lossy_pair(&runtime, config).await;
 
         let total = 256 * 1024;
         let payload = random_payload(total);
@@ -64,8 +63,7 @@ async fn retransmission_under_loss() {
             b_to_a: DirectionConfig::default(),
         };
 
-        let (stream_a, mut stream_b, _sa, _sb, _proxy) =
-            create_lossy_pair(&runtime, config).await;
+        let (stream_a, mut stream_b, _sa, _sb, _proxy) = create_lossy_pair(&runtime, config).await;
 
         let total = 256 * 1024;
         let payload = random_payload(total);
@@ -107,8 +105,7 @@ async fn rtt_under_delay() {
             ..Default::default()
         });
 
-        let (stream_a, mut stream_b, _sa, _sb, _proxy) =
-            create_lossy_pair(&runtime, config).await;
+        let (stream_a, mut stream_b, _sa, _sb, _proxy) = create_lossy_pair(&runtime, config).await;
 
         let start = Instant::now();
         stream_a.write(b"ping").await.expect("write");
@@ -167,14 +164,20 @@ async fn bulk_transfer_over_long_rtt_with_loss() {
         });
 
         let mut received = Vec::with_capacity(total);
-        reader.read_to_end(&mut received).await.expect("read_to_end");
+        reader
+            .read_to_end(&mut received)
+            .await
+            .expect("read_to_end");
         let _writer = write_task.await.expect("writer panicked");
         let elapsed = started.elapsed();
         eprintln!("2 MiB over 100 ms RTT, 1% loss: {elapsed:?}");
 
         verify_payload(&payload, &received);
         // One packet per ms would need ~1.8 s; a stalled pacer takes minutes.
-        assert!(elapsed < Duration::from_secs(30), "transfer took {elapsed:?}: pacer stalled");
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "transfer took {elapsed:?}: pacer stalled"
+        );
     })
     .await;
 }
@@ -195,8 +198,7 @@ async fn receive_window_respected() {
             },
         };
 
-        let (stream_a, mut stream_b, _sa, _sb, _proxy) =
-            create_lossy_pair(&runtime, config).await;
+        let (stream_a, mut stream_b, _sa, _sb, _proxy) = create_lossy_pair(&runtime, config).await;
 
         let total = 512 * 1024;
         let payload = random_payload(total);
@@ -243,8 +245,7 @@ async fn congestion_recovery_after_burst_loss() {
             b_to_a: DirectionConfig::default(),
         };
 
-        let (stream_a, mut stream_b, _sa, _sb, _proxy) =
-            create_lossy_pair(&runtime, config).await;
+        let (stream_a, mut stream_b, _sa, _sb, _proxy) = create_lossy_pair(&runtime, config).await;
 
         let total = 256 * 1024;
         let payload = random_payload(total);
@@ -286,8 +287,7 @@ async fn reorder_handling() {
             ..Default::default()
         });
 
-        let (stream_a, mut stream_b, _sa, _sb, _proxy) =
-            create_lossy_pair(&runtime, config).await;
+        let (stream_a, mut stream_b, _sa, _sb, _proxy) = create_lossy_pair(&runtime, config).await;
 
         let total = 1024 * 1024;
         let payload = random_payload(total);
@@ -330,8 +330,7 @@ async fn mtu_probing_discovers_path_mtu() {
             ..Default::default()
         });
 
-        let (stream_a, mut stream_b, _sa, _sb, _proxy) =
-            create_lossy_pair(&runtime, config).await;
+        let (stream_a, mut stream_b, _sa, _sb, _proxy) = create_lossy_pair(&runtime, config).await;
 
         let total = 128 * 1024;
         let payload = random_payload(total);
@@ -381,8 +380,7 @@ async fn mtu_probing_stays_at_base_when_clamped() {
             ..Default::default()
         });
 
-        let (stream_a, mut stream_b, _sa, _sb, _proxy) =
-            create_lossy_pair(&runtime, config).await;
+        let (stream_a, mut stream_b, _sa, _sb, _proxy) = create_lossy_pair(&runtime, config).await;
 
         let total = 64 * 1024;
         let payload = random_payload(total);
@@ -432,24 +430,18 @@ async fn destroy_during_pending_write() {
             ..Default::default()
         });
 
-        let (stream_a, stream_b, _sa, _sb, _proxy) =
-            create_lossy_pair(&runtime, config).await;
+        let (stream_a, stream_b, _sa, _sb, _proxy) = create_lossy_pair(&runtime, config).await;
 
-        let writer = tokio::spawn(async move {
-            stream_a.write(b"hello from a").await
-        });
+        let writer = tokio::spawn(async move { stream_a.write(b"hello from a").await });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         stream_b.destroy().await.expect("destroy");
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            writer,
-        )
-        .await
-        .expect("writer timed out — pending write was not drained")
-        .expect("writer task panicked");
+        let result = tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("writer timed out — pending write was not drained")
+            .expect("writer task panicked");
 
         assert!(
             result.is_err(),

@@ -46,9 +46,7 @@ pub async fn get_from_root(
     root_data: Vec<u8>,
     root_pk: [u8; 32],
     handle: HyperDhtHandle,
-    task_handle: tokio::task::JoinHandle<
-        Result<(), peeroxide_dht::hyperdht::HyperDhtError>,
-    >,
+    task_handle: tokio::task::JoinHandle<Result<(), peeroxide_dht::hyperdht::HyperDhtError>>,
     args: &GetArgs,
     progress: Arc<ProgressState>,
     reporter: ProgressReporter,

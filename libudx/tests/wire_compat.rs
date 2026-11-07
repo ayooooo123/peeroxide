@@ -8,7 +8,14 @@ use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-fn spawn_echo_server() -> (std::process::Child, BufReader<std::process::ChildStdout>, std::process::ChildStdin, u16, u32, u32) {
+fn spawn_echo_server() -> (
+    std::process::Child,
+    BufReader<std::process::ChildStdout>,
+    std::process::ChildStdin,
+    u16,
+    u32,
+    u32,
+) {
     let mut child = Command::new("node")
         .arg(node_script_path("udx-echo-server.js"))
         .stdin(Stdio::piped())
@@ -60,7 +67,9 @@ async fn connect_to_echo(
         .create_stream(node_remote_id)
         .await
         .expect("create stream");
-    let node_addr: SocketAddr = format!("127.0.0.1:{node_port}").parse().expect("parse addr");
+    let node_addr: SocketAddr = format!("127.0.0.1:{node_port}")
+        .parse()
+        .expect("parse addr");
     stream
         .connect(&socket, node_local_id, node_addr)
         .await
@@ -230,15 +239,23 @@ async fn wire_compat_multiple_streams() {
 
         let mut ready_line = String::new();
         reader.read_line(&mut ready_line).expect("read ready");
-        let ready: serde_json::Value = serde_json::from_str(ready_line.trim()).expect("parse ready");
+        let ready: serde_json::Value =
+            serde_json::from_str(ready_line.trim()).expect("parse ready");
         assert!(ready["ready"].as_bool().unwrap_or(false), "node not ready");
 
-        let node_addr: SocketAddr = format!("127.0.0.1:{node_port}").parse().expect("parse addr");
+        let node_addr: SocketAddr = format!("127.0.0.1:{node_port}")
+            .parse()
+            .expect("parse addr");
 
         let mut streams = Vec::new();
         for (rust_local, rust_remote) in &stream_configs {
-            let s = runtime.create_stream(*rust_local).await.expect("create stream");
-            s.connect(&socket, *rust_remote, node_addr).await.expect("connect");
+            let s = runtime
+                .create_stream(*rust_local)
+                .await
+                .expect("create stream");
+            s.connect(&socket, *rust_remote, node_addr)
+                .await
+                .expect("connect");
             streams.push(s);
         }
 
@@ -287,8 +304,15 @@ async fn wire_compat_message_ordering() {
             all_received.extend_from_slice(&chunk);
         }
 
-        assert_eq!(all_received.len(), all_sent.len(), "total byte count mismatch");
-        assert_eq!(all_received, all_sent, "message ordering or content mismatch");
+        assert_eq!(
+            all_received.len(),
+            all_sent.len(),
+            "total byte count mismatch"
+        );
+        assert_eq!(
+            all_received, all_sent,
+            "message ordering or content mismatch"
+        );
 
         stream.shutdown().await.expect("shutdown");
         let eof = stream.read().await.expect("read eof");

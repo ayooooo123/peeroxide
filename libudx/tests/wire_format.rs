@@ -27,7 +27,12 @@ fn decode_hex(hex: &str) -> Vec<u8> {
 }
 
 fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+    u32::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
 }
 
 #[test]
@@ -53,10 +58,16 @@ fn header_data_packet_fields() {
     assert_eq!(buf[3], 0, "data_offset should be 0 for simple data");
 
     let remote_id = read_u32_le(&buf, 4);
-    assert_eq!(remote_id, 42, "remote_id should be 42 (the REMOTE_ID used in capture)");
+    assert_eq!(
+        remote_id, 42,
+        "remote_id should be 42 (the REMOTE_ID used in capture)"
+    );
 
     let recv_window = read_u32_le(&buf, 8);
-    assert_eq!(recv_window, 4_194_304, "recv_window should be 4MB (DEFAULT_RWND_MAX)");
+    assert_eq!(
+        recv_window, 4_194_304,
+        "recv_window should be 4MB (DEFAULT_RWND_MAX)"
+    );
 
     let seq = read_u32_le(&buf, 12);
     assert_eq!(seq, 0, "first packet seq should be 0");
@@ -130,10 +141,22 @@ fn header_roundtrip_encode_decode() {
         assert_eq!(buf[1] as u64, header["version"].as_u64().unwrap());
         assert_eq!(buf[2] as u64, header["typeFlags"].as_u64().unwrap());
         assert_eq!(buf[3] as u64, header["dataOffset"].as_u64().unwrap());
-        assert_eq!(read_u32_le(&buf, 4) as u64, header["remoteId"].as_u64().unwrap());
-        assert_eq!(read_u32_le(&buf, 8) as u64, header["recvWindow"].as_u64().unwrap());
-        assert_eq!(read_u32_le(&buf, 12) as u64, header["seq"].as_u64().unwrap());
-        assert_eq!(read_u32_le(&buf, 16) as u64, header["ack"].as_u64().unwrap());
+        assert_eq!(
+            read_u32_le(&buf, 4) as u64,
+            header["remoteId"].as_u64().unwrap()
+        );
+        assert_eq!(
+            read_u32_le(&buf, 8) as u64,
+            header["recvWindow"].as_u64().unwrap()
+        );
+        assert_eq!(
+            read_u32_le(&buf, 12) as u64,
+            header["seq"].as_u64().unwrap()
+        );
+        assert_eq!(
+            read_u32_le(&buf, 16) as u64,
+            header["ack"].as_u64().unwrap()
+        );
     }
 }
 
@@ -146,7 +169,10 @@ fn header_data_offset_with_no_sack() {
         let data_offset = buf[3];
 
         if type_flags & FLAG_SACK == 0 {
-            assert_eq!(data_offset, 0, "data_offset should be 0 when SACK flag is not set");
+            assert_eq!(
+                data_offset, 0,
+                "data_offset should be 0 when SACK flag is not set"
+            );
         }
     }
 }

@@ -13,7 +13,11 @@ use peeroxide_dht::secret_stream::SecretStream;
 
 /// Forward datagrams from `listen` to `dest` after `delay`, one task per packet.
 async fn delay_proxy(dest: SocketAddr, delay: Duration) -> SocketAddr {
-    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind proxy"));
+    let sock = Arc::new(
+        tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy"),
+    );
     let addr = sock.local_addr().expect("proxy addr");
     tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
@@ -31,7 +35,9 @@ async fn delay_proxy(dest: SocketAddr, delay: Duration) -> SocketAddr {
 
 async fn bound(runtime: &UdxRuntime) -> (UdxSocket, SocketAddr) {
     let sock = runtime.create_socket().await.expect("socket");
-    sock.bind("127.0.0.1:0".parse().unwrap()).await.expect("bind");
+    sock.bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind");
     let addr = sock.local_addr().await.expect("local addr");
     (sock, addr)
 }
@@ -50,12 +56,26 @@ async fn bulk_frames_pipeline_over_simulated_rtt() {
 
         let stream_a = runtime.create_stream(1).await.expect("stream a");
         let stream_b = runtime.create_stream(2).await.expect("stream b");
-        stream_a.connect(&sock_a, 2, via_to_b).await.expect("connect a");
-        stream_b.connect(&sock_b, 1, via_to_a).await.expect("connect b");
+        stream_a
+            .connect(&sock_a, 2, via_to_b)
+            .await
+            .expect("connect a");
+        stream_b
+            .connect(&sock_b, 1, via_to_a)
+            .await
+            .expect("connect b");
 
         let (client, server) = tokio::join!(
-            SecretStream::new(true, stream_a.into_async_stream(), noise::generate_keypair()),
-            SecretStream::new(false, stream_b.into_async_stream(), noise::generate_keypair()),
+            SecretStream::new(
+                true,
+                stream_a.into_async_stream(),
+                noise::generate_keypair()
+            ),
+            SecretStream::new(
+                false,
+                stream_b.into_async_stream(),
+                noise::generate_keypair()
+            ),
         );
         let mut client = client.expect("client handshake");
         let mut server = server.expect("server handshake");
@@ -90,7 +110,10 @@ async fn bulk_frames_pipeline_over_simulated_rtt() {
         );
         assert_eq!(received, frames * frame.len());
         // One frame per round trip would need 256 * 50 ms = 12.8 s.
-        assert!(elapsed < Duration::from_secs(5), "frames are not pipelined: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "frames are not pipelined: {elapsed:?}"
+        );
     })
     .await
     .expect("test timed out");

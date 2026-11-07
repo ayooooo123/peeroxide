@@ -187,7 +187,10 @@ mod tests {
                 sent += 1;
             }
         }
-        assert!((95..=105).contains(&sent), "sent {sent} packets in 100 ms at 625 B/ms");
+        assert!(
+            (95..=105).contains(&sent),
+            "sent {sent} packets in 100 ms at 625 B/ms"
+        );
     }
 
     #[test]

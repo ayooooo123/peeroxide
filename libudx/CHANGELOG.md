@@ -9,10 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `UdxRuntime::create_random_stream`: atomically selects and reserves a collision-free nonzero ID across shared runtimes.
+- `UdxStreamAbort::closed` / `UdxAsyncStream::closed`: race-free close notification supporting multiple observers both before and after stream closure.
+- `UdxStream::local_id`: accessor for the local stream identifier.
 - `UdxStreamRemote` (`UdxStream::remote_handle` / `UdxAsyncStream::remote_handle`): `change_remote` moves a connected stream to another peer and socket with C libudx semantics (in-flight packets keep their destination, completion once they are ACKed, MTU search restarted, no MTU probes while changing); `remote_observed` resolves when the peer reaches us on the new path; `try_send` sends an unreliable message (Node `rawStream.trySend`).
 
 ### Changed
 
+- `UdxRuntime::create_stream(id)` rejects occupied live stream IDs.
+- Socket stream registration rejects a different stream at an occupied ID while permitting same-stream idempotent registration.
 - Firewall hooks can reject a packet without closing the listening stream.
 - Firewall hooks stay armed after the stream connects and run for packets arriving on another socket than the stream's, as C `on_firewall` does; a connected stream only gates the packet.
 
@@ -20,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Packets queued on a firewall-hooked stream before its first packet arrived were sent to `0.0.0.0:0` and lost for good (retransmits included); they now wait for the hook to commit a peer.
 - Aborting a stream now stops its processor task; abort handles expose liveness for registry pruning.
+- Stream retirement synchronously releases socket registrations and reserved IDs; stale handles cannot deregister a replacement or re-arm a closed stream.
+- Destroying a relay leg is quiet, matching C libudx, so relay teardown does not destroy an upgraded endpoint.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/libudx-v1.7.3...libudx-v1.7.4) - 2026-11-02
 

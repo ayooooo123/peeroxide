@@ -102,9 +102,7 @@ impl SocketRef {
     /// The holepunch receiver is `Some(...)` immediately after `SocketPool::acquire()`.
     /// The Holepuncher recv-adapter takes ownership through this accessor exactly once;
     /// subsequent calls return `None`.
-    pub fn take_holepunch_rx(
-        &mut self,
-    ) -> Option<mpsc::UnboundedReceiver<HolepunchEvent>> {
+    pub fn take_holepunch_rx(&mut self) -> Option<mpsc::UnboundedReceiver<HolepunchEvent>> {
         self.holepunch_rx.take()
     }
 

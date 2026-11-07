@@ -227,11 +227,7 @@ async fn perform_dht_scan(
         if matches!(prev_seq, Some(s) if mget.seq <= s) {
             continue;
         }
-        let Ok(invite) = inbox::decrypt_and_verify_invite(
-            &mget.value,
-            &feed_pk,
-            id_keypair,
-        ) else {
+        let Ok(invite) = inbox::decrypt_and_verify_invite(&mget.value, &feed_pk, id_keypair) else {
             continue;
         };
         debug::log_event(
@@ -283,7 +279,9 @@ pub fn format_invite_lines(
     let mut out = Vec::with_capacity(3);
     if invite.invite_type == INVITE_TYPE_DM {
         let lure = String::from_utf8_lossy(&invite.payload);
-        out.push(format!("[INVITE #{number}] DM from {sender_name} ({short})"));
+        out.push(format!(
+            "[INVITE #{number}] DM from {sender_name} ({short})"
+        ));
         if !lure.is_empty() {
             out.push(format!("  \"{lure}\""));
         }
@@ -298,10 +296,9 @@ pub fn format_invite_lines(
         let name_len = invite.payload[0] as usize;
         if invite.payload.len() >= 1 + name_len + 2 {
             let name = String::from_utf8_lossy(&invite.payload[1..1 + name_len]);
-            let salt_len = u16::from_le_bytes([
-                invite.payload[1 + name_len],
-                invite.payload[2 + name_len],
-            ]) as usize;
+            let salt_len =
+                u16::from_le_bytes([invite.payload[1 + name_len], invite.payload[2 + name_len]])
+                    as usize;
             if invite.payload.len() >= 3 + name_len + salt_len {
                 let salt =
                     String::from_utf8_lossy(&invite.payload[3 + name_len..3 + name_len + salt_len]);
@@ -388,7 +385,10 @@ mod tests {
         push_for_test(&m, invite_dm(2, "b"));
         push_for_test(&m, invite_dm(3, "c"));
         let drained = m.take_unread();
-        assert_eq!(drained.iter().map(|n| n.number).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            drained.iter().map(|n| n.number).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
@@ -436,7 +436,11 @@ mod tests {
             invite: invite_dm(0x42, ""),
         };
         let lines = format_invite_lines(&inv, "default", &users);
-        assert!(lines[0].contains("DM from Alice (42424242)"), "got: {}", lines[0]);
+        assert!(
+            lines[0].contains("DM from Alice (42424242)"),
+            "got: {}",
+            lines[0]
+        );
     }
 
     #[test]

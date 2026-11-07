@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use libudx::UdxRuntime;
-use peeroxide::{discovery_key, spawn as spawn_swarm, JoinOpts, SwarmConfig, SwarmConnection};
-use peeroxide_dht::hyperdht::{spawn, HyperDhtConfig};
+use peeroxide::{JoinOpts, SwarmConfig, SwarmConnection, discovery_key, spawn as spawn_swarm};
+use peeroxide_dht::hyperdht::{HyperDhtConfig, spawn};
 use peeroxide_dht::rpc::DhtConfig;
 use serde_json::Value;
 
@@ -94,20 +94,35 @@ async fn rust_reconnect() -> Result<(), Box<dyn std::error::Error>> {
     let (_client_task, client, mut client_conns) = spawn_swarm(client_config).await?;
     client.join(topic, client_only()).await?;
 
-    let first = recv(&mut server_conns, "the first connection", Duration::from_secs(20)).await?;
+    let first = recv(
+        &mut server_conns,
+        "the first connection",
+        Duration::from_secs(20),
+    )
+    .await?;
     let remote = *first.remote_public_key();
     tracing::info!(pk = %hex::encode(remote), "server accepted the first connection");
 
     // The client also got a connection object; it must not be mistaken for a
     // redial.
-    let _ = recv(&mut client_conns, "the client's own connection", Duration::from_secs(18)).await?;
+    let _ = recv(
+        &mut client_conns,
+        "the client's own connection",
+        Duration::from_secs(18),
+    )
+    .await?;
 
     // Drop the stream as a peer that lost its connection would: the client
     // sees the close, forgets the peer's slot and redials.
     first.peer.stream.abort_handle().abort();
     drop(first);
 
-    let second = recv(&mut server_conns, "the reconnection", Duration::from_secs(5)).await?;
+    let second = recv(
+        &mut server_conns,
+        "the reconnection",
+        Duration::from_secs(5),
+    )
+    .await?;
     assert_eq!(
         second.remote_public_key(),
         &remote,
@@ -261,7 +276,12 @@ async fn node_reconnect() -> Result<(), Box<dyn std::error::Error>> {
     js.send(serde_json::json!({ "cmd": "join", "topic": topic_hex }));
     js.wait_event("joined", Duration::from_secs(10)).await;
 
-    let first = recv(&mut server_conns, "the first Node connection", Duration::from_secs(20)).await?;
+    let first = recv(
+        &mut server_conns,
+        "the first Node connection",
+        Duration::from_secs(20),
+    )
+    .await?;
     assert_eq!(
         hex::encode(first.remote_public_key()),
         js_pk,
@@ -270,7 +290,12 @@ async fn node_reconnect() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("server accepted the Node client");
 
     // The client destroys this connection and redials on its own.
-    let second = recv(&mut server_conns, "the Node reconnection", Duration::from_secs(20)).await?;
+    let second = recv(
+        &mut server_conns,
+        "the Node reconnection",
+        Duration::from_secs(20),
+    )
+    .await?;
     assert_eq!(
         hex::encode(second.remote_public_key()),
         js_pk,

@@ -18,9 +18,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+rand = "0.9"
 
 [dev-dependencies]
-rand = "0.9"
 serde_json = { workspace = true }
 sha2 = "0.10"
 tokio = { workspace = true, features = ["full", "test-util"] }

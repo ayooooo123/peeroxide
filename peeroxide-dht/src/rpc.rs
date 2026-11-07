@@ -7,17 +7,17 @@ use std::time::Duration;
 
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, Instant};
+use tokio::time::{Instant, interval};
 
 use libudx::{UdxRuntime, UdxSocket};
 
 use crate::io::{Io, IoConfig, IoEvent, ReplyContext, RequestParams, SocketKind, TimeoutEvent};
 use crate::messages::{Command, Ipv4Peer};
 use crate::nat::Nat;
-use crate::peer::{peer_id, NodeId};
+use crate::peer::{NodeId, peer_id};
 use crate::query::{
-    parse_bootstrap_str, resolve_bootstrap_nodes, IoResponseData, Query, QueryReply, QueryRequest,
-    QueryResult,
+    IoResponseData, Query, QueryReply, QueryRequest, QueryResult, parse_bootstrap_str,
+    resolve_bootstrap_nodes,
 };
 use crate::routing_table::{Node, RoutingTable, TableEvent};
 
@@ -969,15 +969,20 @@ impl DhtNode {
                         }
                     }
                 } else if let Some(standalone) = self.standalone_tids.remove(&tid) {
-                    self.handle_standalone_response(standalone, ResponseData {
-                        from,
-                        id,
-                        token,
-                        closer_nodes,
-                        error,
-                        value,
-                        rtt,
-                    }, to, socket);
+                    self.handle_standalone_response(
+                        standalone,
+                        ResponseData {
+                            from,
+                            id,
+                            token,
+                            closer_nodes,
+                            error,
+                            value,
+                            rtt,
+                        },
+                        to,
+                        socket,
+                    );
                 }
             }
         }
@@ -1001,8 +1006,18 @@ impl DhtNode {
                         _ => 0,
                     };
                     if port != 0 {
-                        let to = Ipv4Peer { host: req.from.host.clone(), port };
-                        self.io.send_reply_deferred(&to, req.reply_ctx, req.tid, req.target, 0, None);
+                        let to = Ipv4Peer {
+                            host: req.from.host.clone(),
+                            port,
+                        };
+                        self.io.send_reply_deferred(
+                            &to,
+                            req.reply_ctx,
+                            req.tid,
+                            req.target,
+                            0,
+                            None,
+                        );
                     }
                 }
                 CMD_FIND_NODE => {
@@ -1027,9 +1042,7 @@ impl DhtNode {
 
     fn handle_delayed_ping(&mut self, req: crate::io::IncomingRequest) {
         let delay_ms = match &req.value {
-            Some(v) if v.len() >= 4 => {
-                u32::from_le_bytes([v[0], v[1], v[2], v[3]])
-            }
+            Some(v) if v.len() >= 4 => u32::from_le_bytes([v[0], v[1], v[2], v[3]]),
             _ => return,
         };
 
@@ -1320,7 +1333,8 @@ impl DhtNode {
         };
         match self.io.create_request(params) {
             Some(tid) => {
-                self.standalone_tids.insert(tid, StandaloneRequest::NatProbe { quick });
+                self.standalone_tids
+                    .insert(tid, StandaloneRequest::NatProbe { quick });
                 true
             }
             None => false,
@@ -1334,11 +1348,19 @@ impl DhtNode {
             Ok(table) => table
                 .closest(table.id(), 5)
                 .into_iter()
-                .map(|n| Ipv4Peer { host: n.host.clone(), port: n.port })
+                .map(|n| Ipv4Peer {
+                    host: n.host.clone(),
+                    port: n.port,
+                })
                 .collect(),
             Err(_) => Vec::new(),
         };
-        for (host, port) in self.config.bootstrap.iter().filter_map(|s| parse_bootstrap_str(s)) {
+        for (host, port) in self
+            .config
+            .bootstrap
+            .iter()
+            .filter_map(|s| parse_bootstrap_str(s))
+        {
             if targets.len() >= 5 {
                 break;
             }
@@ -1347,7 +1369,10 @@ impl DhtNode {
             }
         }
         let need = if targets.len() >= 5 { 3 } else { 1 };
-        let outstanding = targets.iter().filter(|t| self.send_nat_probe(t, false)).count();
+        let outstanding = targets
+            .iter()
+            .filter(|t| self.send_nat_probe(t, false))
+            .count();
         if outstanding == 0 {
             return false;
         }
@@ -1367,7 +1392,11 @@ impl DhtNode {
     /// finishes bootstrapping.
     fn on_nat_probe(&mut self, quick: bool, hit: Option<(Ipv4Peer, Ipv4Peer)>) {
         if quick {
-            self.quick_probe = if hit.is_some() { QuickProbe::Hit } else { QuickProbe::Miss };
+            self.quick_probe = if hit.is_some() {
+                QuickProbe::Hit
+            } else {
+                QuickProbe::Miss
+            };
             if self.bootstrap_query_id.is_none() && !self.bootstrapped {
                 self.finish_bootstrap();
             }
@@ -1716,7 +1745,8 @@ impl DhtNode {
                 preserve_tid,
                 via,
             } => {
-                self.io.relay(command, target, value, &to, preserve_tid, via.as_ref());
+                self.io
+                    .relay(command, target, value, &to, preserve_tid, via.as_ref());
             }
 
             DhtCommand::SendReplyTo {
@@ -1735,11 +1765,7 @@ impl DhtNode {
             }
 
             DhtCommand::TableSize { reply_tx } => {
-                let size = self
-                    .table
-                    .lock()
-                    .map(|t| t.len())
-                    .unwrap_or(0);
+                let size = self.table.lock().map(|t| t.len()).unwrap_or(0);
                 let _ = reply_tx.send(size);
             }
 
@@ -2132,7 +2158,9 @@ pub async fn spawn(
     };
 
     let io = Io::bind(runtime, Arc::clone(&table), io_config).await?;
-    let local_port = io.server_local_addr().await
+    let local_port = io
+        .server_local_addr()
+        .await
         .map(|a| a.port())
         .unwrap_or(config.port);
 
@@ -2278,7 +2306,10 @@ mod tests {
         first.destroy().await.expect("destroy first");
         second.destroy().await.expect("destroy second");
         first_task.await.expect("first task").expect("first node");
-        second_task.await.expect("second task").expect("second node");
+        second_task
+            .await
+            .expect("second task")
+            .expect("second node");
     }
 
     #[tokio::test]

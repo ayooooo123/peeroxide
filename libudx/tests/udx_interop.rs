@@ -13,11 +13,7 @@ fn node_echo_server_path() -> String {
 async fn bidirectional_echo_with_node() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        run_echo_test(),
-    )
-    .await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(15), run_echo_test()).await;
 
     match result {
         Ok(Ok(())) => {}
@@ -61,9 +57,7 @@ async fn run_echo_test() -> std::result::Result<(), Box<dyn std::error::Error>> 
     let mut stream = runtime.create_stream(node_remote_id).await?;
 
     let node_addr: SocketAddr = format!("127.0.0.1:{node_port}").parse()?;
-    stream
-        .connect(&socket, node_local_id, node_addr)
-        .await?;
+    stream.connect(&socket, node_local_id, node_addr).await?;
 
     let mut ready_line = String::new();
     reader.read_line(&mut ready_line)?;
@@ -82,10 +76,7 @@ async fn run_echo_test() -> std::result::Result<(), Box<dyn std::error::Error>> 
     }
 
     for expected in &test_messages {
-        let echoed = stream
-            .read()
-            .await?
-            .expect("unexpected EOF");
+        let echoed = stream.read().await?.expect("unexpected EOF");
         assert_eq!(&echoed, expected, "echo mismatch");
     }
 

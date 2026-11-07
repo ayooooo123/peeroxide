@@ -20,9 +20,9 @@
 use std::time::Duration;
 
 use libudx::UdxRuntime;
-use peeroxide::{spawn as spawn_swarm, JoinOpts, SwarmConfig, SwarmConnection, SwarmError};
+use peeroxide::{JoinOpts, SwarmConfig, SwarmConnection, SwarmError, spawn as spawn_swarm};
 use peeroxide_dht::crypto::hash;
-use peeroxide_dht::hyperdht::{spawn, HyperDhtConfig};
+use peeroxide_dht::hyperdht::{HyperDhtConfig, spawn};
 use peeroxide_dht::rpc::DhtConfig;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -113,11 +113,7 @@ async fn next_conn(rx: &mut mpsc::Receiver<SwarmConnection>, what: &str) -> Swar
         .unwrap_or_else(|| panic!("{what}: connection channel closed"))
 }
 
-async fn no_conn_within(
-    rx: &mut mpsc::Receiver<SwarmConnection>,
-    what: &str,
-    wait: Duration,
-) {
+async fn no_conn_within(rx: &mut mpsc::Receiver<SwarmConnection>, what: &str, wait: Duration) {
     if tokio::time::timeout(wait, rx.recv()).await.is_ok() {
         panic!("{what}: an unexpected connection was delivered");
     }
@@ -208,7 +204,10 @@ async fn join_peer_connects_and_moves_data_without_a_topic() {
         let mut client_conn = next_conn(&mut client_conns, "the client side").await;
 
         assert_eq!(client_conn.remote_public_key(), &server_pk);
-        assert_eq!(server_conn.remote_public_key(), &client.key_pair().public_key);
+        assert_eq!(
+            server_conn.remote_public_key(),
+            &client.key_pair().public_key
+        );
         assert!(client_conn.is_initiator, "the joining peer dials");
         assert!(!server_conn.is_initiator);
         assert!(
@@ -317,14 +316,11 @@ async fn suspend_defers_topic_discovery_until_resume() {
         let (_server_task, server, _server_rx) = net.swarm().await?;
         let server_pk = server.key_pair().public_key;
         server
-            .join(
-                topic,
-                {
-                    let mut opts = JoinOpts::default();
-                    opts.client = false;
-                    opts
-                },
-            )
+            .join(topic, {
+                let mut opts = JoinOpts::default();
+                opts.client = false;
+                opts
+            })
             .await?;
         server.flush().await?;
 

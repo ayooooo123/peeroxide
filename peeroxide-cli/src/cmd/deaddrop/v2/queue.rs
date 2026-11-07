@@ -14,8 +14,8 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{Mutex, Notify};
 
@@ -107,7 +107,14 @@ impl WorkQueue {
             }
             return;
         }
-        inner.queued.insert(id, Entry { unit, lane, subs: vec![sub] });
+        inner.queued.insert(
+            id,
+            Entry {
+                unit,
+                lane,
+                subs: vec![sub],
+            },
+        );
         match lane {
             Lane::High => inner.high.push_back(id),
             Lane::Normal => inner.normal.push_back(id),

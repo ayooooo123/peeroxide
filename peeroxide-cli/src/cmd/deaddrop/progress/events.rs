@@ -94,7 +94,11 @@ pub fn snapshot_start<'a>(state: &'a ProgressState) -> ProgressEvent<'a> {
     }
 }
 
-pub fn snapshot_progress<'a>(state: &'a ProgressState, rate: f64, eta: Option<f64>) -> ProgressEvent<'a> {
+pub fn snapshot_progress<'a>(
+    state: &'a ProgressState,
+    rate: f64,
+    eta: Option<f64>,
+) -> ProgressEvent<'a> {
     ProgressEvent::Progress {
         phase: state.phase,
         version: state.version,
@@ -197,7 +201,14 @@ mod tests {
             serde_json::to_string(&snapshot_progress(&state, 12.5, Some(7.5))).unwrap(),
             serde_json::to_string(&snapshot_done(&state)).unwrap(),
             serde_json::to_string(&put_result(Phase::Put, 2, "pickup".into(), 4500, 5)).unwrap(),
-            serde_json::to_string(&get_result(Phase::Get, 2, 4500, "abcd".into(), "stdout".into())).unwrap(),
+            serde_json::to_string(&get_result(
+                Phase::Get,
+                2,
+                4500,
+                "abcd".into(),
+                "stdout".into(),
+            ))
+            .unwrap(),
             serde_json::to_string(&ack(1, "abc".into())).unwrap(),
         ];
 
@@ -209,7 +220,14 @@ mod tests {
     #[test]
     fn result_variants() {
         let put = serde_json::to_string(&put_result(Phase::Put, 1, "k".into(), 10, 2)).unwrap();
-        let get = serde_json::to_string(&get_result(Phase::Get, 1, 10, "crc".into(), "stdout".into())).unwrap();
+        let get = serde_json::to_string(&get_result(
+            Phase::Get,
+            1,
+            10,
+            "crc".into(),
+            "stdout".into(),
+        ))
+        .unwrap();
 
         let put_v = assert_has_type(&put);
         let get_v = assert_has_type(&get);

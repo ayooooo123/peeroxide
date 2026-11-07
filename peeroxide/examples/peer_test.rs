@@ -7,10 +7,10 @@
 //!
 //! Set RUST_LOG=info for verbose DHT output.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use peeroxide::{spawn, JoinOpts, KeyPair, SwarmConfig, SwarmConnection};
+use peeroxide::{JoinOpts, KeyPair, SwarmConfig, SwarmConnection, spawn};
 use peeroxide_dht::crypto::hash;
 
 fn test_topic() -> [u8; 32] {

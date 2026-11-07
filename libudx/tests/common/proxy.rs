@@ -120,8 +120,7 @@ async fn forward_loop(
         let (should_drop, total_delay) = {
             let mut rng = rand::rng();
 
-            let should_drop =
-                config.loss_rate > 0.0 && rng.random::<f64>() < config.loss_rate;
+            let should_drop = config.loss_rate > 0.0 && rng.random::<f64>() < config.loss_rate;
 
             let base_delay = config.delay;
             let jitter = if config.jitter > Duration::ZERO {

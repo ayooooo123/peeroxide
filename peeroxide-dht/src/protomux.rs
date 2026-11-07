@@ -104,7 +104,12 @@ pub type Result<T> = std::result::Result<T, ProtomuxError>;
 /// Encode a channel Open control frame.
 ///
 /// Wire: `[uint:0][uint:1][uint:localId][string:protocol][buffer:id][handshake?]`
-pub fn encode_open(local_id: u64, protocol: &str, id: Option<&[u8]>, handshake: Option<&[u8]>) -> Vec<u8> {
+pub fn encode_open(
+    local_id: u64,
+    protocol: &str,
+    id: Option<&[u8]>,
+    handshake: Option<&[u8]>,
+) -> Vec<u8> {
     let mut state = State::new();
     // Preencode
     state.end = 2; // header: [0, 1]
@@ -576,9 +581,7 @@ impl Mux {
             })
             .map_err(|_| ProtomuxError::StreamClosed)?;
 
-        let handle = resp_rx
-            .await
-            .map_err(|_| ProtomuxError::StreamClosed)??;
+        let handle = resp_rx.await.map_err(|_| ProtomuxError::StreamClosed)??;
 
         Ok(Channel {
             local_id: handle.local_id,
@@ -909,8 +912,7 @@ fn send_message_internal(
         inner_state.end += data.len();
         inner_state.alloc();
         c::encode_uint(&mut inner_state, message_type as u64);
-        inner_state.buffer[inner_state.start..inner_state.start + data.len()]
-            .copy_from_slice(data);
+        inner_state.buffer[inner_state.start..inner_state.start + data.len()].copy_from_slice(data);
         state.batch.push((local_id as u64, inner_state.buffer));
     } else {
         let frame = encode_message(local_id as u64, message_type as u64, data);
@@ -994,10 +996,17 @@ fn handle_control(
             protocol,
             id,
             handshake_state,
+        } => handle_remote_open(
+            state,
+            write_queue,
+            remote_local_id,
+            &protocol,
+            id,
+            handshake_state,
+        ),
+        ControlFrame::Close {
+            local_id: remote_local_id,
         } => {
-            handle_remote_open(state, write_queue, remote_local_id, &protocol, id, handshake_state)
-        }
-        ControlFrame::Close { local_id: remote_local_id } => {
             handle_remote_close(state, remote_local_id);
             Ok(())
         }
@@ -1032,7 +1041,9 @@ fn handle_remote_open(
     }
 
     if state.remote[rid].is_some() {
-        return Err(ProtomuxError::InvalidFrame("duplicate remote channel ID".into()));
+        return Err(ProtomuxError::InvalidFrame(
+            "duplicate remote channel ID".into(),
+        ));
     }
 
     let key = MuxState::channel_key(protocol, id.as_deref());
@@ -1076,8 +1087,7 @@ fn handle_remote_open(
         info.incoming.push(remote_id);
         debug!(
             protocol,
-            remote_id,
-            "protomux remote channel queued (awaiting local create)"
+            remote_id, "protomux remote channel queued (awaiting local create)"
         );
     }
 
@@ -1341,14 +1351,8 @@ mod tests {
         tokio::spawn(run_a);
         tokio::spawn(run_b);
 
-        let mut ch_a = mux_a
-            .create_channel("echo", None, None)
-            .await
-            .unwrap();
-        let mut ch_b = mux_b
-            .create_channel("echo", None, None)
-            .await
-            .unwrap();
+        let mut ch_a = mux_a.create_channel("echo", None, None).await.unwrap();
+        let mut ch_b = mux_b.create_channel("echo", None, None).await.unwrap();
 
         ch_a.wait_opened().await.unwrap();
         ch_b.wait_opened().await.unwrap();
@@ -1420,22 +1424,10 @@ mod tests {
         tokio::spawn(run_b);
 
         // Open two different channels
-        let mut ch_a1 = mux_a
-            .create_channel("proto-1", None, None)
-            .await
-            .unwrap();
-        let mut ch_a2 = mux_a
-            .create_channel("proto-2", None, None)
-            .await
-            .unwrap();
-        let mut ch_b1 = mux_b
-            .create_channel("proto-1", None, None)
-            .await
-            .unwrap();
-        let mut ch_b2 = mux_b
-            .create_channel("proto-2", None, None)
-            .await
-            .unwrap();
+        let mut ch_a1 = mux_a.create_channel("proto-1", None, None).await.unwrap();
+        let mut ch_a2 = mux_a.create_channel("proto-2", None, None).await.unwrap();
+        let mut ch_b1 = mux_b.create_channel("proto-1", None, None).await.unwrap();
+        let mut ch_b2 = mux_b.create_channel("proto-2", None, None).await.unwrap();
 
         ch_a1.wait_opened().await.unwrap();
         ch_a2.wait_opened().await.unwrap();

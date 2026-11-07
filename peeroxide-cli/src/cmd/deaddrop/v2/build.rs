@@ -9,10 +9,10 @@
 use peeroxide::KeyPair;
 
 use super::keys::{data_chunk_address, derive_index_keypair, salt as compute_salt};
-use super::tree::{compute_layout, TreeLayout};
+use super::tree::{TreeLayout, compute_layout};
 use super::wire::{
-    encode_data_chunk, encode_non_root_index, encode_root_index, DATA_PAYLOAD_MAX, HASH_LEN,
-    NON_ROOT_INDEX_SLOT_CAP,
+    DATA_PAYLOAD_MAX, HASH_LEN, NON_ROOT_INDEX_SLOT_CAP, encode_data_chunk, encode_non_root_index,
+    encode_root_index,
 };
 
 /// A single index chunk that the sender will publish via `mutable_put`.
@@ -193,8 +193,8 @@ where
 
         for chunk_pos in 0..layer_chunk_count {
             let start = (chunk_pos * NON_ROOT_INDEX_SLOT_CAP as u64) as usize;
-            let end = ((chunk_pos + 1) * NON_ROOT_INDEX_SLOT_CAP as u64)
-                .min(prev_count as u64) as usize;
+            let end =
+                ((chunk_pos + 1) * NON_ROOT_INDEX_SLOT_CAP as u64).min(prev_count as u64) as usize;
             let slots: Vec<[u8; HASH_LEN]> = child_pubkeys[start..end].to_vec();
             let encoded = encode_non_root_index(&slots);
             let kp = derive_index_keypair(root_seed, next_keypair_index);
@@ -237,7 +237,7 @@ pub fn build_tree_from_bytes(root_seed: &[u8; 32], file: &[u8]) -> Result<BuiltT
 mod tests {
     use super::*;
     use crate::cmd::deaddrop::v2::tree::canonical_depth;
-    use crate::cmd::deaddrop::v2::wire::{decode_root_index, ROOT_INDEX_SLOT_CAP};
+    use crate::cmd::deaddrop::v2::wire::{ROOT_INDEX_SLOT_CAP, decode_root_index};
 
     fn make_data(n_chunks: usize, last_partial: usize) -> Vec<u8> {
         let mut data = Vec::new();

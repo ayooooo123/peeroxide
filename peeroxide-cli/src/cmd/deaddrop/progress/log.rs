@@ -8,9 +8,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::cmd::deaddrop::progress::{
-    format::render_log_line,
-    rate::RateCalculator,
-    state::ProgressState,
+    format::render_log_line, rate::RateCalculator, state::ProgressState,
 };
 
 /// Non-TTY progress renderer that prints one formatted line to stderr every

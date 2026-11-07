@@ -9,7 +9,7 @@
 
 #![allow(dead_code)]
 
-use peeroxide::{discovery_key, KeyPair};
+use peeroxide::{KeyPair, discovery_key};
 
 /// Per-deaddrop salt byte. Embedded in every data chunk header.
 ///

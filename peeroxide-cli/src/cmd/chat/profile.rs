@@ -123,7 +123,9 @@ pub fn load_profile(name: &str) -> io::Result<Profile> {
 
     let screen_name = match read_optional_text(&dir.join("name"))? {
         Some(name) => Some(name),
-        None => Some(names::generate_name_from_seed(&KeyPair::from_seed(seed).public_key)),
+        None => Some(names::generate_name_from_seed(
+            &KeyPair::from_seed(seed).public_key,
+        )),
     };
     let bio = read_optional_text(&dir.join("bio"))?;
 
@@ -325,7 +327,10 @@ mod tests {
     ) -> io::Result<Profile> {
         let dir = profiles_root.join(name);
         if dir.exists() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "already exists"));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "already exists",
+            ));
         }
         fs::create_dir_all(&dir)?;
 
@@ -337,7 +342,9 @@ mod tests {
         fs::write(dir.join("seed"), seed)?;
         let effective_screen_name = match screen_name {
             Some(sn) => sn.to_owned(),
-            None => crate::cmd::chat::names::generate_name_from_seed(&KeyPair::from_seed(seed).public_key),
+            None => crate::cmd::chat::names::generate_name_from_seed(
+                &KeyPair::from_seed(seed).public_key,
+            ),
         };
         fs::write(dir.join("name"), &effective_screen_name)?;
         Ok(Profile {
@@ -361,7 +368,9 @@ mod tests {
         seed.copy_from_slice(&seed_bytes);
         let screen_name = match read_optional_text(&dir.join("name"))? {
             Some(name) => Some(name),
-            None => Some(crate::cmd::chat::names::generate_name_from_seed(&KeyPair::from_seed(seed).public_key)),
+            None => Some(crate::cmd::chat::names::generate_name_from_seed(
+                &KeyPair::from_seed(seed).public_key,
+            )),
         };
         let bio = read_optional_text(&dir.join("bio"))?;
         Ok(Profile {
@@ -392,7 +401,9 @@ mod tests {
     fn profile_create_no_screen_name() {
         let tmp = TempDir::new().unwrap();
         let created = do_create_profile(tmp.path(), "bob", None).unwrap();
-        let expected = crate::cmd::chat::names::generate_name_from_seed(&KeyPair::from_seed(created.seed).public_key);
+        let expected = crate::cmd::chat::names::generate_name_from_seed(
+            &KeyPair::from_seed(created.seed).public_key,
+        );
         assert_eq!(created.screen_name.as_deref(), Some(expected.as_str()));
         let loaded = do_load_profile(tmp.path(), "bob").unwrap();
         assert_eq!(loaded.screen_name.as_deref(), Some(expected.as_str()));
@@ -434,7 +445,12 @@ mod tests {
             let alias = optional_field(parts.get(1).copied());
             let cached_name = optional_field(parts.get(2).copied());
             let cached_bio_line = optional_field(parts.get(3).copied());
-            let friend = Friend { pubkey, alias, cached_name, cached_bio_line };
+            let friend = Friend {
+                pubkey,
+                alias,
+                cached_name,
+                cached_bio_line,
+            };
             if let Some(existing) = map.get_mut(&pubkey) {
                 existing.1 = friend;
             } else {
@@ -515,7 +531,10 @@ mod tests {
     fn create_profile_without_name_gets_generated_name() {
         let seed = [99u8; 32];
         let name = crate::cmd::chat::names::generate_name_from_seed(&seed);
-        assert!(name.contains('_'), "generated name must contain underscore: {name}");
+        assert!(
+            name.contains('_'),
+            "generated name must contain underscore: {name}"
+        );
         let parts: Vec<&str> = name.splitn(3, '_').collect();
         assert_eq!(parts.len(), 3);
         assert!(parts[2].chars().all(|c| c.is_ascii_digit()));
@@ -537,7 +556,9 @@ mod tests {
         fs::remove_file(tmp.path().join("missing-name").join("name")).unwrap();
 
         let loaded = do_load_profile(tmp.path(), "missing-name").unwrap();
-        let expected = crate::cmd::chat::names::generate_name_from_seed(&KeyPair::from_seed(created.seed).public_key);
+        let expected = crate::cmd::chat::names::generate_name_from_seed(
+            &KeyPair::from_seed(created.seed).public_key,
+        );
         assert_eq!(loaded.screen_name.as_deref(), Some(expected.as_str()));
     }
 
@@ -545,7 +566,9 @@ mod tests {
     fn profile_create_no_screen_name_uses_pubkey() {
         let tmp = TempDir::new().unwrap();
         let created = do_create_profile(tmp.path(), "pubkey-create", None).unwrap();
-        let expected = crate::cmd::chat::names::generate_name_from_seed(&KeyPair::from_seed(created.seed).public_key);
+        let expected = crate::cmd::chat::names::generate_name_from_seed(
+            &KeyPair::from_seed(created.seed).public_key,
+        );
         assert_eq!(created.screen_name.as_deref(), Some(expected.as_str()));
     }
 
@@ -556,7 +579,9 @@ mod tests {
         fs::remove_file(tmp.path().join("pubkey-load").join("name")).unwrap();
 
         let loaded = do_load_profile(tmp.path(), "pubkey-load").unwrap();
-        let expected = crate::cmd::chat::names::generate_name_from_seed(&KeyPair::from_seed(created.seed).public_key);
+        let expected = crate::cmd::chat::names::generate_name_from_seed(
+            &KeyPair::from_seed(created.seed).public_key,
+        );
         assert_eq!(loaded.screen_name.as_deref(), Some(expected.as_str()));
     }
 }

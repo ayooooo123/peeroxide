@@ -57,7 +57,9 @@ pub fn human_rate(bps: f64) -> String {
 }
 
 pub fn human_eta(eta: Option<f64>) -> String {
-    let Some(eta) = eta else { return "—".to_string(); };
+    let Some(eta) = eta else {
+        return "—".to_string();
+    };
     if eta <= 0.0 {
         return "0s".to_string();
     }
@@ -186,7 +188,8 @@ pub fn render_wire_line(
 }
 
 pub fn render_log_line(state: &ProgressState, smoothed_rate: f64, eta: Option<f64>) -> String {
-    let (bytes_done, bytes_total, indexes_done, indexes_total, data_done, data_total) = snapshot(state);
+    let (bytes_done, bytes_total, indexes_done, indexes_total, data_done, data_total) =
+        snapshot(state);
     let phase = match state.phase {
         Phase::Put => "put",
         Phase::Get => "get",
@@ -312,7 +315,9 @@ mod tests {
     #[test]
     fn render_log_line_shape() {
         let s = render_log_line(&state(), 500.0, Some(4.0));
-        assert!(s.starts_with("[dd-put] indexes 1/2, data 2/4, 5.0 KiB/10.0 KiB (50%), 500 B/s, eta 4s"));
+        assert!(s.starts_with(
+            "[dd-put] indexes 1/2, data 2/4, 5.0 KiB/10.0 KiB (50%), 500 B/s, eta 4s"
+        ));
     }
 
     #[test]

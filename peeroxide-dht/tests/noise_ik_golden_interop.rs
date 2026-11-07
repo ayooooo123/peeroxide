@@ -1,6 +1,6 @@
-use peeroxide_dht::noise::{keypair_from_seed, HandshakeIK};
-use peeroxide_dht::noise_wrap::NoiseWrap;
 use peeroxide_dht::crypto::{NS_PEER_HANDSHAKE, NS_PEER_HOLEPUNCH};
+use peeroxide_dht::noise::{HandshakeIK, keypair_from_seed};
+use peeroxide_dht::noise_wrap::NoiseWrap;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -131,22 +131,37 @@ fn golden_noise_ik_handshake() {
 
         let prologue_bytes = h(&prologue);
         assert_eq!(
-            prologue_bytes,
-            &*NS_PEER_HANDSHAKE,
+            prologue_bytes, &*NS_PEER_HANDSHAKE,
             "{label}: prologue should be NS_PEER_HANDSHAKE"
         );
 
         let s_i = keypair_from_seed(&h32(&static_initiator_seed));
-        assert_eq!(hex::encode(s_i.public_key), static_initiator_pk, "{label}: static_i pk");
+        assert_eq!(
+            hex::encode(s_i.public_key),
+            static_initiator_pk,
+            "{label}: static_i pk"
+        );
 
         let s_r = keypair_from_seed(&h32(&static_responder_seed));
-        assert_eq!(hex::encode(s_r.public_key), static_responder_pk, "{label}: static_r pk");
+        assert_eq!(
+            hex::encode(s_r.public_key),
+            static_responder_pk,
+            "{label}: static_r pk"
+        );
 
         let e_i = keypair_from_seed(&h32(&ephemeral_initiator_seed));
-        assert_eq!(hex::encode(e_i.public_key), ephemeral_initiator_pk, "{label}: eph_i pk");
+        assert_eq!(
+            hex::encode(e_i.public_key),
+            ephemeral_initiator_pk,
+            "{label}: eph_i pk"
+        );
 
         let e_r = keypair_from_seed(&h32(&ephemeral_responder_seed));
-        assert_eq!(hex::encode(e_r.public_key), ephemeral_responder_pk, "{label}: eph_r pk");
+        assert_eq!(
+            hex::encode(e_r.public_key),
+            ephemeral_responder_pk,
+            "{label}: eph_r pk"
+        );
 
         let payload_i = payload_initiator.as_deref().map(h).unwrap_or_default();
         let payload_r = payload_responder.as_deref().map(h).unwrap_or_default();
@@ -180,8 +195,15 @@ fn golden_noise_ik_handshake() {
         assert_eq!(hex::encode(ir.rx), initiator_rx, "{label}: initiator rx");
         assert_eq!(hex::encode(rr.tx), responder_tx, "{label}: responder tx");
         assert_eq!(hex::encode(rr.rx), responder_rx, "{label}: responder rx");
-        assert_eq!(hex::encode(ir.handshake_hash), handshake_hash, "{label}: hash");
-        assert_eq!(ir.handshake_hash, rr.handshake_hash, "{label}: hash agreement");
+        assert_eq!(
+            hex::encode(ir.handshake_hash),
+            handshake_hash,
+            "{label}: hash"
+        );
+        assert_eq!(
+            ir.handshake_hash, rr.handshake_hash,
+            "{label}: hash agreement"
+        );
     }
 }
 
@@ -218,16 +240,32 @@ fn golden_noise_wrap_handshake() {
         };
 
         let s_i = keypair_from_seed(&h32(&static_initiator_seed));
-        assert_eq!(hex::encode(s_i.public_key), static_initiator_pk, "{label}: pk_i");
+        assert_eq!(
+            hex::encode(s_i.public_key),
+            static_initiator_pk,
+            "{label}: pk_i"
+        );
 
         let s_r = keypair_from_seed(&h32(&static_responder_seed));
-        assert_eq!(hex::encode(s_r.public_key), static_responder_pk, "{label}: pk_r");
+        assert_eq!(
+            hex::encode(s_r.public_key),
+            static_responder_pk,
+            "{label}: pk_r"
+        );
 
         let e_i = keypair_from_seed(&h32(&ephemeral_initiator_seed));
-        assert_eq!(hex::encode(e_i.public_key), ephemeral_initiator_pk, "{label}: eph_i");
+        assert_eq!(
+            hex::encode(e_i.public_key),
+            ephemeral_initiator_pk,
+            "{label}: eph_i"
+        );
 
         let e_r = keypair_from_seed(&h32(&ephemeral_responder_seed));
-        assert_eq!(hex::encode(e_r.public_key), ephemeral_responder_pk, "{label}: eph_r");
+        assert_eq!(
+            hex::encode(e_r.public_key),
+            ephemeral_responder_pk,
+            "{label}: eph_r"
+        );
 
         let payload_i = NoisePayload {
             version: 1,
@@ -284,7 +322,11 @@ fn golden_noise_wrap_handshake() {
 
         let recv_pi = resp.recv(&m1).expect("recv M1");
         assert_eq!(recv_pi.firewall, 2, "{label}: M1 payload firewall");
-        assert_eq!(recv_pi.addresses4.len(), 1, "{label}: M1 payload addresses4 len");
+        assert_eq!(
+            recv_pi.addresses4.len(),
+            1,
+            "{label}: M1 payload addresses4 len"
+        );
         assert_eq!(recv_pi.addresses4[0].port, 9000, "{label}: M1 payload port");
 
         resp.set_ephemeral(e_r);
@@ -294,7 +336,11 @@ fn golden_noise_wrap_handshake() {
 
         let recv_pr = init.recv(&m2).expect("recv M2");
         assert_eq!(recv_pr.firewall, 1, "{label}: M2 payload firewall");
-        assert_eq!(recv_pr.holepunch.as_ref().unwrap().id, 42, "{label}: M2 holepunch id");
+        assert_eq!(
+            recv_pr.holepunch.as_ref().unwrap().id,
+            42,
+            "{label}: M2 holepunch id"
+        );
         assert_eq!(recv_pr.udx.as_ref().unwrap().id, 7, "{label}: M2 udx id");
 
         let result_i = init.finalize().expect("finalize initiator");
@@ -304,7 +350,11 @@ fn golden_noise_wrap_handshake() {
         assert_eq!(hex::encode(result_i.rx), initiator_rx, "{label}: init rx");
         assert_eq!(hex::encode(result_r.tx), responder_tx, "{label}: resp tx");
         assert_eq!(hex::encode(result_r.rx), responder_rx, "{label}: resp rx");
-        assert_eq!(hex::encode(result_i.handshake_hash), handshake_hash, "{label}: hash");
+        assert_eq!(
+            hex::encode(result_i.handshake_hash),
+            handshake_hash,
+            "{label}: hash"
+        );
         assert_eq!(
             hex::encode(result_i.holepunch_secret),
             holepunch_secret,
@@ -319,9 +369,9 @@ fn golden_noise_wrap_handshake() {
 
 #[test]
 fn golden_holepunch_secret_derivation() {
+    use blake2::Blake2bMac;
     use blake2::digest::consts::U32;
     use blake2::digest::{KeyInit, Mac};
-    use blake2::Blake2bMac;
 
     type Blake2bMac256 = Blake2bMac<U32>;
 
@@ -344,8 +394,7 @@ fn golden_holepunch_secret_derivation() {
 
         let hash = h64(&handshake_hash);
 
-        let mut mac: Blake2bMac256 =
-            KeyInit::new_from_slice(&hash[..]).expect("64-byte key");
+        let mut mac: Blake2bMac256 = KeyInit::new_from_slice(&hash[..]).expect("64-byte key");
         Mac::update(&mut mac, &*NS_PEER_HOLEPUNCH);
         let computed = mac.finalize().into_bytes();
         let mut computed_arr = [0u8; 32];

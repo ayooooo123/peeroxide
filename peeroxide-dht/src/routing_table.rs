@@ -25,10 +25,7 @@ pub struct Node {
 #[derive(Debug)]
 pub enum TableEvent {
     /// A bucket reached capacity and rejected a node — ping oldest to decide eviction
-    BucketFull {
-        new_node: Node,
-        bucket_index: usize,
-    },
+    BucketFull { new_node: Node, bucket_index: usize },
 }
 
 /// A single k-bucket, nodes sorted by ID for binary search
@@ -636,7 +633,11 @@ mod tests {
         assert_eq!(rt.len(), 20);
 
         let result = rt.recent(4);
-        assert_eq!(result.len(), 4, "recent(4) must cap at 4 (stub returns 0 — RED)");
+        assert_eq!(
+            result.len(),
+            4,
+            "recent(4) must cap at 4 (stub returns 0 — RED)"
+        );
     }
 
     #[test]

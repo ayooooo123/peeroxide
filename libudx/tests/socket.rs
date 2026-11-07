@@ -5,7 +5,7 @@ mod common;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::{create_bound_socket, create_runtime, with_timeout, DEFAULT_TIMEOUT};
+use common::{DEFAULT_TIMEOUT, create_bound_socket, create_runtime, with_timeout};
 
 #[tokio::test]
 async fn socket_bind_and_local_addr() {
@@ -15,7 +15,11 @@ async fn socket_bind_and_local_addr() {
         let runtime = create_runtime();
         let (socket, addr) = create_bound_socket(&runtime).await;
 
-        assert!(addr.port() > 0, "expected non-zero port, got {}", addr.port());
+        assert!(
+            addr.port() > 0,
+            "expected non-zero port, got {}",
+            addr.port()
+        );
         assert_eq!(addr.ip(), "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
 
         socket.close().await.expect("close failed");
@@ -35,9 +39,7 @@ async fn socket_send_recv_datagram() {
         let mut rx = socket_b.recv_start().expect("recv_start failed");
 
         let test_data = b"hello datagram";
-        socket_a
-            .send_to(test_data, addr_b)
-            .expect("send_to failed");
+        socket_a.send_to(test_data, addr_b).expect("send_to failed");
 
         let datagram = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -59,10 +61,7 @@ async fn socket_close() {
 
     with_timeout(DEFAULT_TIMEOUT, async {
         let runtime = create_runtime();
-        let socket = runtime
-            .create_socket()
-            .await
-            .expect("create socket failed");
+        let socket = runtime.create_socket().await.expect("create socket failed");
         socket
             .bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
             .await

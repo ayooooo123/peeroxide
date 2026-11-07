@@ -1,6 +1,6 @@
 use peeroxide_dht::protomux::{
-    decode_frame, encode_batch, encode_close, encode_message, encode_open, encode_reject,
-    ControlFrame, DecodedFrame,
+    ControlFrame, DecodedFrame, decode_frame, encode_batch, encode_close, encode_message,
+    encode_open, encode_reject,
 };
 use serde::Deserialize;
 
@@ -47,8 +47,7 @@ fn load_fixtures() -> GoldenFile {
     let data = std::fs::read_to_string(path).unwrap_or_else(|e| {
         panic!("Failed to read protomux fixtures at {path}: {e}. Run `node generate-protomux-golden.js` in tests/node/ first.")
     });
-    serde_json::from_str(&data)
-        .unwrap_or_else(|e| panic!("Failed to parse protomux fixtures: {e}"))
+    serde_json::from_str(&data).unwrap_or_else(|e| panic!("Failed to parse protomux fixtures: {e}"))
 }
 
 fn from_hex(s: &str) -> Vec<u8> {
@@ -255,9 +254,7 @@ fn golden_protomux_decode_batch_frames() {
                     "[{}] batch item count mismatch",
                     fix.label
                 );
-                for (i, (actual, expected)) in
-                    items.iter().zip(expected_items.iter()).enumerate()
-                {
+                for (i, (actual, expected)) in items.iter().zip(expected_items.iter()).enumerate() {
                     let exp_channel = expected["channel_id"].as_u64().unwrap();
                     let exp_data = from_hex(expected["inner_hex"].as_str().unwrap());
                     assert_eq!(
@@ -323,7 +320,8 @@ fn golden_protomux_encode_roundtrip() {
         };
 
         assert_eq!(
-            encoded, expected_bytes,
+            encoded,
+            expected_bytes,
             "[{}] encode roundtrip mismatch\n  encoded: {}\n  expected: {}",
             fix.label,
             hex::encode(&encoded),

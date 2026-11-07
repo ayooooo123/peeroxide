@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use crate::hyperdht_messages::{FIREWALL_CONSISTENT, FIREWALL_OPEN, FIREWALL_RANDOM, FIREWALL_UNKNOWN};
+use crate::hyperdht_messages::{
+    FIREWALL_CONSISTENT, FIREWALL_OPEN, FIREWALL_RANDOM, FIREWALL_UNKNOWN,
+};
 use crate::messages::Ipv4Peer;
 use crate::rpc::DhtHandle;
 use libudx::{Datagram, UdxSocket};
@@ -193,8 +195,9 @@ impl Nat {
 
         let forwarder = spawn_dht_reply_forwarder(dht.clone(), dht_reply_rx);
 
-        let mut joinset: tokio::task::JoinSet<Result<crate::rpc::PingResponse, crate::rpc::DhtError>> =
-            tokio::task::JoinSet::new();
+        let mut joinset: tokio::task::JoinSet<
+            Result<crate::rpc::PingResponse, crate::rpc::DhtError>,
+        > = tokio::task::JoinSet::new();
         for node in candidates.into_iter().take(max_samples) {
             let dht_clone = dht.clone();
             let socket_clone = socket.clone();
@@ -434,7 +437,8 @@ mod tests {
         let mut nat = Nat::new(true);
         let from = peer("10.0.0.1", 1);
         nat.add(&peer("1.2.3.4", 5000), &from);
-        nat.add(&peer("1.2.3.4", 5000), &from);         assert_eq!(nat.sampled, 1);
+        nat.add(&peer("1.2.3.4", 5000), &from);
+        assert_eq!(nat.sampled, 1);
     }
 
     #[test]
@@ -636,7 +640,9 @@ mod tests {
                 firewalled: false,
                 ..crate::rpc::DhtConfig::default()
             };
-            let (task, handle) = crate::rpc::spawn(&runtime, cfg).await.expect("spawn target");
+            let (task, handle) = crate::rpc::spawn(&runtime, cfg)
+                .await
+                .expect("spawn target");
             target_tasks.push(task);
             target_handles.push(handle);
         }
@@ -661,7 +667,10 @@ mod tests {
         // Acquire a puncher socket exactly as production code does, wiring
         // its DHT-reply lane through to `auto_sample`.
         let pool = SocketPool::new("127.0.0.1".to_string());
-        let mut socket_ref = pool.acquire(&runtime).await.expect("acquire puncher socket");
+        let mut socket_ref = pool
+            .acquire(&runtime)
+            .await
+            .expect("acquire puncher socket");
         let socket = socket_ref.socket.clone();
         let dht_reply_rx = socket_ref
             .take_dht_reply_rx()

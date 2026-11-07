@@ -48,8 +48,7 @@ async fn destroy_during_write() {
 
     with_timeout(Duration::from_secs(10), async {
         let rt = create_runtime();
-        let (stream_a, _stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&rt).await;
+        let (stream_a, _stream_b, _socket_a, _socket_b) = create_connected_pair(&rt).await;
 
         stream_a.write(b"data before destroy").await.expect("write");
         stream_a.destroy().await.expect("destroy after write");
@@ -63,8 +62,7 @@ async fn drop_runtime_with_active_streams() {
 
     with_timeout(Duration::from_secs(5), async {
         let rt = create_runtime();
-        let (stream_a, stream_b, socket_a, socket_b) =
-            create_connected_pair(&rt).await;
+        let (stream_a, stream_b, socket_a, socket_b) = create_connected_pair(&rt).await;
 
         stream_a.write(b"active data").await.expect("write");
 
@@ -144,10 +142,7 @@ async fn double_connect() {
             .expect("first connect should succeed");
 
         let result = stream.connect(&socket, 20, target).await;
-        assert!(
-            result.is_err(),
-            "second connect on same stream should fail"
-        );
+        assert!(result.is_err(), "second connect on same stream should fail");
     })
     .await;
 }
@@ -164,8 +159,7 @@ async fn shared_runtime_outlives_owner() {
         // owner dropped — shared runtime from handle must still work
         let shared = libudx::UdxRuntime::shared(handle);
 
-        let (stream_a, mut stream_b, _socket_a, _socket_b) =
-            create_connected_pair(&shared).await;
+        let (stream_a, mut stream_b, _socket_a, _socket_b) = create_connected_pair(&shared).await;
 
         stream_a.write(b"from shared runtime").await.expect("write");
         let received = stream_b.read().await.expect("read").expect("EOF");

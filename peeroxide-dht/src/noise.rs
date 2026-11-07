@@ -12,12 +12,12 @@
 
 use blake2::digest::consts::U64;
 use blake2::{Blake2b, Digest};
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Nonce,
-};
 use chacha20poly1305::aead::rand_core::RngCore;
-use curve25519_dalek::{edwards::CompressedEdwardsY, Scalar};
+use chacha20poly1305::{
+    ChaCha20Poly1305, Nonce,
+    aead::{Aead, KeyInit, Payload},
+};
+use curve25519_dalek::{Scalar, edwards::CompressedEdwardsY};
 use ed25519_dalek::SigningKey;
 use sha2::Sha512;
 
@@ -154,7 +154,10 @@ struct CipherState {
 
 impl CipherState {
     fn new() -> Self {
-        CipherState { key: None, nonce: 0 }
+        CipherState {
+            key: None,
+            nonce: 0,
+        }
     }
 
     fn has_key(&self) -> bool {
@@ -189,7 +192,13 @@ impl CipherState {
             .expect("key is always 32 bytes");
         let nonce = Nonce::from(nonce_bytes);
         let ciphertext = cipher
-            .encrypt(&nonce, Payload { msg: plaintext, aad: ad })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: ad,
+                },
+            )
             .map_err(|_| NoiseError::DecryptionFailed)?;
         self.nonce += 1;
         Ok(ciphertext)
@@ -208,7 +217,13 @@ impl CipherState {
             .expect("key is always 32 bytes");
         let nonce = Nonce::from(nonce_bytes);
         let plaintext = cipher
-            .decrypt(&nonce, Payload { msg: ciphertext, aad: ad })
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: ad,
+                },
+            )
             .map_err(|_| NoiseError::DecryptionFailed)?;
         self.nonce += 1;
         Ok(plaintext)
@@ -522,11 +537,17 @@ impl Handshake {
         self.symmetric.mix_key(&dh_ee);
 
         // TOK_S: decrypt_and_hash(message[32..80])  → rs (32 bytes)
-        let enc_s_len = if self.symmetric.has_key() { 32 + 16 } else { 32 };
+        let enc_s_len = if self.symmetric.has_key() {
+            32 + 16
+        } else {
+            32
+        };
         if message.len() < offset + enc_s_len {
             return Err(NoiseError::UnexpectedState);
         }
-        let rs_bytes = self.symmetric.decrypt_and_hash(&message[offset..offset + enc_s_len])?;
+        let rs_bytes = self
+            .symmetric
+            .decrypt_and_hash(&message[offset..offset + enc_s_len])?;
         let mut rs = [0u8; 32];
         rs.copy_from_slice(&rs_bytes);
         self.rs = Some(rs);
@@ -587,7 +608,11 @@ impl Handshake {
         let e_secret = e.secret_key;
 
         // TOK_S: decrypt_and_hash(message[0..48])  → rs
-        let enc_s_len = if self.symmetric.has_key() { 32 + 16 } else { 32 };
+        let enc_s_len = if self.symmetric.has_key() {
+            32 + 16
+        } else {
+            32
+        };
         let rs_bytes = self.symmetric.decrypt_and_hash(&message[..enc_s_len])?;
         let mut rs = [0u8; 32];
         rs.copy_from_slice(&rs_bytes);
@@ -764,7 +789,9 @@ impl HandshakeIK {
         if message.len() < offset + enc_s_len {
             return Err(NoiseError::UnexpectedState);
         }
-        let rs_bytes = self.symmetric.decrypt_and_hash(&message[offset..offset + enc_s_len])?;
+        let rs_bytes = self
+            .symmetric
+            .decrypt_and_hash(&message[offset..offset + enc_s_len])?;
         let mut rs = [0u8; 32];
         rs.copy_from_slice(&rs_bytes);
         self.rs = Some(rs);
@@ -872,7 +899,10 @@ pub fn keypair_from_seed(seed: &[u8; 32]) -> Keypair {
     let mut secret_key = [0u8; 64];
     secret_key[..32].copy_from_slice(seed);
     secret_key[32..].copy_from_slice(&pub_key);
-    Keypair { public_key: pub_key, secret_key }
+    Keypair {
+        public_key: pub_key,
+        secret_key,
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -956,17 +986,29 @@ mod tests {
 
         // M1: Initiator → Responder
         let m1 = initiator.send().expect("initiator send M1");
-        assert!(!initiator.complete(), "initiator should not be done after M1");
+        assert!(
+            !initiator.complete(),
+            "initiator should not be done after M1"
+        );
 
         responder.recv(&m1).expect("responder recv M1");
-        assert!(!responder.complete(), "responder should not be done after M1");
+        assert!(
+            !responder.complete(),
+            "responder should not be done after M1"
+        );
 
         // M2: Responder → Initiator
         let m2 = responder.send().expect("responder send M2");
-        assert!(!responder.complete(), "responder should not be done after M2");
+        assert!(
+            !responder.complete(),
+            "responder should not be done after M2"
+        );
 
         initiator.recv(&m2).expect("initiator recv M2");
-        assert!(!initiator.complete(), "initiator should not be done after M2");
+        assert!(
+            !initiator.complete(),
+            "initiator should not be done after M2"
+        );
 
         // M3: Initiator → Responder
         let m3 = initiator.send().expect("initiator send M3");
@@ -981,8 +1023,14 @@ mod tests {
         let init_result = initiator.result().expect("initiator result should be set");
 
         // Session keys must agree
-        assert_eq!(init_result.tx, resp_result.rx, "initiator.tx == responder.rx");
-        assert_eq!(init_result.rx, resp_result.tx, "initiator.rx == responder.tx");
+        assert_eq!(
+            init_result.tx, resp_result.rx,
+            "initiator.tx == responder.rx"
+        );
+        assert_eq!(
+            init_result.rx, resp_result.tx,
+            "initiator.rx == responder.tx"
+        );
 
         // Handshake hashes must agree
         assert_eq!(

@@ -11,16 +11,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use blake2::digest::consts::U32;
-use blake2::digest::Mac;
 use blake2::Blake2bMac;
+use blake2::digest::Mac;
+use blake2::digest::consts::U32;
 use tokio::time::Instant;
 
 use libudx::{Datagram, UdxRuntime, UdxSocket};
 
 use crate::messages::{self, Ipv4Peer, Response};
 use crate::peer::{self, NodeId};
-use crate::routing_table::{RoutingTable, K};
+use crate::routing_table::{K, RoutingTable};
 
 type Blake2bMac256 = Blake2bMac<U32>;
 
@@ -709,7 +709,9 @@ impl Io {
             tracing::warn!(err = %e, "send_request_via_socket: send_to failed");
             return None;
         }
-        self.wire.bytes_sent.fetch_add(buffer_len, Ordering::Relaxed);
+        self.wire
+            .bytes_sent
+            .fetch_add(buffer_len, Ordering::Relaxed);
 
         self.stats.active += 1;
         self.stats.total += 1;
@@ -901,7 +903,9 @@ impl Io {
             tracing::warn!(err = %e, "relay: send_to failed");
             return false;
         }
-        self.wire.bytes_sent.fetch_add(buffer_len, Ordering::Relaxed);
+        self.wire
+            .bytes_sent
+            .fetch_add(buffer_len, Ordering::Relaxed);
 
         true
     }
@@ -975,11 +979,7 @@ impl Io {
     }
 
     /// Encode and send a response message.
-    fn send_reply_internal(
-        &mut self,
-        to: &Ipv4Peer,
-        params: ReplyInternalParams,
-    ) {
+    fn send_reply_internal(&mut self, to: &Ipv4Peer, params: ReplyInternalParams) {
         if self.suspended {
             return;
         }
@@ -1071,7 +1071,9 @@ impl Io {
         if let Err(e) = socket.send_to(&buffer, addr) {
             tracing::warn!(err = %e, "send_inflight_at: send_to failed");
         } else {
-            self.wire.bytes_sent.fetch_add(buffer_len, Ordering::Relaxed);
+            self.wire
+                .bytes_sent
+                .fetch_add(buffer_len, Ordering::Relaxed);
         }
     }
 
@@ -1106,7 +1108,10 @@ impl Io {
             Ok(messages::Message::Request(req)) => {
                 // Validate token if present.
                 if req.token.is_some() {
-                    let token_val = req.token.as_ref().map(|t| self.validate_token(&from.host, t));
+                    let token_val = req
+                        .token
+                        .as_ref()
+                        .map(|t| self.validate_token(&from.host, t));
                     if token_val == Some(false) {
                         let tid = req.tid;
                         let target = req.target;
@@ -1129,11 +1134,7 @@ impl Io {
                 // Validate incoming ID.
                 let validated_id = req.id.and_then(|id| {
                     let expected = peer::peer_id(&from.host, from.port);
-                    if expected == id {
-                        Some(expected)
-                    } else {
-                        None
-                    }
+                    if expected == id { Some(expected) } else { None }
                 });
 
                 Some(IoEvent::IncomingRequest(IncomingRequest {
@@ -1174,11 +1175,7 @@ impl Io {
                 // Validate incoming ID.
                 let validated_id = res.id.and_then(|id| {
                     let expected = peer::peer_id(&from.host, from.port);
-                    if expected == id {
-                        Some(expected)
-                    } else {
-                        None
-                    }
+                    if expected == id { Some(expected) } else { None }
                 });
 
                 let request = ResolvedRequest {
@@ -1203,7 +1200,6 @@ impl Io {
                     socket: socket_kind,
                 })
             }
-
         }
     }
 }
@@ -1372,5 +1368,4 @@ mod tests {
 
         assert!(!validate_wrong(&token));
     }
-
 }

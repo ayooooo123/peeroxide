@@ -44,8 +44,7 @@ pub const NEED_LIST_HEADER_SIZE: usize = 1 + 2;
 pub const NEED_ENTRY_SIZE: usize = 8;
 
 /// Maximum entries per need-list record (124).
-pub const NEED_LIST_ENTRY_CAP: usize =
-    (MAX_CHUNK_SIZE - NEED_LIST_HEADER_SIZE) / NEED_ENTRY_SIZE;
+pub const NEED_LIST_ENTRY_CAP: usize = (MAX_CHUNK_SIZE - NEED_LIST_HEADER_SIZE) / NEED_ENTRY_SIZE;
 
 /// SHA/BLAKE-256 size in bytes (for slot entries).
 pub const HASH_LEN: usize = 32;
@@ -74,14 +73,20 @@ impl std::fmt::Display for WireError {
                 write!(f, "slot byte length {n} not a multiple of 32")
             }
             WireError::OversizedChunk(n) => {
-                write!(f, "chunk size {n} exceeds MAX_CHUNK_SIZE ({MAX_CHUNK_SIZE})")
+                write!(
+                    f,
+                    "chunk size {n} exceeds MAX_CHUNK_SIZE ({MAX_CHUNK_SIZE})"
+                )
             }
             WireError::BadCount { declared, computed } => write!(
                 f,
                 "need-list count mismatch: declared {declared}, computed from length {computed}"
             ),
             WireError::InvalidEntry { start, end } => {
-                write!(f, "invalid need-list entry: start={start} end={end} (need start < end)")
+                write!(
+                    f,
+                    "invalid need-list entry: start={start} end={end} (need start < end)"
+                )
             }
         }
     }

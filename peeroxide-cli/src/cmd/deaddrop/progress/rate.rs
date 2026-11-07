@@ -172,7 +172,11 @@ mod tests {
         }
         rate.record(start + Duration::from_secs(10), 100);
 
-        assert!((50..=51).contains(&rate.window.len()), "len={}", rate.window.len());
+        assert!(
+            (50..=51).contains(&rate.window.len()),
+            "len={}",
+            rate.window.len()
+        );
         assert!(
             rate.window.front().is_some_and(|(instant, _)| {
                 instant

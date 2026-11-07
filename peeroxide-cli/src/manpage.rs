@@ -32,9 +32,7 @@ fn collect_pages(cmd: clap::Command, prefix: &str, pages: &mut Vec<(String, Vec<
 }
 
 fn render_page(cmd: clap::Command, name: &str) -> Vec<u8> {
-    let cmd = cmd
-        .display_name(name.to_owned())
-        .bin_name(name.to_owned());
+    let cmd = cmd.display_name(name.to_owned()).bin_name(name.to_owned());
     let cmd = apply_long_about(cmd, name);
 
     let man = clap_mangen::Man::new(cmd.clone())
@@ -72,9 +70,7 @@ fn render_page(cmd: clap::Command, name: &str) -> Vec<u8> {
 }
 
 fn render_consolidated_page(cmd: clap::Command, name: &str) -> Vec<u8> {
-    let cmd = cmd
-        .display_name(name.to_owned())
-        .bin_name(name.to_owned());
+    let cmd = cmd.display_name(name.to_owned()).bin_name(name.to_owned());
     let cmd = apply_long_about(cmd, name);
 
     let man = clap_mangen::Man::new(cmd.clone())
@@ -141,7 +137,10 @@ fn write_synopsis_recursive(buf: &mut Vec<u8>, cmd: &clap::Command, invocation: 
 
         writeln!(buf, ".B {sub_invocation}").unwrap();
         let mut opts = Vec::new();
-        for arg in sub.get_arguments().filter(|a| !a.is_hide_set() && !is_global_arg(a)) {
+        for arg in sub
+            .get_arguments()
+            .filter(|a| !a.is_hide_set() && !is_global_arg(a))
+        {
             if arg.is_positional() {
                 if arg.is_required_set() {
                     opts.push(format!("<{}>", arg.get_id()));
@@ -150,7 +149,10 @@ fn write_synopsis_recursive(buf: &mut Vec<u8>, cmd: &clap::Command, invocation: 
                 }
             } else if let Some(long) = arg.get_long() {
                 if arg.get_action().takes_values() {
-                    opts.push(format!("[--{long} {val}]", val = arg.get_id().as_str().to_uppercase()));
+                    opts.push(format!(
+                        "[--{long} {val}]",
+                        val = arg.get_id().as_str().to_uppercase()
+                    ));
                 } else {
                     opts.push(format!("[--{long}]"));
                 }
@@ -168,12 +170,7 @@ fn write_consolidated_commands(buf: &mut Vec<u8>, cmd: &clap::Command, parent_na
     write_commands_recursive(buf, cmd, parent_name, "");
 }
 
-fn write_commands_recursive(
-    buf: &mut Vec<u8>,
-    cmd: &clap::Command,
-    parent_name: &str,
-    path: &str,
-) {
+fn write_commands_recursive(buf: &mut Vec<u8>, cmd: &clap::Command, parent_name: &str, path: &str) {
     for sub in cmd.get_subcommands() {
         if sub.is_hide_set() || sub.get_name() == "help" {
             continue;
@@ -225,13 +222,7 @@ fn write_commands_recursive(
 fn is_global_arg(arg: &clap::Arg) -> bool {
     matches!(
         arg.get_id().as_str(),
-        "config"
-            | "no_default_config"
-            | "public"
-            | "no_public"
-            | "bootstrap"
-            | "verbose"
-            | "help"
+        "config" | "no_default_config" | "public" | "no_public" | "bootstrap" | "verbose" | "help"
     )
 }
 
@@ -282,10 +273,7 @@ fn write_examples_section(buf: &mut Vec<u8>, examples: &[(&str, &str)]) {
 
 fn write_see_also_section(buf: &mut Vec<u8>, refs: &[&str]) {
     buf.write_all(b".SH SEE ALSO\n").unwrap();
-    let formatted: Vec<String> = refs
-        .iter()
-        .map(|r| format!("\\fB{r}\\fR(1)"))
-        .collect();
+    let formatted: Vec<String> = refs.iter().map(|r| format!("\\fB{r}\\fR(1)")).collect();
     writeln!(buf, "{}", formatted.join(",\n")).unwrap();
 }
 
@@ -539,9 +527,7 @@ fn long_about_for(name: &str) -> Option<&'static str> {
              seed, an optional screen name and bio, and a friend list. The \\fBdefault\\fR \
              profile is auto-created on first run and cannot be deleted.",
         ),
-        "peeroxide-chat-profiles-list" => Some(
-            "List all locally-known profile names.",
-        ),
+        "peeroxide-chat-profiles-list" => Some("List all locally-known profile names."),
         "peeroxide-chat-profiles-create" => Some(
             "Create a new profile with a freshly generated Ed25519 keypair. If \
              \\fB--screen-name\\fR is omitted, a vendor name is generated deterministically \

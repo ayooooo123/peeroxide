@@ -1,15 +1,15 @@
 use clap::Args;
 use libudx::UdxRuntime;
-use peeroxide_dht::hyperdht::{self, HyperDhtConfig, KeyPair};
 use peeroxide_dht::blind_relay::BlindRelayServerConfig;
+use peeroxide_dht::hyperdht::{self, HyperDhtConfig, KeyPair};
 use peeroxide_dht::persistent::PersistentConfig;
 use peeroxide_dht::relay_service::{self, RelayServiceConfig};
 use peeroxide_dht::rpc::DhtConfig;
-use tokio::signal;
 use std::time::Duration;
+use tokio::signal;
 
-use crate::config::ResolvedConfig;
 use super::{resolve_bootstrap, to_hex};
+use crate::config::ResolvedConfig;
 
 #[derive(Args)]
 pub struct NodeArgs {
@@ -75,8 +75,14 @@ pub struct NodeArgs {
 
 pub async fn run(args: NodeArgs, cfg: &ResolvedConfig) -> i32 {
     let port = args.port.or(cfg.node.port).unwrap_or(49737);
-    let host = args.host.or_else(|| cfg.node.host.clone()).unwrap_or_else(|| "0.0.0.0".to_string());
-    let stats_interval = args.stats_interval.or(cfg.node.stats_interval).unwrap_or(60);
+    let host = args
+        .host
+        .or_else(|| cfg.node.host.clone())
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let stats_interval = args
+        .stats_interval
+        .or(cfg.node.stats_interval)
+        .unwrap_or(60);
 
     if stats_interval == 0 {
         eprintln!("error: --stats-interval must be greater than 0");
@@ -276,10 +282,11 @@ fn parse_relay_key_seed(seed_hex: Option<&str>) -> Result<KeyPair, String> {
     match seed_hex {
         None => Ok(KeyPair::generate()),
         Some(hex_str) => {
-            let bytes = hex::decode(hex_str).map_err(|e| format!("invalid --relay-key-seed hex: {e}"))?;
-            let seed: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| "--relay-key-seed must be exactly 32 bytes (64 hex chars)".to_string())?;
+            let bytes =
+                hex::decode(hex_str).map_err(|e| format!("invalid --relay-key-seed hex: {e}"))?;
+            let seed: [u8; 32] = bytes.try_into().map_err(|_| {
+                "--relay-key-seed must be exactly 32 bytes (64 hex chars)".to_string()
+            })?;
             Ok(KeyPair::from_seed(seed))
         }
     }

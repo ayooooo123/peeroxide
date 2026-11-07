@@ -244,10 +244,7 @@ impl BlindRelayClient {
                     if message_type == MSG_TYPE_PAIR {
                         let response = decode_pair_from_slice(&data)?;
                         if response.token == *token && response.is_initiator == is_initiator {
-                            debug!(
-                                remote_id = response.id,
-                                "pair response received"
-                            );
+                            debug!(remote_id = response.id, "pair response received");
                             return Ok(PairResponse {
                                 remote_id: response.id,
                             });
@@ -508,7 +505,9 @@ struct PendingPairing {
 
 impl PendingPairing {
     fn empty() -> Self {
-        Self { links: [None, None] }
+        Self {
+            links: [None, None],
+        }
     }
 
     fn slot(&self, is_initiator: bool) -> &Option<PendingLink> {
@@ -588,17 +587,18 @@ impl BlindRelayServer {
             if self
                 .inner
                 .session_count
-                .compare_exchange(
-                    current,
-                    current + 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 let id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
-                self.inner.stats.sessions_accepted.fetch_add(1, Ordering::Relaxed);
-                self.inner.stats.sessions_active.fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .stats
+                    .sessions_accepted
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .stats
+                    .sessions_active
+                    .fetch_add(1, Ordering::Relaxed);
                 return Some(id);
             }
         }
@@ -609,7 +609,11 @@ impl BlindRelayServer {
     /// doesn't immediately look infinitely idle to
     /// [`Self::sweep_idle_sessions`]. Call once, right after
     /// [`Self::try_accept_session`] succeeds.
-    pub fn register_session(&self, session_id: u64, outbound_tx: mpsc::UnboundedSender<SessionOutbound>) {
+    pub fn register_session(
+        &self,
+        session_id: u64,
+        outbound_tx: mpsc::UnboundedSender<SessionOutbound>,
+    ) {
         self.inner
             .session_outbound
             .lock()
@@ -635,7 +639,10 @@ impl BlindRelayServer {
     /// `this._streams` when a session's channel closes).
     pub fn release_session(&self, session_id: u64) {
         self.inner.session_count.fetch_sub(1, Ordering::AcqRel);
-        self.inner.stats.sessions_active.fetch_sub(1, Ordering::Relaxed);
+        self.inner
+            .stats
+            .sessions_active
+            .fetch_sub(1, Ordering::Relaxed);
         self.inner
             .session_activity
             .lock()
@@ -657,8 +664,14 @@ impl BlindRelayServer {
                 }
             }
             if touched && pair.links.iter().all(Option::is_none) {
-                self.inner.stats.pairings_cancelled.fetch_add(1, Ordering::Relaxed);
-                self.inner.stats.pairings_pending.fetch_sub(1, Ordering::Relaxed);
+                self.inner
+                    .stats
+                    .pairings_cancelled
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .stats
+                    .pairings_pending
+                    .fetch_sub(1, Ordering::Relaxed);
                 false // remove entry
             } else {
                 true
@@ -668,11 +681,18 @@ impl BlindRelayServer {
 
         // Mirrors Node's `_onclose`: destroy every active stream this
         // session was part of.
-        let mut active = self.inner.active_pairings.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = self
+            .inner
+            .active_pairings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         active.retain(|_token, pair| {
             if pair.session_ids.contains(&session_id) {
                 let _ = pair.teardown_tx.send(());
-                self.inner.stats.pairings_active.fetch_sub(1, Ordering::Relaxed);
+                self.inner
+                    .stats
+                    .pairings_active
+                    .fetch_sub(1, Ordering::Relaxed);
                 false // remove entry
             } else {
                 true
@@ -697,7 +717,10 @@ impl BlindRelayServer {
             return PairOutcome::LimitExceeded;
         }
 
-        self.inner.stats.pairings_requested.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .stats
+            .pairings_requested
+            .fetch_add(1, Ordering::Relaxed);
 
         let mut pairing = self.inner.pairing.lock().unwrap_or_else(|e| e.into_inner());
         let pair = pairing.entry(token).or_insert_with(PendingPairing::empty);
@@ -719,7 +742,10 @@ impl BlindRelayServer {
 
         let other = &pair.links[usize::from(!is_initiator)];
         let Some(other_link) = other else {
-            self.inner.stats.pairings_pending.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .stats
+                .pairings_pending
+                .fetch_add(1, Ordering::Relaxed);
             return PairOutcome::Pending;
         };
 
@@ -744,16 +770,29 @@ impl BlindRelayServer {
         pairing.remove(&token);
 
         // Only the first side ever incremented `pairings_pending`.
-        self.inner.stats.pairings_pending.fetch_sub(1, Ordering::Relaxed);
-        self.inner.stats.pairings_matched.fetch_add(1, Ordering::Relaxed);
-        self.inner.stats.pairings_active.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .stats
+            .pairings_pending
+            .fetch_sub(1, Ordering::Relaxed);
+        self.inner
+            .stats
+            .pairings_matched
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .stats
+            .pairings_active
+            .fetch_add(1, Ordering::Relaxed);
 
         debug!(
             token = %format_args!("{:02x?}", &token[..4]),
             "blind-relay pairing matched"
         );
 
-        PairOutcome::Matched(MatchedPairing { token, first, second })
+        PairOutcome::Matched(MatchedPairing {
+            token,
+            first,
+            second,
+        })
     }
 
     /// Register an already-matched pairing's data-plane as active, so a
@@ -813,8 +852,14 @@ impl BlindRelayServer {
             pairing.remove(&token);
         }
 
-        self.inner.stats.pairings_cancelled.fetch_add(1, Ordering::Relaxed);
-        self.inner.stats.pairings_pending.fetch_sub(1, Ordering::Relaxed);
+        self.inner
+            .stats
+            .pairings_cancelled
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .stats
+            .pairings_pending
+            .fetch_sub(1, Ordering::Relaxed);
 
         UnpairOutcome::Cancelled
     }
@@ -823,12 +868,19 @@ impl BlindRelayServer {
     /// its `teardown_tx` and remove the entry. Shared tail of
     /// [`Self::unpair`] for the "already matched" case.
     fn unpair_active(&self, token: [u8; 32]) -> UnpairOutcome {
-        let mut active = self.inner.active_pairings.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = self
+            .inner
+            .active_pairings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(pair) = active.remove(&token) else {
             return UnpairOutcome::NotFound;
         };
         let _ = pair.teardown_tx.send(());
-        self.inner.stats.pairings_active.fetch_sub(1, Ordering::Relaxed);
+        self.inner
+            .stats
+            .pairings_active
+            .fetch_sub(1, Ordering::Relaxed);
         UnpairOutcome::Destroyed
     }
 
@@ -840,7 +892,11 @@ impl BlindRelayServer {
     /// [`Self::sweep_expired_pairings`].
     pub fn sweep_idle_sessions(&self) -> Vec<u64> {
         let timeout = self.inner.config.idle_session_timeout;
-        let activity = self.inner.session_activity.lock().unwrap_or_else(|e| e.into_inner());
+        let activity = self
+            .inner
+            .session_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let idle: Vec<u64> = activity
             .iter()
             .filter(|(_, last)| last.elapsed() > timeout)
@@ -852,7 +908,11 @@ impl BlindRelayServer {
             return idle;
         }
 
-        let outbound = self.inner.session_outbound.lock().unwrap_or_else(|e| e.into_inner());
+        let outbound = self
+            .inner
+            .session_outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let closed: Vec<u64> = idle
             .into_iter()
             .filter(|id| {
@@ -1037,8 +1097,8 @@ impl BlindRelaySession {
 #[cfg(test)]
 mod golden_interop {
     use super::{
-        decode_pair_from_slice, decode_unpair_from_slice, encode_pair_to_vec, encode_unpair_to_vec,
-        PairMessage, UnpairMessage,
+        PairMessage, UnpairMessage, decode_pair_from_slice, decode_unpair_from_slice,
+        encode_pair_to_vec, encode_unpair_to_vec,
     };
     use serde::Deserialize;
 
@@ -1154,7 +1214,8 @@ mod golden_interop {
             };
 
             assert_eq!(
-                encoded, expected_bytes,
+                encoded,
+                expected_bytes,
                 "[{}] encode roundtrip mismatch\n  encoded: {}\n  expected: {}",
                 fix.label,
                 hex::encode(&encoded),
@@ -1224,9 +1285,7 @@ mod tests {
 
     #[test]
     fn unpair_roundtrip() {
-        let msg = UnpairMessage {
-            token: [0xcc; 32],
-        };
+        let msg = UnpairMessage { token: [0xcc; 32] };
         let encoded = encode_unpair_to_vec(&msg);
         let decoded = decode_unpair_from_slice(&encoded).unwrap();
         assert_eq!(decoded, msg);
@@ -1267,9 +1326,7 @@ mod tests {
 
     #[test]
     fn unpair_wire_format() {
-        let msg = UnpairMessage {
-            token: [0xff; 32],
-        };
+        let msg = UnpairMessage { token: [0xff; 32] };
         let encoded = encode_unpair_to_vec(&msg);
 
         assert_eq!(encoded[0], 0x00); // flags: all zero
@@ -1773,10 +1830,7 @@ mod tests {
 
         let closed = server.sweep_idle_sessions();
         assert_eq!(closed, vec![session_id]);
-        assert!(matches!(
-            outbound_rx.try_recv(),
-            Ok(SessionOutbound::Close)
-        ));
+        assert!(matches!(outbound_rx.try_recv(), Ok(SessionOutbound::Close)));
     }
 
     #[test]

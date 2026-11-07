@@ -10,8 +10,7 @@ use tokio::task::JoinHandle;
 
 use crate::cmd::deaddrop::progress::{
     format::{
-        render_bar_line, render_data_line, render_index_line, render_overall_line,
-        render_wire_line,
+        render_bar_line, render_data_line, render_index_line, render_overall_line, render_wire_line,
     },
     rate::RateCalculator,
     state::{Phase, ProgressState},
@@ -58,7 +57,7 @@ impl BarRenderer {
 
         // All layouts now use MultiProgress because we add a wire-stats bar.
         let bar_count = match layout {
-            BarLayout::Single => 2, // main + wire
+            BarLayout::Single => 2,     // main + wire
             BarLayout::V2GetMulti => 4, // index + data + wire + overall
         };
         let mp = MultiProgress::new();

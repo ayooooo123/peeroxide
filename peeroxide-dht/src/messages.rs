@@ -282,10 +282,7 @@ pub fn encode_response(state: &mut State, res: &Response) -> Result<(), Encoding
 /// Decodes a [`Message`] from the compact-encoding buffer.
 pub fn decode_message(buf: &[u8]) -> Result<Message, EncodingError> {
     if buf.is_empty() {
-        return Err(EncodingError::OutOfBounds {
-            need: 1,
-            have: 0,
-        });
+        return Err(EncodingError::OutOfBounds { need: 1, have: 0 });
     }
 
     let type_version = buf[0];

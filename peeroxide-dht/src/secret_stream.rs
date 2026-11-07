@@ -19,9 +19,9 @@
 
 use std::sync::LazyLock;
 
-use blake2::digest::{KeyInit, Mac};
 use blake2::Blake2bMac;
 use blake2::digest::consts::U32;
+use blake2::digest::{KeyInit, Mac};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tracing::debug;
@@ -168,10 +168,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> SecretStream<T> {
             .ok_or(SecretStreamError::HandshakeIncomplete)?
             .clone();
 
-        debug!(
-            is_initiator,
-            "noise handshake complete"
-        );
+        debug!(is_initiator, "noise handshake complete");
 
         // ── Phase 2: ID header exchange ──────────────────────────────────
         // Create encryptor → produces the 24-byte secretstream header.
@@ -507,9 +504,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(
 ///
 /// Returns `Ok(None)` on clean EOF (zero bytes read for the length header).
 /// Returns `Err(UnexpectedEof)` if EOF occurs mid-message.
-async fn read_frame<R: AsyncRead + Unpin>(
-    r: &mut R,
-) -> Result<Option<Vec<u8>>, SecretStreamError> {
+async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Vec<u8>>, SecretStreamError> {
     let mut header = [0u8; 3];
     match r.read_exact(&mut header).await {
         Ok(_) => {}

@@ -168,7 +168,8 @@ mod tests {
         let feed_kp = KeyPair::generate();
         let id_kp = KeyPair::generate();
         let channel_key = [0x42u8; 32];
-        let ownership = crypto::ownership_proof(&id_kp.secret_key, &feed_kp.public_key, &channel_key);
+        let ownership =
+            crypto::ownership_proof(&id_kp.secret_key, &feed_kp.public_key, &channel_key);
         FeedState::new(feed_kp, id_kp, channel_key, ownership, lifetime_minutes)
     }
 
@@ -242,13 +243,23 @@ mod tests {
         let fs1 = make_feed_state(60);
         let fs2 = make_feed_state(60);
         let fs3 = make_feed_state(60);
-        let lifetimes = [fs1.feed_lifetime_secs, fs2.feed_lifetime_secs, fs3.feed_lifetime_secs];
+        let lifetimes = [
+            fs1.feed_lifetime_secs,
+            fs2.feed_lifetime_secs,
+            fs3.feed_lifetime_secs,
+        ];
         let all_same = lifetimes[0] == lifetimes[1] && lifetimes[1] == lifetimes[2];
         let min = 60 * 60 / 2;
         let max = 60 * 60 * 3 / 2;
         for l in &lifetimes {
-            assert!(*l >= min && *l <= max, "lifetime {l} not in expected range [{min}, {max}]");
+            assert!(
+                *l >= min && *l <= max,
+                "lifetime {l} not in expected range [{min}, {max}]"
+            );
         }
-        assert!(!all_same || lifetimes[0] != 3600, "extremely unlikely: 3 feeds with identical non-60min lifetime");
+        assert!(
+            !all_same || lifetimes[0] != 3600,
+            "extremely unlikely: 3 feeds with identical non-60min lifetime"
+        );
     }
 }

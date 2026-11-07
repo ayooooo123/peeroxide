@@ -57,10 +57,22 @@ pub enum HandshakeAction {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum HolepunchAction {
-    Reply { value: Vec<u8>, to: Ipv4Peer },
-    Relay { value: Vec<u8>, to: Ipv4Peer },
-    ForwardRequest { value: Vec<u8>, to: Ipv4Peer },
-    ReplyTo { value: Vec<u8>, to: Ipv4Peer },
+    Reply {
+        value: Vec<u8>,
+        to: Ipv4Peer,
+    },
+    Relay {
+        value: Vec<u8>,
+        to: Ipv4Peer,
+    },
+    ForwardRequest {
+        value: Vec<u8>,
+        to: Ipv4Peer,
+    },
+    ReplyTo {
+        value: Vec<u8>,
+        to: Ipv4Peer,
+    },
     HandleLocally {
         msg: HolepunchMessage,
         peer_address: Ipv4Peer,
@@ -234,8 +246,7 @@ impl Router {
                                 peer_address: Some(from.clone()),
                                 relay_address: None,
                             };
-                            let encoded =
-                                hyperdht_messages::encode_handshake_to_bytes(&relayed)?;
+                            let encoded = hyperdht_messages::encode_handshake_to_bytes(&relayed)?;
                             Ok(HandshakeAction::ForwardRequest {
                                 value: encoded,
                                 to: target_addr,
@@ -315,10 +326,7 @@ impl Router {
                     peer_address: Some(from.clone()),
                 };
                 let encoded = hyperdht_messages::encode_holepunch_msg_to_bytes(&relayed)?;
-                Ok(HolepunchAction::ForwardRequest {
-                    value: encoded,
-                    to,
-                })
+                Ok(HolepunchAction::ForwardRequest { value: encoded, to })
             }
             MODE_FROM_RELAY => {
                 if !is_server {
@@ -525,7 +533,11 @@ mod tests {
 
         router.gc();
         assert!(router.get(&key1).is_some(), "fresh entry should survive gc");
-        assert_eq!(router.forwards.len(), 1, "expired entry should be removed by gc");
+        assert_eq!(
+            router.forwards.len(),
+            1,
+            "expired entry should be removed by gc"
+        );
     }
 
     #[test]
@@ -569,11 +581,7 @@ mod tests {
         );
 
         router.gc();
-        assert_eq!(
-            router.forwards.len(),
-            1,
-            "server entry must survive gc"
-        );
+        assert_eq!(router.forwards.len(), 1, "server entry must survive gc");
     }
 
     #[test]
@@ -662,7 +670,11 @@ mod tests {
         let from = peer("1.2.3.4", 1000);
 
         let router = Router::new();
-        assert!(router.validate_handshake_reply(&encoded, &from, &from).is_err());
+        assert!(
+            router
+                .validate_handshake_reply(&encoded, &from, &from)
+                .is_err()
+        );
     }
 
     #[test]
@@ -676,9 +688,11 @@ mod tests {
         let encoded = hyperdht_messages::encode_handshake_to_bytes(&reply_msg).unwrap();
 
         let router = Router::new();
-        assert!(router
-            .validate_handshake_reply(&encoded, &peer("1.2.3.4", 1000), &peer("5.6.7.8", 2000))
-            .is_err());
+        assert!(
+            router
+                .validate_handshake_reply(&encoded, &peer("1.2.3.4", 1000), &peer("5.6.7.8", 2000))
+                .is_err()
+        );
     }
 
     #[test]
@@ -811,9 +825,9 @@ mod tests {
                 assert_eq!(to.host, "10.0.0.5");
                 assert_eq!(to.port, 4000);
             }
-            other => panic!(
-                "Expected ForwardRequest to server via self-announce entry, got {other:?}"
-            ),
+            other => {
+                panic!("Expected ForwardRequest to server via self-announce entry, got {other:?}")
+            }
         }
     }
 
@@ -878,9 +892,7 @@ mod tests {
         };
         let encoded = hyperdht_messages::encode_handshake_to_bytes(&server_hs).unwrap();
 
-        let action = router
-            .route_handshake(None, &from, &encoded)
-            .unwrap();
+        let action = router.route_handshake(None, &from, &encoded).unwrap();
         match action {
             HandshakeAction::ReplyTo { value, to } => {
                 assert_eq!(to.host, "2.3.4.5");
@@ -976,8 +988,7 @@ mod tests {
 
     #[test]
     fn encode_client_handshake_roundtrip() {
-        let encoded =
-            Router::encode_client_handshake(vec![1, 2, 3], None, None).unwrap();
+        let encoded = Router::encode_client_handshake(vec![1, 2, 3], None, None).unwrap();
         let decoded = hyperdht_messages::decode_handshake_from_bytes(&encoded).unwrap();
         assert_eq!(decoded.mode, MODE_FROM_CLIENT);
         assert_eq!(decoded.noise, vec![1, 2, 3]);
@@ -986,8 +997,7 @@ mod tests {
     #[test]
     fn encode_client_holepunch_roundtrip() {
         let encoded =
-            Router::encode_client_holepunch(42, vec![0xaa], Some(peer("1.2.3.4", 1000)))
-                .unwrap();
+            Router::encode_client_holepunch(42, vec![0xaa], Some(peer("1.2.3.4", 1000))).unwrap();
         let decoded = hyperdht_messages::decode_holepunch_msg_from_bytes(&encoded).unwrap();
         assert_eq!(decoded.mode, MODE_FROM_CLIENT);
         assert_eq!(decoded.id, 42);

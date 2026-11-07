@@ -70,7 +70,10 @@ impl JsPeer {
                     return v["port"].as_u64().expect("missing port") as u16;
                 }
             }
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for JS peer ready");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for JS peer ready"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -81,7 +84,9 @@ impl JsPeer {
         let mut msg = cmd;
         msg["id"] = serde_json::json!(id);
         let line = serde_json::to_string(&msg).unwrap() + "\n";
-        self.stdin.write_all(line.as_bytes()).expect("write to JS stdin");
+        self.stdin
+            .write_all(line.as_bytes())
+            .expect("write to JS stdin");
         self.stdin.flush().expect("flush JS stdin");
         id
     }
@@ -99,7 +104,10 @@ impl JsPeer {
                     }
                 }
             }
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for JS reply id={id}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for JS reply id={id}"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -107,14 +115,20 @@ impl JsPeer {
     fn announce(&mut self, topic_hex: &str) -> Value {
         let id = self.send_cmd(serde_json::json!({ "cmd": "announce", "topic": topic_hex }));
         let reply = self.wait_reply(id);
-        assert!(reply["ok"].as_bool().unwrap_or(false), "JS announce failed: {reply}");
+        assert!(
+            reply["ok"].as_bool().unwrap_or(false),
+            "JS announce failed: {reply}"
+        );
         reply
     }
 
     fn lookup(&mut self, topic_hex: &str) -> Vec<String> {
         let id = self.send_cmd(serde_json::json!({ "cmd": "lookup", "topic": topic_hex }));
         let reply = self.wait_reply(id);
-        assert!(reply["ok"].as_bool().unwrap_or(false), "JS lookup failed: {reply}");
+        assert!(
+            reply["ok"].as_bool().unwrap_or(false),
+            "JS lookup failed: {reply}"
+        );
         reply["peers"]
             .as_array()
             .unwrap_or(&vec![])
@@ -208,7 +222,10 @@ async fn run_interop() -> Result<(), Box<dyn std::error::Error>> {
     assert!(js_peers.contains(&public_key), "JS lookup missed Rust peer");
     handle.unannounce(topic2_raw, &kp).await?;
     let js_peers = js.lookup(&topic2_hex);
-    assert!(!js_peers.contains(&public_key), "JS lookup still found unannounced peer");
+    assert!(
+        !js_peers.contains(&public_key),
+        "JS lookup still found unannounced peer"
+    );
 
     // ── Cleanup ───────────────────────────────────────────────────────────
     handle.destroy().await?;

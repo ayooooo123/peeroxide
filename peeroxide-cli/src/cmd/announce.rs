@@ -1,13 +1,13 @@
 use clap::Args;
-use peeroxide::{spawn, JoinOpts, KeyPair, SwarmConfig};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use peeroxide::{JoinOpts, KeyPair, SwarmConfig, spawn};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::signal;
 use tokio::sync::Semaphore;
 
-use crate::config::ResolvedConfig;
 use super::{build_dht_config, parse_topic, to_hex};
+use crate::config::ResolvedConfig;
 
 const PING_MAGIC: &[u8; 4] = b"PING";
 const PONG_MAGIC: &[u8; 4] = b"PONG";
@@ -44,7 +44,10 @@ pub async fn run(args: AnnounceArgs, cfg: &ResolvedConfig) -> i32 {
 
     if let Some(ref data) = args.data {
         if data.len() > 1000 {
-            eprintln!("error: --data exceeds 1000 byte limit ({} bytes)", data.len());
+            eprintln!(
+                "error: --data exceeds 1000 byte limit ({} bytes)",
+                data.len()
+            );
             return 1;
         }
     }
@@ -91,7 +94,10 @@ pub async fn run(args: AnnounceArgs, cfg: &ResolvedConfig) -> i32 {
     }
 
     if is_ephemeral {
-        eprintln!("ANNOUNCE blake2b(\"{}\") as @{pk_hex} (ephemeral)", args.topic);
+        eprintln!(
+            "ANNOUNCE blake2b(\"{}\") as @{pk_hex} (ephemeral)",
+            args.topic
+        );
     } else {
         eprintln!("ANNOUNCE blake2b(\"{}\") as @{pk_hex}", args.topic);
     }
@@ -102,7 +108,11 @@ pub async fn run(args: AnnounceArgs, cfg: &ResolvedConfig) -> i32 {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        match handle.dht().mutable_put(&key_pair, data.as_bytes(), seq).await {
+        match handle
+            .dht()
+            .mutable_put(&key_pair, data.as_bytes(), seq)
+            .await
+        {
             Ok(_) => {
                 eprintln!("  metadata: \"{data}\" ({} bytes, seq={seq})", data.len());
             }
@@ -119,7 +129,9 @@ pub async fn run(args: AnnounceArgs, cfg: &ResolvedConfig) -> i32 {
     let echo_sem = Arc::new(Semaphore::new(MAX_ECHO_SESSIONS));
     let active_sessions = Arc::new(AtomicUsize::new(0));
 
-    let duration_deadline = args.duration.map(|d| tokio::time::Instant::now() + Duration::from_secs(d));
+    let duration_deadline = args
+        .duration
+        .map(|d| tokio::time::Instant::now() + Duration::from_secs(d));
 
     let data_for_refresh = args.data.clone();
     let key_pair_for_refresh = key_pair.clone();
