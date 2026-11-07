@@ -13,7 +13,8 @@ use libudx::{RuntimeHandle, UdxRuntime, UdxSocket, UdxStream};
 use peeroxide_dht::crypto::hash;
 use peeroxide_dht::holepuncher::{HolepunchEvent, Holepuncher};
 use peeroxide_dht::hyperdht::{
-    self, HyperDhtConfig, HyperDhtHandle, KeyPair, PeerConnection, ServerEvent, ServerReply,
+    self, HyperDhtConfig, HyperDhtHandle, KeyPair, PeerConnection, ServerEvent,
+    ServerReply,
 };
 use peeroxide_dht::hyperdht_messages::{
     encode_handshake_to_bytes, encode_holepunch_msg_to_bytes, HandshakeMessage, HolepunchInfo,
@@ -42,8 +43,49 @@ fn track_abort(aborts: &Mutex<Vec<libudx::UdxStreamAbort>>, handle: libudx::UdxS
     }
 }
 
-fn next_stream_id() -> u32 {
-    hyperdht::alloc_stream_id()
+type ConnectionAbortMap = HashMap<[u8; 32], (u64, libudx::UdxStreamAbort)>;
+
+/// Remember the abort handle of the connection registered under
+/// `generation`, so a duplicate handshake can destroy the connection it
+/// replaces (Node's `_handleServerConnectionSwap`). Same pruning as
+/// [`track_abort`]: dead handles still pin their stream's buffers.
+fn track_conn_abort(
+    aborts: &Mutex<ConnectionAbortMap>,
+    pk: [u8; 32],
+    generation: u64,
+    handle: libudx::UdxStreamAbort,
+) {
+    if let Ok(mut aborts) = aborts.lock() {
+        aborts.retain(|_, (_, h)| h.is_alive());
+        aborts.insert(pk, (generation, handle));
+    }
+}
+
+/// Everything a spawned connection task needs to register its connection with
+/// the actor before handing it out: the abort handles (for suspend, destroy and
+/// duplicate swaps) and the close notification that frees the peer's slot.
+#[derive(Clone)]
+struct ConnectionWatch {
+    aborts: Arc<Mutex<Vec<libudx::UdxStreamAbort>>>,
+    conn_aborts: Arc<Mutex<ConnectionAbortMap>>,
+    closed_tx: Option<mpsc::UnboundedSender<([u8; 32], u64)>>,
+}
+
+impl ConnectionWatch {
+    /// Register `conn` for close/abort and give it back, ready to hand out.
+    fn watch(&self, mut conn: PeerConnection, pk: [u8; 32], generation: u64) -> PeerConnection {
+        track_abort(&self.aborts, conn.stream.abort_handle());
+        track_conn_abort(&self.conn_aborts, pk, generation, conn.stream.abort_handle());
+        if let (Some(closed), Some(sender)) =
+            (conn.stream.take_close_notification(), self.closed_tx.clone())
+        {
+            tokio::spawn(async move {
+                let _ = closed.await;
+                let _ = sender.send((pk, generation));
+            });
+        }
+        conn
+    }
 }
 
 const DEFAULT_MAX_PEERS: usize = 64;
@@ -506,8 +548,15 @@ struct SwarmActor {
     active_connects: usize,
     flush_waiters: Vec<oneshot::Sender<Result<(), SwarmError>>>,
     server_failure_tx: Option<mpsc::UnboundedSender<[u8; 32]>>,
-    outgoing_closed_tx: Option<mpsc::UnboundedSender<([u8; 32], u64)>>,
-    outgoing_generations: HashMap<[u8; 32], u64>,
+    /// Fires `(pk, generation)` when a connection's stream closes, whichever
+    /// side opened it (Node's `conn.on('close')`).
+    closed_tx: Option<mpsc::UnboundedSender<([u8; 32], u64)>>,
+    /// Generation of the connection registered in `connections` per peer, so
+    /// a late close notification only retires the connection it belongs to.
+    generations: HashMap<[u8; 32], u64>,
+    /// Abort handle of that connection, so a duplicate handshake can destroy
+    /// the connection it replaces.
+    conn_aborts: Arc<Mutex<ConnectionAbortMap>>,
     next_generation: u64,
 
     // Passive-holepunch state. When the server is firewalled, each accepted
@@ -822,8 +871,9 @@ pub async fn spawn(
         active_connects: 0,
         flush_waiters: Vec::new(),
         server_failure_tx: None,
-        outgoing_closed_tx: None,
-        outgoing_generations: HashMap::new(),
+        closed_tx: None,
+        generations: HashMap::new(),
+        conn_aborts: Arc::new(Mutex::new(HashMap::new())),
         next_generation: 0,
         connects: HashMap::new(),
         pending_handshakes: HashMap::new(),
@@ -881,8 +931,8 @@ impl SwarmActor {
         let (server_failure_tx, mut server_failure_rx) =
             mpsc::unbounded_channel::<[u8; 32]>();
         self.server_failure_tx = Some(server_failure_tx);
-        let (outgoing_closed_tx, mut outgoing_closed_rx) = mpsc::unbounded_channel();
-        self.outgoing_closed_tx = Some(outgoing_closed_tx);
+        let (closed_tx, mut closed_rx) = mpsc::unbounded_channel();
+        self.closed_tx = Some(closed_tx);
 
         let mut reply_sweep = tokio::time::interval(HANDSHAKE_REPLY_TTL);
         reply_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -915,16 +965,26 @@ impl SwarmActor {
                         self.handle_retry(pk);
                     }
                 }
-                closed = outgoing_closed_rx.recv() => {
+                closed = closed_rx.recv() => {
                     if let Some((pk, generation)) = closed {
-                        if self.outgoing_generations.get(&pk) == Some(&generation) {
-                            self.outgoing_generations.remove(&pk);
-                            if self.connections.get(&pk).is_some_and(|info| info.is_initiator) {
-                                self.connections.remove(&pk);
+                        // A stale generation belongs to a connection we have
+                        // already replaced; only the current one is retired.
+                        if self.generations.get(&pk) == Some(&generation) {
+                            self.generations.remove(&pk);
+                            if let Ok(mut abort) = self.conn_aborts.lock() {
+                                abort.remove(&pk);
+                            }
+                            let was_initiator = self
+                                .connections
+                                .get(&pk)
+                                .is_some_and(|info| info.is_initiator);
+                            if self.connections.remove(&pk) {
                                 if let Some(info) = self.peers.get_mut(&pk) {
                                     info.disconnected();
                                 }
-                                self.schedule_retry(pk);
+                                if was_initiator {
+                                    self.schedule_retry(pk);
+                                }
                             }
                         }
                     }
@@ -1248,6 +1308,10 @@ impl SwarmActor {
             }
         }
         self.connections = ConnectionSet::new();
+        self.generations.clear();
+        if let Ok(mut aborts) = self.conn_aborts.lock() {
+            aborts.clear();
+        }
 
         for (_, mut entry) in self.connects.drain() {
             if let Some(task) = entry.abort_task.take() {
@@ -1449,6 +1513,30 @@ impl SwarmActor {
         }
     }
 
+    /// The registration handles a connect task needs for the connection it
+    /// just created (shared ownership, so it can be cloned into the task).
+    fn connection_watch(&self) -> ConnectionWatch {
+        ConnectionWatch {
+            aborts: Arc::clone(&self.aborts),
+            conn_aborts: Arc::clone(&self.conn_aborts),
+            closed_tx: self.closed_tx.clone(),
+        }
+    }
+
+    /// Destroy the connection we hold for `pk` (Node destroys the connection a
+    /// duplicate handshake replaces). Do nothing if it is already gone.
+    fn abort_connection(&mut self, pk: &[u8; 32]) {
+        let Ok(mut aborts) = self.conn_aborts.lock() else {
+            return;
+        };
+        let Some((generation, handle)) = aborts.remove(pk) else {
+            return;
+        };
+        if self.generations.get(pk) == Some(&generation) {
+            handle.abort();
+        }
+    }
+
     fn attempt_connections(&mut self) {
         if self.suspended {
             return;
@@ -1541,7 +1629,7 @@ impl SwarmActor {
         }
 
         match result.result {
-            Ok((mut conn, runtime)) => {
+            Ok((conn, runtime)) => {
                 let pk = result.public_key;
 
                 // Dedup: compare public keys to decide tie-break
@@ -1553,6 +1641,7 @@ impl SwarmActor {
                             return;
                         }
                     }
+                    self.abort_connection(&pk);
                     self.connections.remove(&pk);
                 }
 
@@ -1560,15 +1649,8 @@ impl SwarmActor {
                     .add(pk, ConnectionInfo { is_initiator: true });
                 self.next_generation = self.next_generation.wrapping_add(1);
                 let generation = self.next_generation;
-                self.outgoing_generations.insert(pk, generation);
-                if let (Some(closed), Some(sender)) =
-                    (conn.stream.take_close_notification(), self.outgoing_closed_tx.clone())
-                {
-                    tokio::spawn(async move {
-                        let _ = closed.await;
-                        let _ = sender.send((pk, generation));
-                    });
-                }
+                self.generations.insert(pk, generation);
+                let conn = self.connection_watch().watch(conn, pk, generation);
 
                 let topics = if let Some(info) = self.peers.get_mut(&pk) {
                     info.connected();
@@ -1577,7 +1659,6 @@ impl SwarmActor {
                     vec![]
                 };
 
-                track_abort(&self.aborts, conn.stream.abort_handle());
                 let swarm_conn = SwarmConnection {
                     peer: conn,
                     is_initiator: true,
@@ -1723,7 +1804,7 @@ impl SwarmActor {
 
         let client_address = initial_client_address;
 
-        let local_stream_id = next_stream_id();
+        let local_stream_id = hyperdht::alloc_stream_id();
 
         let (relay_token, relay_through_info) = if let Some(relay_pk) = self.config.relay_through {
             let token: [u8; 32] = rand::random();
@@ -1894,9 +1975,25 @@ impl SwarmActor {
             return;
         }
 
+        // Node `_handleServerConnection`: a handshake from a peer we are still
+        // connected to replaces that connection when the tie-break picks the
+        // new one; otherwise the new one is refused and the client retries.
+        // Node also keeps the new connection when the existing one has already
+        // carried traffic in both directions; `SecretStream` keeps no byte
+        // counters, so the tie-break decides alone.
         if self.connections.has(&remote_pk) {
-            tracing::debug!(pk = %short_hex(&remote_pk), "server: already connected");
-            return;
+            let expected_initiator = self.key_pair.public_key > remote_pk;
+            if expected_initiator {
+                tracing::debug!(pk = %short_hex(&remote_pk), "server: keeping the existing connection");
+                return;
+            }
+            tracing::debug!(
+                pk = %short_hex(&remote_pk),
+                "server: duplicate handshake replaces the existing connection"
+            );
+            self.abort_connection(&remote_pk);
+            self.connections.remove(&remote_pk);
+            self.generations.remove(&remote_pk);
         }
         if self.connections.len() >= self.config.max_peers {
             tracing::debug!("server: at max connections");
@@ -1913,9 +2010,12 @@ impl SwarmActor {
 
         self.connections
             .add(remote_pk, ConnectionInfo { is_initiator: false });
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        self.generations.insert(remote_pk, generation);
+        let watch = self.connection_watch();
 
         let conn_tx = self.conn_tx.clone();
-        let aborts = Arc::clone(&self.aborts);
 
         if let (Some(relay_pk), Some(token)) = (self.config.relay_through, relay_token) {
             let dht = self.dht.clone();
@@ -1923,7 +2023,6 @@ impl SwarmActor {
             let relay_addr = self.config.relay_address;
             let rh = self.runtime_handle.clone();
             let failure_tx = self.server_failure_tx.clone();
-            let aborts = Arc::clone(&aborts);
             tokio::spawn(async move {
                 match create_server_relay_connection(
                     rh,
@@ -1937,7 +2036,7 @@ impl SwarmActor {
                 .await
                 {
                     Ok((conn, runtime)) => {
-                        track_abort(&aborts, conn.stream.abort_handle());
+                        let conn = watch.watch(conn, remote_pk, generation);
                         let swarm_conn = SwarmConnection {
                             peer: conn,
                             is_initiator: false,
@@ -1961,7 +2060,6 @@ impl SwarmActor {
             let dht = self.dht.clone();
             let client_addr_for_task = client_address.clone();
             let failure_tx = self.server_failure_tx.clone();
-            let aborts = Arc::clone(&aborts);
             tokio::spawn(async move {
                 match create_server_connection(
                     rh,
@@ -1975,7 +2073,7 @@ impl SwarmActor {
                 .await
                 {
                     Ok((conn, runtime)) => {
-                        track_abort(&aborts, conn.stream.abort_handle());
+                        let conn = watch.watch(conn, remote_pk, generation);
                         let swarm_conn = SwarmConnection {
                             peer: conn,
                             is_initiator: false,
@@ -2297,11 +2395,14 @@ impl SwarmActor {
 
                 self.connections
                     .add(entry.remote_pk, ConnectionInfo { is_initiator: false });
+                self.next_generation = self.next_generation.wrapping_add(1);
+                let generation = self.next_generation;
+                self.generations.insert(entry.remote_pk, generation);
 
                 let runtime = UdxRuntime::shared(self.runtime_handle.clone());
                 let conn_tx = self.conn_tx.clone();
                 let failure_tx = self.server_failure_tx.clone();
-                let aborts = Arc::clone(&self.aborts);
+                let watch = self.connection_watch();
                 let remote_pk = entry.remote_pk;
 
                 tokio::spawn(async move {
@@ -2327,7 +2428,7 @@ impl SwarmActor {
                     };
 
                     let conn = PeerConnection::with_remote_addr(ss, remote_pk, addr, entry.udx_socket, None);
-                    track_abort(&aborts, conn.stream.abort_handle());
+                    let conn = watch.watch(conn, remote_pk, generation);
                     let swarm_conn = SwarmConnection {
                         peer: conn,
                         is_initiator: false,
@@ -2383,6 +2484,9 @@ enum ServerPath {
 /// Choose the server-side path for a handshake, per Node hyperdht
 /// `lib/server.js _addHandshake`.
 ///
+/// - `relay_through` is whether *this* reply advertises `relay_through` info.
+///   The swarm only sets it when its own NAT is randomized (see
+///   [`SwarmConfig::relay_through`]), so a paired relay is always available.
 /// - The client is *dialable* when it says it is `FIREWALL_OPEN`, or when its
 ///   handshake reached us directly rather than through a relay.
 /// - We count as firewalled only once the DHT has settled on CONSISTENT or
@@ -2562,17 +2666,6 @@ async fn create_server_relay_connection(
         .await
         .map_err(|e| SwarmError::Dht(peeroxide_dht::hyperdht::HyperDhtError::Relay(e)))?;
 
-    // Mint a fresh data-stream id from the *same* counter `dht.connect_to`
-    // used internally for the control connection above (both reuse
-    // `relay_conn.socket`). Reusing the `local_stream_id` parameter here
-    // (originally allocated from this crate's own, separately-counted
-    // `next_stream_id()` and already advertised in the direct-connect
-    // handshake reply) risks colliding with whatever id the control
-    // connection registered on that same socket, since the two counters
-    // are independent and can coincidentally produce the same value —
-    // silently clobbering the control channel's demux registration and
-    // breaking it out from under the still-running Protomux/blind-relay
-    // exchange (observed as an immediate spurious "stream closed").
     let data_stream_id = peeroxide_dht::hyperdht::alloc_stream_id();
 
     let pair_response = relay_client
@@ -2655,18 +2748,6 @@ mod tests {
         assert_eq!(short_hex(&bytes), "deadbeef");
     }
 
-    #[tokio::test]
-    async fn abort_registry_prunes_closed_streams() {
-        let runtime = UdxRuntime::new().expect("runtime");
-        let first = runtime.create_stream(1).await.expect("first");
-        let second = runtime.create_stream(2).await.expect("second");
-        let aborts = Mutex::new(Vec::new());
-        track_abort(&aborts, first.abort_handle());
-        first.abort_handle().abort();
-        track_abort(&aborts, second.abort_handle());
-        assert_eq!(aborts.lock().unwrap().len(), 1);
-    }
-
     #[test]
     fn default_config() {
         let c = SwarmConfig::default();
@@ -2681,6 +2762,24 @@ mod tests {
         let j = JoinOpts::default();
         assert!(j.server);
         assert!(j.client);
+    }
+
+    #[tokio::test]
+    async fn abort_registries_prune_closed_streams() {
+        let runtime = UdxRuntime::new().expect("runtime");
+        let first = runtime.create_stream(1).await.expect("first");
+        let second = runtime.create_stream(2).await.expect("second");
+        let aborts = Mutex::new(Vec::new());
+        let connections = Mutex::new(HashMap::new());
+        track_abort(&aborts, first.abort_handle());
+        track_conn_abort(&connections, [1; 32], 1, first.abort_handle());
+        first.abort_handle().abort();
+        track_abort(&aborts, second.abort_handle());
+        track_conn_abort(&connections, [2; 32], 2, second.abort_handle());
+        assert_eq!(aborts.lock().unwrap().len(), 1);
+        let connections = connections.lock().unwrap();
+        assert_eq!(connections.len(), 1);
+        assert!(connections.contains_key(&[2; 32]));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2757,9 +2856,9 @@ mod tests {
         const CONSISTENT: u64 = FIREWALL_CONSISTENT;
         const RANDOM: u64 = FIREWALL_RANDOM;
 
-        // (relay_through, server, client, forwarded) -> path
+        // (relay_advertised, server, client, forwarded) -> path
         let cases = [
-            // relay_through wins over everything.
+            // An advertised relay (randomized NAT) wins over everything.
             ((true, CONSISTENT, OPEN, false), Relay),
             ((true, UNKNOWN, UNKNOWN, true), Relay),
             // Open or direct clients are dialled; a firewalled server still
@@ -2774,11 +2873,11 @@ mod tests {
             ((false, UNKNOWN, UNKNOWN, true), Listen),
             ((false, OPEN, RANDOM, true), Listen),
         ];
-        for ((relay, server, client, forwarded), want) in cases {
+        for ((relay_advertised, server, client, forwarded), want) in cases {
             assert_eq!(
-                select_server_path(relay, server, client, forwarded),
+                select_server_path(relay_advertised, server, client, forwarded),
                 want,
-                "relay_through={relay} server={server} client={client} forwarded={forwarded}"
+                "relay_advertised={relay_advertised} server={server} client={client} forwarded={forwarded}"
             );
         }
     }
