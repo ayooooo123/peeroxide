@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `relay_service` could not pair two firewalled Node.js peers: the relay node did not resolve its own key (above), and the responder-side secret-stream header of a control connection was lost when it was queued before the peer's first packet arrived (libudx fix). The relay interop test now forces the relay path like hyperdht's own `test/relaying.js` and asserts the echo arrived from the relay's socket.
+- Open servers accept relayed handshakes, handshake staging runs independently per client, and client holepunch errors stop staged punches.
+- Suspend closes outgoing connection streams and bootstrap waiters; resume retries bootstrap and falls back to an ephemeral client port when needed.
+- Raw stream firewalls use Node's `true`-means-reject convention; random stream IDs replace counters and dead abort handles are pruned.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.3...peeroxide-dht-v1.7.4) - 2026-11-02
 

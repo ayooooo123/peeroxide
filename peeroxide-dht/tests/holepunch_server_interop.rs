@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use libudx::UdxRuntime;
 use peeroxide_dht::hyperdht::{self, HyperDhtConfig, KeyPair, ServerConfig};
-use peeroxide_dht::hyperdht_messages::FIREWALL_UNKNOWN;
+use peeroxide_dht::hyperdht_messages::{FIREWALL_OPEN, FIREWALL_UNKNOWN};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 
@@ -128,4 +128,59 @@ async fn rust_client_holepunches_into_a_js_server() {
     })
     .await
     .expect("Rust -> JS holepunch timed out");
+}
+
+/// A server node that reports itself open, so a dial-in client needs no
+/// punch on the server's side.
+fn open_config(bootstrap: u64) -> HyperDhtConfig {
+    let mut config = HyperDhtConfig::default();
+    config.dht.host = "127.0.0.1".into();
+    config.dht.bootstrap = vec![format!("127.0.0.1:{bootstrap}")];
+    config.dht.firewalled = false;
+    config.dht.quick_firewall = false;
+    config.dht.ephemeral = Some(false);
+    config
+}
+
+/// A relayed handshake from a firewalled JS client must be answered by an
+/// OPEN Rust server: it replies with its stream id and waits on the DHT
+/// socket for the client's dial instead of staging a passive punch.
+#[tokio::test]
+async fn js_client_reaches_an_open_rust_server() {
+    let _ = tracing_subscriber::fmt::try_init();
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (mut js, ready) = JsPeer::start("holepunch-client.js").await.expect("JS client");
+        let port = ready["port"].as_u64().expect("port");
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let (_task, dht, events) =
+            hyperdht::spawn(&runtime, open_config(port)).await.expect("DHT");
+        dht.fully_bootstrapped().await.expect("bootstrapped");
+
+        let keys = KeyPair::generate();
+        let mut server = dht.create_server(
+            &runtime,
+            ServerConfig::new(keys.clone(), FIREWALL_OPEN),
+            events,
+        );
+        server.listen(&keys).await.expect("listen");
+
+        js.input
+            .write_all(format!("{}\n", hex::encode(keys.public_key)).as_bytes())
+            .await
+            .expect("ask JS to dial");
+
+        let mut accepted = server.accept().await.expect("server accepted the firewalled client");
+        let data = accepted.stream.read().await.expect("read JS").expect("payload");
+        assert_eq!(data, b"js-client");
+        accepted.stream.write(&data).await.expect("echo");
+        let echoed = js.read_json().await.expect("JS echo");
+        assert_eq!(echoed["data"], "js-client");
+
+        server.close().await;
+        dht.destroy().await.expect("destroy");
+        js.child.kill().await.expect("stop JS");
+    })
+    .await
+    .expect("JS -> open Rust server timed out");
 }

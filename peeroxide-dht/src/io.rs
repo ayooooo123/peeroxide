@@ -427,9 +427,10 @@ impl Io {
         events
     }
 
-    /// Rebind both sockets and resume traffic (dht-rpc `io.resume()`). The
-    /// server socket retries its previous port first and falls back to an
-    /// ephemeral one, exactly like `_bindSockets`.
+    /// Rebind both sockets and resume traffic (dht-rpc `io.resume()`). Each
+    /// socket retries its previous port first and falls back to an ephemeral
+    /// one, exactly like `_bindSockets`: a stream that outlived the suspend
+    /// can still hold the old port open.
     pub async fn resume(&mut self) -> IoResult<()> {
         if !self.suspended {
             return Ok(());
@@ -440,7 +441,11 @@ impl Io {
             self.server_socket.bind(fallback).await?;
         }
         self.server_bind = self.server_socket.local_addr().await?;
-        self.client_socket.bind(self.client_bind).await?;
+        if self.client_socket.bind(self.client_bind).await.is_err() {
+            let fallback = SocketAddr::new(self.client_bind.ip(), 0);
+            tracing::debug!(%fallback, "resume: previous client port unavailable");
+            self.client_socket.bind(fallback).await?;
+        }
         self.client_bind = self.client_socket.local_addr().await?;
         self.suspended = false;
         Ok(())

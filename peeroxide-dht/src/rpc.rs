@@ -1602,7 +1602,12 @@ impl DhtNode {
         // Timeout events from the IO layer are irrelevant now that the
         // queries owning them were aborted above.
         let _ = self.io.suspend().await;
+        // dht-rpc rejects `_bootstrapping` (every `fullyBootstrapped()`
+        // waiter) when the bootstrap query dies with the sockets.
         self.bootstrap_query_id = None;
+        for tx in self.bootstrap_waiters.drain(..) {
+            let _ = tx.send(Err(DhtError::Suspended));
+        }
         self.quick_probe = QuickProbe::NotSent;
         self.firewall_check = None;
     }
@@ -1614,8 +1619,16 @@ impl DhtNode {
         }
         self.io.resume().await?;
         self.local_port = self.io.server_local_addr().await?.port();
+        // dht-rpc always refreshes on resume; a node whose bootstrap the
+        // suspend killed restarts it so later waiters still resolve.
         if self.bootstrapped {
             self.run_refresh();
+        } else {
+            let own_id = match self.table.lock() {
+                Ok(table) => *table.id(),
+                Err(_) => return Ok(()),
+            };
+            self.start_bootstrap(own_id);
         }
         Ok(())
     }

@@ -167,6 +167,7 @@ pub(crate) struct StreamInner {
     pub(crate) remote_id: u32,
     pub(crate) remote_addr: Option<SocketAddr>,
     pub(crate) connected: bool,
+    terminated: bool,
     /// True once `prepare_end()` has been called (FIN queued).
     ended: bool,
 
@@ -239,8 +240,7 @@ pub(crate) struct StreamInner {
     /// First seq not sent before the change, and the waiter released once
     /// the peer has ACKed up to it (C `seq_on_remote_changed`).
     remote_change: Option<(u32, oneshot::Sender<()>)>,
-    /// Released by the first packet from the current remote on the current
-    /// socket.
+    /// Released by data or a message from the current remote on this socket.
     remote_observed: Option<oneshot::Sender<()>>,
 }
 
@@ -252,6 +252,7 @@ impl StreamInner {
     /// fail fast. Idempotent — safe to call more than once.
     fn terminate(&mut self) {
         self.connected = false;
+        self.terminated = true;
         self.notify_tx = None;
         // Migration waiters learn the stream died (their receivers error).
         self.remote_change = None;
@@ -922,6 +923,7 @@ impl UdxStream {
             remote_id: 0,
             remote_addr: None,
             connected: false,
+            terminated: false,
             ended: false,
             next_seq: 0,
             pending_writes: Vec::new(),
@@ -1307,7 +1309,18 @@ impl UdxStreamAbort {
                 });
             }
         }
+        // The processor only exits on Shutdown; queue it before `terminate`
+        // drops the sender (the queued message still arrives), or the task
+        // ticks its keepalive forever.
+        if let Some(tx) = &inner.notify_tx {
+            let _ = tx.send(StreamNotify::Shutdown);
+        }
         inner.terminate();
+    }
+
+    /// Whether the stream is still running (not aborted, closed or dropped).
+    pub fn is_alive(&self) -> bool {
+        !self.inner.lock().unwrap_or_else(|e| e.into_inner()).terminated
     }
 }
 
@@ -1432,6 +1445,9 @@ impl UdxStreamRemote {
 
 impl Drop for UdxStream {
     fn drop(&mut self) {
+        if self.read_rx.is_some() {
+            self.inner.lock().unwrap_or_else(|e| e.into_inner()).terminate();
+        }
         if let Ok(mut guard) = self.processor.lock() {
             if let Some(handle) = guard.take() {
                 handle.abort();
@@ -2060,6 +2076,7 @@ mod mtu_tests {
             remote_id: 0,
             remote_addr: None,
             connected: false,
+            terminated: false,
             next_seq: 0,
             pending_writes: Vec::new(),
             outgoing: BTreeMap::new(),
@@ -2231,6 +2248,45 @@ mod mtu_tests {
         assert_eq!(inner.mtu_state, MtuState::SearchComplete);
         assert!(!inner.mtu_probe_wanted);
         assert_eq!(inner.mtu, MTU_BASE + MTU_STEP, "MTU frozen at last successful value");
+    }
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// `abort` must stop the processor task, not just disconnect the stream:
+    /// the task owns a clone of `StreamInner`, so a task that keeps running
+    /// (ticking its keepalive) pins the stream for the life of the process.
+    #[tokio::test]
+    async fn abort_ends_the_processor_task() {
+        let runtime = crate::UdxRuntime::new().expect("runtime");
+        let socket = runtime.create_socket().await.expect("socket");
+        socket.bind("127.0.0.1:0".parse().unwrap()).await.expect("bind");
+        let peer = runtime.create_socket().await.expect("peer socket");
+        peer.bind("127.0.0.1:0".parse().unwrap()).await.expect("peer bind");
+        let peer_addr = peer.local_addr().await.expect("peer addr");
+
+        let stream = runtime.create_stream(1).await.expect("stream");
+        stream.connect(&socket, 2, peer_addr).await.expect("connect");
+
+        let weak = Arc::downgrade(&stream.inner);
+        let abort = stream.abort_handle();
+        abort.abort();
+        assert!(!abort.is_alive(), "aborted stream reports itself dead");
+        drop(abort);
+        // The async stream detaches the task instead of aborting it, which is
+        // how the swarm drops a suspended connection.
+        drop(stream.into_async_stream());
+
+        for _ in 0..50 {
+            if weak.upgrade().is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("processor task still holds the stream one second after abort");
     }
 }
 

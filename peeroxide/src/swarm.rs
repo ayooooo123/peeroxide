@@ -1,7 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use rand::Rng;
@@ -34,10 +33,17 @@ use crate::error::SwarmError;
 use crate::peer_discovery::{run_discovery, DiscoveryEvent, PeerDiscoveryConfig};
 use crate::peer_info::{PeerInfo, Priority};
 
-static NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
+/// Node keeps `_allConnections` and drops a connection on `'close'`; the
+/// handle of a dead stream still pins its buffers, so prune on every push.
+fn track_abort(aborts: &Mutex<Vec<libudx::UdxStreamAbort>>, handle: libudx::UdxStreamAbort) {
+    if let Ok(mut aborts) = aborts.lock() {
+        aborts.retain(|h| h.is_alive());
+        aborts.push(handle);
+    }
+}
 
 fn next_stream_id() -> u32 {
-    NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+    hyperdht::alloc_stream_id()
 }
 
 const DEFAULT_MAX_PEERS: usize = 64;
@@ -1571,9 +1577,7 @@ impl SwarmActor {
                     vec![]
                 };
 
-                if let Ok(mut aborts) = self.aborts.lock() {
-                    aborts.push(conn.stream.abort_handle());
-                }
+                track_abort(&self.aborts, conn.stream.abort_handle());
                 let swarm_conn = SwarmConnection {
                     peer: conn,
                     is_initiator: true,
@@ -1933,9 +1937,7 @@ impl SwarmActor {
                 .await
                 {
                     Ok((conn, runtime)) => {
-                        if let Ok(mut aborts) = aborts.lock() {
-                            aborts.push(conn.stream.abort_handle());
-                        }
+                        track_abort(&aborts, conn.stream.abort_handle());
                         let swarm_conn = SwarmConnection {
                             peer: conn,
                             is_initiator: false,
@@ -1973,9 +1975,7 @@ impl SwarmActor {
                 .await
                 {
                     Ok((conn, runtime)) => {
-                        if let Ok(mut aborts) = aborts.lock() {
-                            aborts.push(conn.stream.abort_handle());
-                        }
+                        track_abort(&aborts, conn.stream.abort_handle());
                         let swarm_conn = SwarmConnection {
                             peer: conn,
                             is_initiator: false,
@@ -2327,9 +2327,7 @@ impl SwarmActor {
                     };
 
                     let conn = PeerConnection::with_remote_addr(ss, remote_pk, addr, entry.udx_socket, None);
-                    if let Ok(mut aborts) = aborts.lock() {
-                        aborts.push(conn.stream.abort_handle());
-                    }
+                    track_abort(&aborts, conn.stream.abort_handle());
                     let swarm_conn = SwarmConnection {
                         peer: conn,
                         is_initiator: false,
@@ -2655,6 +2653,18 @@ mod tests {
     fn short_hex_format() {
         let bytes = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33];
         assert_eq!(short_hex(&bytes), "deadbeef");
+    }
+
+    #[tokio::test]
+    async fn abort_registry_prunes_closed_streams() {
+        let runtime = UdxRuntime::new().expect("runtime");
+        let first = runtime.create_stream(1).await.expect("first");
+        let second = runtime.create_stream(2).await.expect("second");
+        let aborts = Mutex::new(Vec::new());
+        track_abort(&aborts, first.abort_handle());
+        first.abort_handle().abort();
+        track_abort(&aborts, second.abort_handle());
+        assert_eq!(aborts.lock().unwrap().len(), 1);
     }
 
     #[test]
