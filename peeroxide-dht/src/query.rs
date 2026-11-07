@@ -683,7 +683,7 @@ pub(crate) fn parse_bootstrap_str(s: &str) -> Option<(String, u16)> {
 ///
 /// For each entry, tries the suggested IP (before `@`) first. If absent or
 /// not a valid IP, falls back to async DNS resolution of the hostname.
-pub(crate) async fn resolve_bootstrap_nodes(raw: &[String]) -> Vec<String> {
+pub async fn resolve_bootstrap_nodes(raw: &[String]) -> Vec<String> {
     let mut resolved = Vec::with_capacity(raw.len());
     for s in raw {
         if let Some((host, port)) = resolve_one_bootstrap(s).await {

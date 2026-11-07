@@ -15,9 +15,9 @@ use crate::io::{Io, IoConfig, IoEvent, ReplyContext, RequestParams, SocketKind, 
 use crate::messages::{Command, Ipv4Peer};
 use crate::nat::Nat;
 use crate::peer::{NodeId, peer_id};
+pub use crate::query::resolve_bootstrap_nodes;
 use crate::query::{
     IoResponseData, Query, QueryReply, QueryRequest, QueryResult, parse_bootstrap_str,
-    resolve_bootstrap_nodes,
 };
 use crate::routing_table::{Node, RoutingTable, TableEvent};
 
