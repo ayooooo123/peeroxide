@@ -487,12 +487,16 @@ pub struct ServerConfig {
     pub key_pair: KeyPair,
     /// Firewall mode advertised to connecting peers.
     pub firewall: u64,
+    /// Blind relay offered to every client we cannot dial (Node
+    /// `createServer({ relayThrough })`); the passive punch keeps running
+    /// and moves the stream off the relay when it lands.
+    pub relay_through: Option<[u8; 32]>,
 }
 
 impl ServerConfig {
     /// Create a new server configuration.
     pub fn new(key_pair: KeyPair, firewall: u64) -> Self {
-        Self { key_pair, firewall }
+        Self { key_pair, firewall, relay_through: None }
     }
 }
 
@@ -522,12 +526,18 @@ pub struct ConnectOpts {
     /// its `addresses4` and dials only the public address. Set this to
     /// `false` to force the real-network code path under test.
     pub local_connection: bool,
+    /// Blind relay to pair through while the direct path is still being
+    /// tried (Node `dht.connect(pk, { relayThrough })`): whichever lands
+    /// first carries the connection, and a later direct landing moves the
+    /// stream off the relay.
+    pub relay_through: Option<[u8; 32]>,
 }
 
 impl Default for ConnectOpts {
     fn default() -> Self {
         Self {
             local_connection: true,
+            relay_through: None,
         }
     }
 }
@@ -1746,6 +1756,10 @@ impl HyperDhtHandle {
             Err(_) => vec![],
         };
 
+        // Node `connect.js:455`: a client-chosen relay rides in the handshake
+        // with a fresh pairing token.
+        let relay_token: Option<[u8; 32]> = opts.relay_through.map(|_| random());
+
         let local_payload = NoisePayload {
             version: 1,
             error: 0,
@@ -1760,7 +1774,9 @@ impl HyperDhtHandle {
                 seq: 0,
             }),
             secret_stream: Some(SecretStreamInfo { version: 1 }),
-            relay_through: None,
+            relay_through: opts.relay_through.zip(relay_token).map(|(public_key, token)| {
+                RelayThroughInfo { version: 1, public_key, token }
+            }),
             relay_addresses: None,
         };
 
@@ -1807,27 +1823,115 @@ impl HyperDhtHandle {
             return Err(HyperDhtError::FirewallRejected);
         }
 
-        // Check if the remote peer wants us to relay through a third node.
-        if let Some(ref relay_through) = remote_payload.relay_through {
-            let relay_addrs = remote_payload.relay_addresses.clone().unwrap_or_default();
-            tracing::debug!(
-                relay_pk = ?&relay_through.public_key[..8],
-                relay_addr_hints = relay_addrs.len(),
-                "remote requested relay_through"
-            );
-            return Box::pin(
-                self.relay_connection(
-                    key_pair,
-                    relay_through,
-                    &relay_addrs,
-                    &nw_result,
-                    false,
-                    true,
-                    runtime,
-                ),
-            )
-            .await;
+        let remote_udx = remote_payload
+            .udx
+            .clone()
+            .ok_or_else(|| HyperDhtError::HandshakeFailed("server sent no UDX info".into()))?;
+        let remote_id = u32::try_from(remote_udx.id)
+            .map_err(|_| HyperDhtError::StreamEstablishment("remote UDX id out of u32 range".into()))?;
+
+        // Node `connect.js:534`: the server's relay wins over ours (it holds
+        // the token both sides pair with); either way the direct path keeps
+        // running and moves the stream off the relay when it lands.
+        let relay_through = match (&remote_payload.relay_through, opts.relay_through.zip(relay_token)) {
+            (Some(theirs), _) => Some((theirs.public_key, theirs.token, false)),
+            (None, Some((public_key, token))) => Some((public_key, token, true)),
+            (None, None) => None,
+        };
+        let raced = RacedStream::new(runtime.create_stream(local_stream_id).await?);
+        let direct = DirectDial {
+            dht: self.clone(),
+            hs_result,
+            remote_payload: remote_payload.clone(),
+            nw_result: nw_result.clone(),
+            node: relay.clone(),
+            target,
+            local_stream_id,
+            remote_id,
+            local_connection: opts.local_connection,
+        };
+
+        let Some((relay_pk, token, initiator)) = relay_through else {
+            let landing = direct.run(runtime).await?;
+            return raced.land(landing, &nw_result, true).await?.ok_or(HyperDhtError::StreamEstablishment(
+                "stream landed twice".into(),
+            ));
+        };
+
+        if let Some(socket) = self.server_socket().await? {
+            let pending = Arc::downgrade(&raced);
+            raced.with_stream(|stream| {
+                // Node rejects the relay's old-path packets after migration.
+                stream.set_firewall_hook(&socket, remote_id, move |_, port, ip| {
+                    pending.upgrade().is_some_and(|raced| !raced.is_relay_traffic(SocketAddr::new(ip, port)))
+                })?;
+                Ok(())
+            })?;
         }
+
+        let (landed_tx, mut landed_rx) = mpsc::channel(2);
+        let direct_runtime = UdxRuntime::shared(runtime.handle());
+        let direct_tx = landed_tx.clone();
+        tokio::spawn(async move {
+            let _ = direct_tx.send(direct.run(&direct_runtime).await).await;
+        });
+        let relay_dht = self.clone();
+        let relay_key_pair = key_pair.clone();
+        let hints = remote_payload.relay_addresses.clone().unwrap_or_default();
+        let relay_runtime = UdxRuntime::shared(runtime.handle());
+        let relay_raced = Arc::clone(&raced);
+        tokio::spawn(async move {
+            let landing = relay_dht
+                .relay_path(&relay_key_pair, relay_pk, &hints, initiator, &token, local_stream_id, &relay_runtime, &relay_raced)
+                .await;
+            let _ = landed_tx.send(landing).await;
+        });
+
+        // Node `maybeDestroyEncryptedSocket`: a failed path is not fatal while
+        // the other is still trying.
+        let mut last_err = None;
+        let first = loop {
+            match landed_rx.recv().await {
+                Some(Ok(landing)) => break landing,
+                Some(Err(err)) => last_err = Some(err),
+                None => return Err(last_err.unwrap_or(HyperDhtError::HolepunchFailed)),
+            }
+        };
+        let conn = raced.land(first, &nw_result, true).await?;
+        let noise = nw_result.clone();
+        tokio::spawn(async move {
+            while let Some(landing) = landed_rx.recv().await {
+                match landing {
+                    Ok(landing) => { let _ = raced.land(landing, &noise, true).await; }
+                    Err(err) => tracing::debug!(%err, "alternate connection path failed"),
+                }
+            }
+        });
+        conn.ok_or(HyperDhtError::StreamEstablishment("stream landed twice".into()))
+    }
+}
+
+/// Everything the client's direct path needs after the handshake, owned so
+/// it can run beside the relay (Node `holepunch(c, opts)`).
+struct DirectDial {
+    dht: HyperDhtHandle,
+    hs_result: crate::router::HandshakeResult,
+    remote_payload: NoisePayload,
+    nw_result: NoiseWrapResult,
+    /// The DHT node that forwarded our handshake; holepunch rounds go through it.
+    node: Ipv4Peer,
+    target: [u8; 32],
+    local_stream_id: u32,
+    remote_id: u32,
+    local_connection: bool,
+}
+
+impl DirectDial {
+    async fn run(self, runtime: &UdxRuntime) -> Result<Landing, HyperDhtError> {
+        let DirectDial { dht, hs_result, remote_payload, nw_result, node, target, local_stream_id, remote_id, local_connection } =
+            self;
+        let this = &dht;
+        let relay = &node;
 
         // Skip holepunching when the remote peer is directly reachable.
         // Node.js (connect.js) checks:
@@ -1846,10 +1950,10 @@ impl HyperDhtHandle {
         // cannot be the same-host signal. Use our own NAT-sampled public
         // address instead. Disabled when the caller opts out via
         // `local_connection=false`.
-        let same_host = if !opts.local_connection {
+        let same_host = if !local_connection {
             false
         } else {
-            match self.dht.remote_address().await {
+            match this.dht.remote_address().await {
                 Ok(Some(my_remote)) => my_remote.host == hs_result.server_address.host,
                 _ => false,
             }
@@ -1907,23 +2011,13 @@ impl HyperDhtHandle {
                 "direct-connect dial target chosen"
             );
 
-            let direct = ConnectResult {
-                remote_public_key: nw_result.remote_public_key,
-                server_address: connect_addr,
-                client_address: hs_result.client_address,
-                is_relayed: false,
-            noise: nw_result,
-            local_stream_id,
-            remote_udx: remote_payload.udx.clone(),
-            udx_socket: None,
-        };
-            let shared = self.server_socket().await?;
-            return establish_stream_with_socket(&direct, runtime, shared).await;
+            let socket = socket_or_new(this.server_socket().await?, runtime).await?;
+            return Ok(Landing { socket, remote_id, addr: to_socket_addr(&connect_addr)?, relay: None });
         }
 
         // Phase 2: Holepunch rounds via PEER_HOLEPUNCH relay
         let server_address = hs_result.server_address.clone();
-        let hp_result = self
+        let hp_result = this
             .run_holepunch_rounds(
                 &nw_result,
                 &remote_payload,
@@ -1934,11 +2028,84 @@ impl HyperDhtHandle {
                 local_stream_id,
             )
             .await?;
-        let shared = match hp_result.udx_socket.clone() {
-            Some(s) => Some(s),
-            None => self.server_socket().await?,
+        let socket = match hp_result.udx_socket.clone() {
+            Some(s) => s,
+            None => socket_or_new(this.server_socket().await?, runtime).await?,
         };
-        establish_stream_with_socket(&hp_result, runtime, shared).await
+        Ok(Landing { socket, remote_id, addr: to_socket_addr(&hp_result.server_address)?, relay: None })
+    }
+}
+
+impl HyperDhtHandle {
+    /// Dialling the relay is itself a connect; boxing it here (not inline)
+    /// keeps the connect future's type from recursing.
+    fn connect_boxed<'a>(
+        &'a self,
+        key_pair: &'a KeyPair,
+        public_key: [u8; 32],
+        hints: &'a [Ipv4Peer],
+        runtime: &'a UdxRuntime,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<PeerConnection, HyperDhtError>> + Send + 'a>> {
+        Box::pin(self.connect_with_nodes(key_pair, public_key, hints, runtime))
+    }
+
+    /// Pair with the peer through `relay_pk` (Node `relayConnection` /
+    /// `_relayConnection`): dial the relay, open a blind-relay channel and
+    /// pair our stream id with the peer's under `token`.
+    #[allow(clippy::too_many_arguments)]
+    async fn relay_path(
+        &self,
+        key_pair: &KeyPair,
+        relay_pk: [u8; 32],
+        relay_addr_hints: &[Ipv4Peer],
+        is_initiator: bool,
+        token: &[u8; 32],
+        local_stream_id: u32,
+        runtime: &UdxRuntime,
+        raced: &RacedStream,
+    ) -> Result<Landing, HyperDhtError> {
+        /// Node `relayTimeout`: a relay that has not paired us in 15 s is abandoned.
+        const RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+        let relay_conn = self.connect_boxed(key_pair, relay_pk, relay_addr_hints, runtime).await?;
+        let relay_addr = relay_conn.remote_addr.ok_or_else(|| {
+            HyperDhtError::StreamEstablishment("relay connection has no remote_addr".into())
+        })?;
+        // Known before any relayed packet can reach us, so a direct landing
+        // from this address is recognised as relay traffic (Node `isRelay`).
+        if let Ok(mut addr) = raced.relay_addr.lock() {
+            *addr = Some(relay_addr);
+        }
+        let control = relay_conn.stream.abort_handle();
+        // Protomux over the control channel; the relay server keys the
+        // channel by our public key (`id = socket.remotePublicKey`).
+        let (mux, mux_run) = Mux::new(relay_conn.stream);
+        let keep_mux = mux.clone();
+        let mux_task = tokio::spawn(async move {
+            // Pairing is not the end of the control connection's lifetime.
+            let _keep_mux = keep_mux;
+            mux_run.await;
+        });
+        let pair = tokio::time::timeout(RELAY_TIMEOUT, async {
+            let mut client = BlindRelayClient::open(&mux, Some(key_pair.public_key.to_vec())).await?;
+            client.wait_opened().await?;
+            client.pair(is_initiator, token, u64::from(local_stream_id)).await
+        })
+        .await;
+        let remote_id = match pair {
+            Ok(Ok(response)) => u32::try_from(response.remote_id).ok(),
+            Ok(Err(err)) => {
+                tracing::debug!(err = %err, "relay pairing failed");
+                None
+            }
+            Err(_) => None,
+        };
+        let Some(remote_id) = remote_id else {
+            control.abort();
+            mux_task.abort();
+            return Err(HyperDhtError::StreamEstablishment("relay pairing failed".into()));
+        };
+        Ok(Landing { socket: relay_conn.socket, remote_id, addr: relay_addr, relay: Some((control, mux_task)) })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2041,7 +2208,6 @@ impl HyperDhtHandle {
         // State carried between probe rounds.
         let mut cached_reply_token: Option<[u8; 32]> = None;
         let mut verified_remote_addr: Option<Ipv4Peer> = None;
-        let mut stable = false;
         let mut last_round: u64 = 0;
 
         for round in 0u64..=u64::from(HOLEPUNCH_MAX_PROBE_ROUNDS) {
@@ -2172,7 +2338,6 @@ impl HyperDhtHandle {
                 && puncher.nat.is_settled()
                 && reply_hp.firewall != FIREWALL_UNKNOWN
             {
-                stable = true;
                 tracing::info!(
                     target: "peeroxide::_events::holepunch::nat_settled",
                     round,
@@ -2182,22 +2347,8 @@ impl HyperDhtHandle {
             }
         }
 
-        // Phase 3 MVP divergence from Node: skip the post-loop
-        // `puncher.analyze(true).await` gate. Node's gate relies on
-        // `Holepuncher.autoSample()` having fed 4+ unique DHT-node pings
-        // into the puncher's NAT sampler in parallel; we don't have
-        // autoSample yet, so the in-loop `puncher.nat.add(...)` from
-        // PEER_HOLEPUNCH replies is our only sample source. Each round
-        // here comes from the SAME FE-holder relay (same `from`), which
-        // `Nat::add`'s dedupe-by-from rejects after the first sample —
-        // leaving the puncher's NAT permanently UNKNOWN and the analyze
-        // gate hanging forever. Instead we rely on `verified_remote_addr`
-        // (set when a reply echoes back our outbound token) as the
-        // signal that we've identified a punchable target. The actual
-        // punch-success signal is `HolepunchEvent::Connected` emitted by
-        // the recv adapter, not the local NAT classification. Adding
-        // autoSample is tracked as future work for full Node parity.
-        let _ = stable; // suppress unused-write warning; loop still tracks it for future use
+        // shortcut: verified probe rounds may proceed with UNKNOWN local NAT;
+        // require settled sampling here when porting Node's analyze/reopen gate.
 
         let Some(verified_addr) = verified_remote_addr else {
             tracing::warn!(
@@ -2360,90 +2511,129 @@ impl HyperDhtHandle {
 
         unreachable!("holepunch select loop exited without return or timeout");
     }
+}
 
-    /// Establish an encrypted connection to a peer via a relay node.
-    ///
-    /// The relay node forwards raw UDX packets between the two peers using
-    /// the blind-relay protocol. The returned [`PeerConnection`] is encrypted
-    /// end-to-end with the original peer's keys (the relay cannot read the data).
-    ///
-    /// `relay_addr_hints` are optional addresses where the relay may be reachable
-    /// directly (e.g. from the server's NoisePayload `relay_addresses`). They are
-    /// tried first before falling back to full DHT routing.
-    #[allow(clippy::too_many_arguments)]
-    async fn relay_connection(
-        &self,
-        key_pair: &KeyPair,
-        relay_through: &RelayThroughInfo,
-        relay_addr_hints: &[Ipv4Peer],
-        noise_result: &NoiseWrapResult,
-        relay_is_initiator: bool,
-        noise_is_initiator: bool,
-        runtime: &UdxRuntime,
-    ) -> Result<PeerConnection, HyperDhtError> {
-        // 1. HyperDHT connection to the relay node.
-        // Try known addresses first (pre-connect), then fall back to DHT routing.
-        // Node.js does `dht.connect(publicKey)` — we enhance with address hints.
-        let relay_conn = self
-            .connect_with_nodes(key_pair, relay_through.public_key, relay_addr_hints, runtime)
-            .await?;
+/// One path that reached the peer: the socket to send from, the peer's
+/// stream id and address, and for a relay landing the control connection
+/// (its abort handle and mux task) to drop once a direct path is confirmed.
+struct Landing {
+    socket: UdxSocket,
+    remote_id: u32,
+    addr: SocketAddr,
+    relay: Option<(libudx::UdxStreamAbort, JoinHandle<()>)>,
+}
 
-        let relay_addr = relay_conn.remote_addr.ok_or_else(|| {
-            HyperDhtError::StreamEstablishment("relay connection has no remote_addr".into())
-        })?;
+/// Node's `rawStream` + `onsocket` for a connection that may land through a
+/// relay and directly: one UDX stream both paths share.
+struct RacedStream {
+    /// Taken by the first landing.
+    stream: Mutex<Option<libudx::UdxStream>>,
+    remote: libudx::UdxStreamRemote,
+    /// The relay control connection, while the stream runs over the relay.
+    relay: Mutex<Option<libudx::UdxStreamAbort>>,
+    /// Where relayed packets come from, so a hook firing for them is not
+    /// mistaken for a direct landing (Node `isRelay`).
+    relay_addr: Mutex<Option<SocketAddr>>,
+}
 
-        // 2. Protomux over the control channel.
-        let (mux, mux_run) = Mux::new(relay_conn.stream);
-        let mux_task = tokio::spawn(mux_run);
-
-        // 3. Open blind-relay client with our public key as channel id.
-        // The relay server uses `id = socket.remotePublicKey` (our key).
-        let mut relay_client =
-            BlindRelayClient::open(&mux, Some(key_pair.public_key.to_vec())).await?;
-        relay_client.wait_opened().await?;
-
-        let data_stream_id = next_stream_id();
-
-        let pair_response = relay_client
-            .pair(
-                relay_is_initiator,
-                &relay_through.token,
-                u64::from(data_stream_id),
-            )
-            .await?;
-
-        let remote_id = u32::try_from(pair_response.remote_id).map_err(|_| {
-            HyperDhtError::StreamEstablishment("relay remote_id out of u32 range".into())
-        })?;
-
-        // 4. Connect data UDX stream through the relay, reusing the control
-        //    channel's socket so the relay sees traffic from the same source address.
-        let data_stream = runtime.create_stream(data_stream_id).await?;
-        data_stream
-            .connect(&relay_conn.socket, remote_id, relay_addr)
-            .await?;
-
-        // 5. Wrap with SecretStream::from_session using the original peer's
-        //    Noise keys (end-to-end encryption through the relay).
-        let async_stream = data_stream.into_async_stream();
-        let ss = SecretStream::from_session(
-            noise_is_initiator,
-            async_stream,
-            noise_result.tx,
-            noise_result.rx,
-            noise_result.handshake_hash,
-            noise_result.remote_public_key,
-        )
-        .await?;
-
-        Ok(PeerConnection {
-            stream: ss,
-            remote_public_key: noise_result.remote_public_key,
-            remote_addr: Some(relay_addr),
-            socket: relay_conn.socket,
-            _relay_task: Some(mux_task),
+impl RacedStream {
+    fn new(stream: libudx::UdxStream) -> Arc<Self> {
+        Arc::new(Self {
+            remote: stream.remote_handle(),
+            stream: Mutex::new(Some(stream)),
+            relay: Mutex::new(None),
+            relay_addr: Mutex::new(None),
         })
     }
+
+    /// Borrow the stream to arm hooks before any path lands.
+    fn with_stream<T>(&self, f: impl FnOnce(&libudx::UdxStream) -> Result<T, HyperDhtError>) -> Result<T, HyperDhtError> {
+        let guard = self.stream.lock().map_err(|_| HyperDhtError::ChannelClosed)?;
+        let stream = guard.as_ref().ok_or_else(|| HyperDhtError::StreamEstablishment("stream already landed".into()))?;
+        f(stream)
+    }
+
+    fn is_relay_traffic(&self, addr: SocketAddr) -> bool {
+        self.relay_addr.lock().ok().is_some_and(|relay| *relay == Some(addr))
+    }
+
+    /// Node `onsocket` / relay `ondata`: the first landing connects the
+    /// stream and yields the connection; a later direct landing moves the
+    /// stream off the relay (`changeRemote` + `confirmDirectUpgrade`), a
+    /// later relay landing is dropped.
+    async fn land(
+        &self,
+        landing: Landing,
+        noise: &NoiseWrapResult,
+        is_initiator: bool,
+    ) -> Result<Option<PeerConnection>, HyperDhtError> {
+        let stream = self.stream.lock().map_err(|_| HyperDhtError::ChannelClosed)?.take();
+        let Some(stream) = stream else {
+            match landing.relay {
+                Some((control, _)) => control.abort(),
+                None => self.upgrade(landing),
+            }
+            return Ok(None);
+        };
+        let relay_task = landing.relay.map(|(control, mux)| {
+            if let Ok(mut relay) = self.relay.lock() {
+                *relay = Some(control);
+            }
+            mux
+        });
+        stream.connect(&landing.socket, landing.remote_id, landing.addr).await?;
+        let ss = SecretStream::from_session(
+            is_initiator,
+            stream.into_async_stream(),
+            noise.tx,
+            noise.rx,
+            noise.handshake_hash,
+            noise.remote_public_key,
+        )
+        .await?;
+        Ok(Some(PeerConnection::with_remote_addr(ss, noise.remote_public_key, landing.addr, landing.socket, relay_task)))
+    }
+
+    /// Move a relayed stream onto the direct path and, once the peer is seen
+    /// there, drop the relay (Node `changeRemote` + `confirmDirectUpgrade`).
+    fn upgrade(&self, landing: Landing) {
+        let control = self.relay.lock().ok().and_then(|mut relay| relay.take());
+        let Some(control) = control else { return };
+        let remote = self.remote.clone();
+        tokio::spawn(async move {
+            match remote.change_remote(&landing.socket, landing.remote_id, landing.addr).await {
+                Ok(()) => {
+                    // An empty UDX message makes the peer observe the direct
+                    // path without application data crossing it.
+                    let _ = remote.try_send(&[]);
+                    let _ = remote.remote_observed().await;
+                }
+                Err(err) => tracing::debug!(err = %err, "relay to direct upgrade failed"),
+            }
+            // Either the peer answers on the direct path or the stream is
+            // gone; the relay is not needed in both cases.
+            control.abort();
+        });
+    }
+}
+
+async fn socket_or_new(shared: Option<UdxSocket>, runtime: &UdxRuntime) -> Result<UdxSocket, HyperDhtError> {
+    match shared {
+        Some(socket) => Ok(socket),
+        None => {
+            let socket = runtime.create_socket().await?;
+            socket.bind("0.0.0.0:0".parse().expect("valid addr")).await?;
+            Ok(socket)
+        }
+    }
+}
+
+fn to_socket_addr(peer: &Ipv4Peer) -> Result<SocketAddr, HyperDhtError> {
+    let ip = peer
+        .host
+        .parse()
+        .map_err(|e| HyperDhtError::StreamEstablishment(format!("invalid address {}: {e}", peer.host)))?;
+    Ok(SocketAddr::new(ip, peer.port))
 }
 
 /// Create a UDX stream, connect it to the remote peer, and wrap with
@@ -2828,56 +3018,6 @@ impl HyperDhtHandle {
     }
 }
 
-/// The socket and peer selected for a staged handshake.
-struct Landing {
-    socket: UdxSocket,
-    remote_id: u32,
-    addr: SocketAddr,
-}
-
-/// Owns the raw stream while an independently staged handshake is pending.
-struct PendingStream {
-    stream: Mutex<Option<libudx::UdxStream>>,
-}
-
-impl PendingStream {
-    fn new(stream: libudx::UdxStream) -> Arc<Self> {
-        Arc::new(Self { stream: Mutex::new(Some(stream)) })
-    }
-
-    /// Borrow the stream to arm hooks before any path lands.
-    fn with_stream<T>(&self, f: impl FnOnce(&libudx::UdxStream) -> Result<T, HyperDhtError>) -> Result<T, HyperDhtError> {
-        let guard = self.stream.lock().map_err(|_| HyperDhtError::ChannelClosed)?;
-        let stream = guard.as_ref().ok_or_else(|| HyperDhtError::StreamEstablishment("stream already landed".into()))?;
-        f(stream)
-    }
-
-
-    async fn land(
-        &self,
-        landing: Landing,
-        noise: &NoiseWrapResult,
-        is_initiator: bool,
-    ) -> Result<Option<PeerConnection>, HyperDhtError> {
-        let stream = self.stream.lock().map_err(|_| HyperDhtError::ChannelClosed)?.take();
-        let Some(stream) = stream else { return Ok(None) };
-        stream.connect(&landing.socket, landing.remote_id, landing.addr).await?;
-        let ss = SecretStream::from_session(
-            is_initiator, stream.into_async_stream(), noise.tx, noise.rx,
-            noise.handshake_hash, noise.remote_public_key,
-        ).await?;
-        Ok(Some(PeerConnection::with_remote_addr(ss, noise.remote_public_key, landing.addr, landing.socket, None)))
-    }
-}
-
-fn to_socket_addr(peer: &Ipv4Peer) -> Result<SocketAddr, HyperDhtError> {
-    let ip = peer
-        .host
-        .parse()
-        .map_err(|e| HyperDhtError::StreamEstablishment(format!("invalid address {}: {e}", peer.host)))?;
-    Ok(SocketAddr::new(ip, peer.port))
-}
-
 /// One accepted handshake waiting for its passive holepunch to land.
 ///
 /// Mirrors Node `lib/server.js::_addHandshake`'s `hs`: the puncher, the
@@ -2896,7 +3036,7 @@ struct ServerPassivePunch {
     /// `replyFromPuncher`); `None` (the DHT socket) for a same-host client,
     /// whose LAN shortcut dials the DHT socket we advertised.
     reply_socket: Option<UdxSocket>,
-    raced: Arc<PendingStream>,
+    raced: Arc<RacedStream>,
     remote_id: u32,
     noise_result: NoiseWrapResult,
     round: u64,
@@ -2948,7 +3088,7 @@ async fn stage_server_punch(
     client_host: &str,
     remote_firewall: u64,
     id: u64,
-    raced: Arc<PendingStream>,
+    raced: Arc<RacedStream>,
     remote_id: u32,
     events: &mpsc::UnboundedSender<ServerPunchEvent>,
 ) -> Result<ServerPassivePunch, HyperDhtError> {
@@ -2977,11 +3117,16 @@ async fn stage_server_punch(
         .port();
 
     let punched = events.clone();
+    let pending = Arc::downgrade(&raced);
     raced.with_stream(|stream| {
         stream.set_firewall_hook(&socket, remote_id, move |socket, port, ip| {
+            let addr = SocketAddr::new(ip, port);
+            if pending.upgrade().is_none_or(|raced| raced.is_relay_traffic(addr)) {
+                return false;
+            }
             let _ = punched.send(ServerPunchEvent::Punched {
                 id,
-                addr: std::net::SocketAddr::new(ip, port),
+                addr,
                 socket: socket.clone(),
             });
             true
@@ -3308,9 +3453,14 @@ async fn run_hyperdht_server(
                     }
                 }
                 ServerPunchEvent::Punched { id, addr, socket } => {
+                    // Node `isRelay`: the relay's packets reach the same
+                    // hook and are not a punch.
+                    if punches.get(&id).is_none_or(|punch| punch.raced.is_relay_traffic(addr)) {
+                        continue;
+                    }
                     let Some(punch) = punches.remove(&id) else { continue };
                     punch.abort.abort();
-                    let landing = Landing { socket, remote_id: punch.remote_id, addr };
+                    let landing = Landing { socket, remote_id: punch.remote_id, addr, relay: None };
                     match punch.raced.land(landing, &punch.noise_result, false).await {
                         Ok(Some(connection)) => {
                             let _ = connection_tx.send(connection);
@@ -3336,11 +3486,22 @@ async fn run_hyperdht_server(
 /// What a handshake task sets up once its reply is out.
 struct AcceptPath {
     noise_result: NoiseWrapResult,
-    raced: Arc<PendingStream>,
+    raced: Arc<RacedStream>,
     remote_id: u32,
     client: Ipv4Peer,
     /// Dial the client, else wait on the DHT socket for it to dial us.
     dial: bool,
+}
+
+/// The relay side of an accepted handshake (Node `_relayConnection`).
+struct RelayStart {
+    raced: Arc<RacedStream>,
+    noise_result: NoiseWrapResult,
+    public_key: [u8; 32],
+    token: [u8; 32],
+    initiator: bool,
+    hints: Vec<Ipv4Peer>,
+    local_stream_id: u32,
 }
 
 /// An accepted handshake: the Noise reply, the socket it leaves from, and
@@ -3352,6 +3513,45 @@ struct AcceptedHandshake {
     punch: Option<(u64, Box<ServerPassivePunch>)>,
     /// A client we dial or wait for, run by the handshake task itself.
     accept: Option<AcceptPath>,
+}
+
+/// Pair through the relay beside the direct path; a landing that comes first
+/// is handed out, a later one only moves or drops the stream.
+fn spawn_server_relay(
+    dht: &HyperDhtHandle,
+    runtime: &UdxRuntime,
+    key_pair: &KeyPair,
+    relay: RelayStart,
+    connection_tx: mpsc::UnboundedSender<PeerConnection>,
+) {
+    let dht = dht.clone();
+    let runtime = UdxRuntime::shared(runtime.handle());
+    let key_pair = key_pair.clone();
+    tokio::spawn(async move {
+        let landing = dht
+            .relay_path(
+                &key_pair,
+                relay.public_key,
+                &relay.hints,
+                relay.initiator,
+                &relay.token,
+                relay.local_stream_id,
+                &runtime,
+                &relay.raced,
+            )
+            .await;
+        let landed = match landing {
+            Ok(landing) => relay.raced.land(landing, &relay.noise_result, false).await,
+            Err(err) => Err(err),
+        };
+        match landed {
+            Ok(Some(connection)) => {
+                let _ = connection_tx.send(connection);
+            }
+            Ok(None) => {}
+            Err(err) => tracing::debug!(err = %err, "server: relay connection failed"),
+        }
+    });
 }
 
 /// Answer one inbound `PEER_HANDSHAKE` as a server: complete the Noise IK
@@ -3369,7 +3569,7 @@ async fn accept_server_handshake(
     config: &ServerConfig,
     holepunch_id: u64,
     punch_tx: &mpsc::UnboundedSender<ServerPunchEvent>,
-    _connection_tx: &mpsc::UnboundedSender<PeerConnection>,
+    connection_tx: &mpsc::UnboundedSender<PeerConnection>,
     msg: &HandshakeMessage,
     from: &Ipv4Peer,
     peer_address: Option<&Ipv4Peer>,
@@ -3395,6 +3595,14 @@ async fn accept_server_handshake(
         relays: dht.current_relays(),
     });
 
+    // Node `server.js:381,689`: our relay (we initiate the pairing with a
+    // fresh token) beats the client's.
+    let relay = match (config.relay_through, &remote_payload.relay_through) {
+        (Some(public_key), _) => Some((public_key, random::<[u8; 32]>(), true)),
+        (None, Some(theirs)) => Some((theirs.public_key, theirs.token, false)),
+        (None, None) => None,
+    };
+
     let reply_payload = NoisePayload {
         version: 1,
         error: ERROR_NONE,
@@ -3409,7 +3617,11 @@ async fn accept_server_handshake(
             seq: 0,
         }),
         secret_stream: Some(SecretStreamInfo { version: 1 }),
-        relay_through: None,
+        relay_through: relay.filter(|(_, _, ours)| *ours).map(|(public_key, token, _)| RelayThroughInfo {
+            version: 1,
+            public_key,
+            token,
+        }),
         relay_addresses: None,
     };
 
@@ -3426,13 +3638,31 @@ async fn accept_server_handshake(
         return Some(accepted);
     };
     let remote_id = u32::try_from(remote_udx.id).ok()?;
-    let raced = PendingStream::new(runtime.create_stream(local_stream_id).await.ok()?);
+    let raced = RacedStream::new(runtime.create_stream(local_stream_id).await.ok()?);
     // Node dials a client that reached us directly or reports itself open
     // (`hs.onsocket`); an open server told a firewalled client it is open
     // and waits on the DHT socket for its dial (`prepunching`). A client we
     // dial needs no relay (`server.js:420-429`); for the rest the relay
     // runs beside the punch from here on (`_relayConnection`).
     let dial = peer_address.is_none() || remote_payload.firewall == FIREWALL_OPEN;
+    if let Some((public_key, token, initiator)) = relay.filter(|_| !dial) {
+        spawn_server_relay(
+            dht,
+            runtime,
+            &config.key_pair,
+            RelayStart {
+                raced: Arc::clone(&raced),
+                noise_result: noise_result.clone(),
+                public_key,
+                token,
+                initiator,
+                hints: remote_payload.relay_addresses.clone().unwrap_or_default(),
+                local_stream_id,
+            },
+            connection_tx.clone(),
+        );
+    }
+
     // A relayed handshake from a firewalled client cannot be dialled: a
     // firewalled server stages the passive punch now and advertises its
     // stream id, exactly as Node's `_addHandshake` does before replying.
@@ -3497,21 +3727,32 @@ async fn server_accept_connection(
     } else {
         // shortcut: passive NAT traversal needs a puncher socket, not the DHT socket.
         let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+        let pending = Arc::downgrade(&path.raced);
         path.raced.with_stream(|stream| {
             stream.set_firewall_hook(&socket, path.remote_id, move |socket, port, ip| {
+                if pending.upgrade().is_none_or(|raced| raced.is_relay_traffic(SocketAddr::new(ip, port))) {
+                    return false;
+                }
                 let _ = seen_tx.send((socket.clone(), SocketAddr::new(ip, port)));
                 true
             })?;
             Ok(())
         })?;
         let wait = async {
-            seen_rx.recv().await.ok_or_else(|| HyperDhtError::StreamEstablishment("stream closed".into()))
+            loop {
+                let Some((socket, addr)) = seen_rx.recv().await else {
+                    return Err(HyperDhtError::StreamEstablishment("stream closed".into()));
+                };
+                if !path.raced.is_relay_traffic(addr) {
+                    return Ok((socket, addr));
+                }
+            }
         };
         tokio::time::timeout(ACCEPT_TIMEOUT, wait)
             .await
             .map_err(|_| HyperDhtError::StreamEstablishment("accept timed out".into()))??
     };
-    let landing = Landing { socket, remote_id: path.remote_id, addr };
+    let landing = Landing { socket, remote_id: path.remote_id, addr, relay: None };
     let landed = path.raced.land(landing, &path.noise_result, false);
     tokio::time::timeout(ACCEPT_TIMEOUT, landed)
         .await
@@ -4653,7 +4894,7 @@ mod tests {
             handshake_hash: [4; 64], holepunch_secret: [5; 32], is_initiator: false,
         };
         let (events, _rx) = mpsc::unbounded_channel();
-        let raced = PendingStream::new(runtime.create_stream(42).await.expect("stream"));
+        let raced = RacedStream::new(runtime.create_stream(42).await.expect("stream"));
         let mut punch = stage_server_punch(
             &runtime, dht.dht(), None, &noise, "127.0.0.1",
             FIREWALL_UNKNOWN, 1, raced, 43, &events,

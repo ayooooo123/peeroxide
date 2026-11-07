@@ -13,7 +13,7 @@ use libudx::{RuntimeHandle, UdxRuntime, UdxSocket, UdxStream};
 use peeroxide_dht::crypto::hash;
 use peeroxide_dht::holepuncher::{HolepunchEvent, Holepuncher};
 use peeroxide_dht::hyperdht::{
-    self, HyperDhtConfig, HyperDhtHandle, KeyPair, PeerConnection, ServerEvent,
+    self, HyperDhtConfig, HyperDhtError, HyperDhtHandle, KeyPair, PeerConnection, ServerEvent,
     ServerReply,
 };
 use peeroxide_dht::hyperdht_messages::{
@@ -88,6 +88,24 @@ impl ConnectionWatch {
     }
 }
 
+/// Node's default `relayThrough` function: `(force || dht.randomized) ? relay : null`.
+fn relay_for_dial(cfg: Option<[u8; 32]>, force: bool, randomized: bool) -> Option<[u8; 32]> {
+    cfg.filter(|_| force || randomized)
+}
+
+/// Node's connect `onerror`: a holepunch failure with a relay configured pins
+/// the peer to the relay and resets the attempts, so the relay retry is fast.
+fn note_connect_error(info: &mut PeerInfo, relay_configured: bool, err: &SwarmError) {
+    let holepunch_failure = matches!(
+        err,
+        SwarmError::Dht(HyperDhtError::HolepunchAborted | HyperDhtError::HolepunchFailed)
+    );
+    if relay_configured && holepunch_failure {
+        info.force_relaying = true;
+        info.attempts = 0;
+    }
+}
+
 const DEFAULT_MAX_PEERS: usize = 64;
 const DEFAULT_MAX_PARALLEL: usize = 3;
 
@@ -154,9 +172,13 @@ pub struct SwarmConfig {
     pub max_parallel: usize,
     /// Firewall value sent in handshakes (default 0).
     pub firewall: u64,
-    /// Public key of a relay node to force all server connections through.
-    /// When set, server handshake replies include `relay_through` info directing
-    /// clients to connect via the specified relay using the blind-relay protocol.
+    /// Public key of a blind relay used for `relayThrough`.
+    ///
+    /// As in Node hyperswarm, this is not a hard switch: the relay is used
+    /// for a dial when the peer has `force_relaying` set (after a holepunch
+    /// failure) or when this node's DHT classifies its NAT as
+    /// `FIREWALL_RANDOM`, and a server only advertises it in its handshake
+    /// replies when its own NAT is randomized.
     pub relay_through: Option<[u8; 32]>,
     /// Socket address of the relay node. When provided alongside `relay_through`,
     /// the server connects to the relay directly instead of discovering it via DHT.
@@ -1556,13 +1578,13 @@ impl SwarmActor {
             });
 
             let pk = self.queue.remove(0);
-            let relay_addrs = if let Some(info) = self.peers.get_mut(&pk) {
+            let (relay_addrs, force_relaying) = if let Some(info) = self.peers.get_mut(&pk) {
                 info.queued = false;
                 info.connecting = true;
                 info.attempts += 1;
-                info.relay_addresses.clone()
+                (info.relay_addresses.clone(), info.force_relaying)
             } else {
-                vec![]
+                (vec![], false)
             };
 
             self.active_connects += 1;
@@ -1572,9 +1594,14 @@ impl SwarmActor {
             let rh = self.runtime_handle.clone();
             let mut connect_opts = peeroxide_dht::hyperdht::ConnectOpts::default();
             connect_opts.local_connection = self.config.local_connection;
+            let relay_cfg = self.config.relay_through;
 
             let task = tokio::spawn(async move {
                 let conn_runtime = UdxRuntime::shared(rh);
+                // Node `_maybeRelayConnection(peerInfo.forceRelaying)`; the
+                // NAT lookup lives here because the actor loop is sync.
+                let randomized = dht.firewalled().await.ok() == Some(FIREWALL_RANDOM);
+                connect_opts.relay_through = relay_for_dial(relay_cfg, force_relaying, randomized);
                 tracing::debug!(pk = %short_hex(&pk), "connecting to peer");
                 match dht
                     .connect_with_options(&key_pair, pk, &relay_addrs, &conn_runtime, connect_opts)
@@ -1671,6 +1698,9 @@ impl SwarmActor {
             }
             Err(e) => {
                 tracing::debug!(pk = %short_hex(&result.public_key), err = %e, "connect failed");
+                if let Some(info) = self.peers.get_mut(&result.public_key) {
+                    note_connect_error(info, self.config.relay_through.is_some(), &e);
+                }
                 self.schedule_retry(result.public_key);
             }
         }
@@ -1806,20 +1836,23 @@ impl SwarmActor {
 
         let local_stream_id = hyperdht::alloc_stream_id();
 
-        let (relay_token, relay_through_info) = if let Some(relay_pk) = self.config.relay_through {
-            let token: [u8; 32] = rand::random();
-            let info = RelayThroughInfo {
-                version: 1,
-                public_key: relay_pk,
-                token,
-            };
-            (Some(token), Some(info))
-        } else {
-            (None, None)
+        let firewall_state = self.dht.firewalled().await.unwrap_or(FIREWALL_UNKNOWN);
+        let (relay_token, relay_through_info) = match self.config.relay_through {
+            // Node calls the relay function with `force` undefined on the
+            // server side, so only a randomized NAT advertises the relay.
+            Some(relay_pk) if firewall_state == FIREWALL_RANDOM => {
+                let token: [u8; 32] = rand::random();
+                let info = RelayThroughInfo {
+                    version: 1,
+                    public_key: relay_pk,
+                    token,
+                };
+                (Some(token), Some(info))
+            }
+            _ => (None, None),
         };
 
         // Decide how this handshake will connect (see `select_server_path`).
-        let firewall_state = self.dht.firewalled().await.unwrap_or(FIREWALL_UNKNOWN);
         let path = select_server_path(
             relay_through_info.is_some(),
             firewall_state,
@@ -2880,6 +2913,48 @@ mod tests {
                 "relay_advertised={relay_advertised} server={server} client={client} forwarded={forwarded}"
             );
         }
+    }
+
+    #[test]
+    fn relay_dial_follows_node_relay_function() {
+        let cfg = Some([9u8; 32]);
+        assert_eq!(relay_for_dial(cfg, false, false), None, "neither forced nor randomized");
+        assert_eq!(relay_for_dial(cfg, true, false), cfg, "a holepunch failure forces the relay");
+        assert_eq!(relay_for_dial(cfg, false, true), cfg, "a randomized NAT dials via the relay");
+        assert_eq!(relay_for_dial(None, true, true), None, "no relay configured");
+    }
+
+    #[test]
+    fn holepunch_failure_pins_the_peer_to_the_relay() {
+        let mut info = PeerInfo::new([1u8; 32], vec![]);
+        info.attempts = 2;
+        note_connect_error(
+            &mut info,
+            true,
+            &SwarmError::Dht(HyperDhtError::HolepunchAborted),
+        );
+        assert!(info.force_relaying);
+        assert_eq!(info.attempts, 0, "the relay retry is fast");
+
+        let mut aborted = PeerInfo::new([2u8; 32], vec![]);
+        note_connect_error(
+            &mut aborted,
+            true,
+            &SwarmError::Dht(HyperDhtError::HolepunchFailed),
+        );
+        assert!(aborted.force_relaying);
+
+        let mut other = PeerInfo::new([3u8; 32], vec![]);
+        note_connect_error(&mut other, true, &SwarmError::Dht(HyperDhtError::HandshakeFailed("x".into())));
+        assert!(!other.force_relaying, "only a holepunch failure forces the relay");
+
+        let mut no_relay = PeerInfo::new([4u8; 32], vec![]);
+        note_connect_error(
+            &mut no_relay,
+            false,
+            &SwarmError::Dht(HyperDhtError::HolepunchAborted),
+        );
+        assert!(!no_relay.force_relaying, "no relay configured");
     }
 
     #[test]

@@ -31,6 +31,32 @@ async fn relay(rt: &UdxRuntime) -> (UdxStream, UdxStream, UdxSocket, SocketAddr)
     (to_a, to_b, socket, addr)
 }
 
+#[tokio::test]
+async fn direct_observation_waits_for_in_order_data() {
+    let runtime = create_runtime();
+    let (socket, addr) = create_bound_socket(&runtime).await;
+    let (peer, peer_addr) = create_bound_socket(&runtime).await;
+    let stream = runtime.create_stream(A_ID).await.expect("stream");
+    stream.connect(&socket, B_ID, peer_addr).await.expect("connect");
+    let remote = stream.remote_handle();
+    remote.change_remote(&socket, B_ID, peer_addr).await.expect("move");
+    let packet = |seq: u32| {
+        let mut data = vec![0u8; 20];
+        data[..4].copy_from_slice(&[0xff, 1, 1, 0]); // UDX v1 DATA header.
+        data[4..8].copy_from_slice(&A_ID.to_le_bytes());
+        data[8..12].copy_from_slice(&65536u32.to_le_bytes());
+        data[12..16].copy_from_slice(&seq.to_le_bytes());
+        data.push(seq as u8);
+        data
+    };
+    peer.send_to(&packet(1), addr).expect("out-of-order data");
+    assert!(tokio::time::timeout(Duration::from_millis(30), remote.remote_observed())
+        .await.is_err(), "a gap must keep the relay alive");
+    peer.send_to(&packet(0), addr).expect("in-order data");
+    tokio::time::timeout(Duration::from_secs(2), remote.remote_observed())
+        .await.expect("direct observation").expect("stream alive");
+}
+
 /// A (the initiator) learns B's direct address out of band and moves first;
 /// B notices A's packets arriving on its direct socket through the firewall
 /// hook, exactly how hyperdht's server side triggers `changeRemote`.
@@ -104,6 +130,9 @@ async fn relayed_stream_moves_to_a_direct_path_mid_transfer() {
         assert_eq!(addr, addr_a2);
         assert_eq!(socket.local_addr().await.unwrap(), addr_b2);
         b_remote.change_remote(&socket, A_ID, addr).await.expect("b change_remote");
+        assert!(tokio::time::timeout(Duration::from_millis(20), a_remote.remote_observed())
+            .await.is_err(), "ACKs alone must not confirm direct application traffic");
+        b_remote.try_send(&[]).expect("confirm direct path");
         a_remote.remote_observed().await.expect("a observed b directly");
 
         // The relay is gone; the rest must go direct.

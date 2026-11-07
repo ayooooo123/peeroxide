@@ -49,6 +49,10 @@ pub struct PeerInfo {
     pub connecting: bool,
     /// Whether this peer was explicitly added (not discovered via DHT).
     pub explicit: bool,
+    /// Whether to pair with this peer through the relay regardless of NAT
+    /// state. Set after a holepunch failure when a relay is configured
+    /// (Node `peerInfo.forceRelaying`).
+    pub force_relaying: bool,
     /// Topics this peer is associated with.
     pub topics: Vec<[u8; 32]>,
     /// Number of connection attempts since the last successful connection.
@@ -71,6 +75,7 @@ impl PeerInfo {
             queued: false,
             connecting: false,
             explicit: false,
+            force_relaying: false,
             topics: Vec::new(),
             attempts: 0,
             priority: Priority::Normal,

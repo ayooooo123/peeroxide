@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HyperDHT server handles, shared-server routing, and raw-stream allocation and connection.
 - `HyperDhtHandle::mutable_put_signed`: store a mutable record with a caller-supplied signature (Node `mutablePut` with a precomputed `opts.signMutable`), so a guard can forward an endpoint-signed record. `mutable_put` now queries with `seq = 0` like Node; the stored seq is unchanged.
 - `SecretStream::remote_handle` exposes libudx's `UdxStreamRemote` for the connection's UDX stream.
+- `ConnectOpts::relay_through` and `ServerConfig::relay_through` race blind relay pairing with a direct path and migrate the same encrypted stream when the punch lands.
 
 ### Changed
 

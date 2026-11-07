@@ -242,6 +242,7 @@ pub(crate) struct StreamInner {
     remote_change: Option<(u32, oneshot::Sender<()>)>,
     /// Released by data or a message from the current remote on this socket.
     remote_observed: Option<oneshot::Sender<()>>,
+    observed_current_remote: bool,
 }
 
 impl StreamInner {
@@ -963,6 +964,7 @@ impl UdxStream {
             registrations: Arc::clone(&registrations),
             remote_change: None,
             remote_observed: None,
+            observed_current_remote: false,
         };
 
         Self {
@@ -1339,6 +1341,12 @@ impl UdxStreamRemote {
         Self { inner }
     }
 
+    /// The peer address the stream currently sends to (Node
+    /// `rawStream.remoteHost`/`remotePort`); moves with `change_remote`.
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).remote_addr
+    }
+
     /// Send to `remote_id` at `remote_addr` over `socket` from now on
     /// (C `udx_stream_change_remote`, udx.c:2582).
     ///
@@ -1374,6 +1382,7 @@ impl UdxStreamRemote {
             }
             inner.remote_id = remote_id;
             inner.remote_addr = Some(remote_addr);
+            inner.observed_current_remote = false;
             inner.udp = Some(udp);
             // Not sent yet, so bound to the remote at send time as in C.
             for queued in &mut inner.send_queue {
@@ -1401,14 +1410,17 @@ impl UdxStreamRemote {
         Ok(())
     }
 
-    /// Resolves once a packet from the current remote arrives on the current
-    /// socket: the peer is reaching us over the path `change_remote` set.
+    /// Resolves once data or a message from the current remote arrives on the
+    /// current socket, confirming the peer sends application traffic directly.
     pub async fn remote_observed(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if !inner.is_alive() {
                 return Err(UdxError::StreamClosed);
+            }
+            if inner.observed_current_remote {
+                return Ok(());
             }
             inner.remote_observed = Some(tx);
         }
@@ -1550,12 +1562,16 @@ async fn process_incoming(
                 // ── Peer seen on the current path (after `change_remote`) ──
                 {
                     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                    if guard.remote_observed.is_some() && guard.remote_addr == Some(packet.addr) {
+                    // Out-of-order data does not prove the old path has drained.
+                    let observed = header.has_flag(FLAG_MESSAGE)
+                        || (header.has_flag(FLAG_DATA) && header.seq == guard.next_remote_seq);
+                    if observed && guard.remote_addr == Some(packet.addr) {
                         let same = match (&guard.udp, packet.socket.udp_arc().ok()) {
                             (Some(ours), Some(arrival)) => Arc::ptr_eq(ours, &arrival),
                             _ => false,
                         };
                         if same {
+                            guard.observed_current_remote = true;
                             if let Some(tx) = guard.remote_observed.take() {
                                 let _ = tx.send(());
                             }
@@ -2116,6 +2132,7 @@ mod mtu_tests {
             registrations: Registrations::default(),
             remote_change: None,
             remote_observed: None,
+            observed_current_remote: false,
         }
     }
 
