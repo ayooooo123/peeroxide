@@ -1914,6 +1914,7 @@ impl HyperDhtHandle {
             local_stream_id,
             remote_id,
             local_connection: opts.local_connection,
+            has_relay: relay_through.is_some(),
         };
 
         let Some((relay_pk, token, initiator)) = relay_through else {
@@ -1991,6 +1992,7 @@ struct DirectDial {
     local_stream_id: u32,
     remote_id: u32,
     local_connection: bool,
+    has_relay: bool,
 }
 
 impl DirectDial {
@@ -2005,6 +2007,7 @@ impl DirectDial {
             local_stream_id,
             remote_id,
             local_connection,
+            has_relay,
         } = self;
         let this = &dht;
         let relay = &node;
@@ -2107,6 +2110,7 @@ impl DirectDial {
                 &server_address,
                 runtime,
                 local_stream_id,
+                has_relay,
             )
             .await?;
         let socket = match hp_result.udx_socket.clone() {
@@ -2222,6 +2226,7 @@ impl HyperDhtHandle {
         _server_address: &Ipv4Peer,
         runtime: &UdxRuntime,
         local_stream_id: u32,
+        has_relay: bool,
     ) -> Result<ConnectResult, HyperDhtError> {
         // Node-shaped multi-round client holepunch loop.
         //
@@ -2454,71 +2459,93 @@ impl HyperDhtHandle {
             return Err(HyperDhtError::HolepunchFailed);
         };
 
-        // ── Final punch round (single round with punching=true) ─────────────
-        let final_round = last_round.saturating_add(1);
-        let final_outbound_token: [u8; 32] = rand::random();
-        let punch_payload = HolepunchPayload {
-            error: ERROR_NONE,
-            firewall: puncher.nat.firewall,
-            round: final_round,
-            connected: false,
-            punching: true,
-            addresses: Some(local_punch_addrs.clone()),
-            remote_address: Some(verified_addr.clone()),
-            token: Some(final_outbound_token),
-            remote_token: cached_reply_token,
-        };
-
-        let encrypted_punch = sp.encrypt(&punch_payload)?;
-        let hp_punch_value = Router::encode_client_holepunch(hp_id, encrypted_punch, None)?;
-
-        tracing::info!(
-            target: "peeroxide::_events::holepunch::final_punch_sent",
-            round = final_round,
-            verified_addr = %format!("{}:{}", verified_addr.host, verified_addr.port),
-            "final punch sent, waiting for Connected event"
-        );
-
-        let punch_resp = self
-            .dht
-            .request(
-                UserRequestParams {
-                    token: None,
-                    command: PEER_HOLEPUNCH,
-                    target: Some(*target),
-                    value: Some(hp_punch_value),
-                    timeout_ms: None,
-                    retries: None,
-                },
-                &relay.host,
-                relay.port,
-            )
-            .await?;
-
-        if let Some(reply_value) = &punch_resp.value {
-            let hp_result = {
-                let router = self
-                    .router
-                    .lock()
-                    .map_err(|_| HyperDhtError::ChannelClosed)?;
-                router.validate_holepunch_reply(reply_value, relay, &punch_resp.from, relay)?
-            };
-
-            if let Ok(reply_hp) = sp.decrypt(&hp_result.payload) {
-                let verified_host = if reply_hp.remote_token == Some(final_outbound_token) {
-                    Some(hp_result.peer_address.host.as_str())
-                } else {
-                    None
-                };
-                if let Some(addrs) = &reply_hp.addresses {
-                    puncher.update_remote(
-                        reply_hp.punching,
-                        reply_hp.firewall,
-                        addrs,
-                        verified_host,
-                    );
+        let mut final_round = last_round;
+        loop {
+            while !puncher.reserve_random_punch() {
+                if !puncher.retry_random_punch(has_relay, deadline).await {
+                    puncher.destroy();
+                    return Err(HyperDhtError::HolepunchAborted);
                 }
             }
+
+            // ── Final punch round (single round with punching=true) ─────────────
+            final_round = final_round.saturating_add(1);
+            let final_outbound_token: [u8; 32] = rand::random();
+            let punch_payload = HolepunchPayload {
+                error: ERROR_NONE,
+                firewall: puncher.nat.firewall,
+                round: final_round,
+                connected: false,
+                punching: true,
+                addresses: Some(local_punch_addrs.clone()),
+                remote_address: Some(verified_addr.clone()),
+                token: Some(final_outbound_token),
+                remote_token: cached_reply_token,
+            };
+
+            let encrypted_punch = sp.encrypt(&punch_payload)?;
+            let hp_punch_value = Router::encode_client_holepunch(hp_id, encrypted_punch, None)?;
+
+            tracing::info!(
+                target: "peeroxide::_events::holepunch::final_punch_sent",
+                round = final_round,
+                verified_addr = %format!("{}:{}", verified_addr.host, verified_addr.port),
+                "final punch sent, waiting for Connected event"
+            );
+
+            let punch_resp = self
+                .dht
+                .request(
+                    UserRequestParams {
+                        token: None,
+                        command: PEER_HOLEPUNCH,
+                        target: Some(*target),
+                        value: Some(hp_punch_value),
+                        timeout_ms: None,
+                        retries: None,
+                    },
+                    &relay.host,
+                    relay.port,
+                )
+                .await?;
+
+            if let Some(reply_value) = &punch_resp.value {
+                let hp_result = {
+                    let router = self
+                        .router
+                        .lock()
+                        .map_err(|_| HyperDhtError::ChannelClosed)?;
+                    router.validate_holepunch_reply(reply_value, relay, &punch_resp.from, relay)?
+                };
+
+                if let Ok(reply_hp) = sp.decrypt(&hp_result.payload) {
+                    if reply_hp.error == ERROR_TRY_LATER {
+                        if !puncher.retry_random_punch(has_relay, deadline).await {
+                            puncher.destroy();
+                            return Err(HyperDhtError::HolepunchAborted);
+                        }
+                        continue;
+                    }
+                    if reply_hp.error != ERROR_NONE {
+                        puncher.destroy();
+                        return Err(HyperDhtError::HolepunchAborted);
+                    }
+                    let verified_host = if reply_hp.remote_token == Some(final_outbound_token) {
+                        Some(hp_result.peer_address.host.as_str())
+                    } else {
+                        None
+                    };
+                    if let Some(addrs) = &reply_hp.addresses {
+                        puncher.update_remote(
+                            reply_hp.punching,
+                            reply_hp.firewall,
+                            addrs,
+                            verified_host,
+                        );
+                    }
+                }
+            }
+            break;
         }
 
         // Spawn the local punch loop and race it against Connected / Aborted
@@ -3372,9 +3399,14 @@ async fn server_punch_round(
         state.round = remote_hp.round;
     }
 
+    let try_later = remote_hp.punching
+        && state
+            .puncher
+            .as_mut()
+            .is_some_and(|puncher| !puncher.reserve_random_punch());
     // `punch()` owns the puncher for the rest of the exchange; later rounds
     // only rebuild the reply, as Node does once its probe loop is running.
-    if remote_hp.punching && state.puncher.is_some() {
+    if remote_hp.punching && !try_later && state.puncher.is_some() {
         if let Some(puncher) = state.puncher.take() {
             let runtime = UdxRuntime::shared(runtime.handle());
             state.punch_task = Some(tokio::spawn(async move {
@@ -3399,11 +3431,15 @@ async fn server_punch_round(
         }
     } else {
         HolepunchPayload {
-            error: ERROR_NONE,
+            error: if try_later {
+                ERROR_TRY_LATER
+            } else {
+                ERROR_NONE
+            },
             firewall: server_firewall,
             round: remote_hp.round,
             connected: false,
-            punching: remote_hp.punching,
+            punching: remote_hp.punching && !try_later,
             addresses: Some(state.addresses.clone()),
             remote_address: Some(peer_address.clone()),
             token: Some(state.payload.token(&peer_address.host)),
@@ -4288,12 +4324,17 @@ pub async fn build_passive_holepunch_reply(
         None => Vec::new(),
     };
 
+    let try_later = remote_hp.punching && !puncher.reserve_random_punch();
     let reply_hp = HolepunchPayload {
-        error: 0,
+        error: if try_later {
+            ERROR_TRY_LATER
+        } else {
+            ERROR_NONE
+        },
         firewall: config_firewall,
         round: remote_hp.round,
         connected: false,
-        punching: remote_hp.punching,
+        punching: remote_hp.punching && !try_later,
         addresses: Some(local_punch_addrs),
         remote_address: Some(peer_address.clone()),
         token: Some(sp.token(&peer_address.host)),

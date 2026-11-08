@@ -386,6 +386,7 @@ pub struct DhtHandle {
     cmd_tx: mpsc::UnboundedSender<DhtCommand>,
     wire: crate::io::WireCounters,
     table: Arc<Mutex<RoutingTable>>,
+    pub(crate) random_punch_budget: Arc<Mutex<crate::holepuncher::RandomPunchBudget>>,
 }
 
 impl DhtHandle {
@@ -2217,6 +2218,7 @@ pub async fn spawn(
         cmd_tx,
         wire,
         table: Arc::clone(&table_for_handle),
+        random_punch_budget: Arc::new(Mutex::new(crate::holepuncher::RandomPunchBudget::default())),
     };
 
     Ok((handle, dht_handle))

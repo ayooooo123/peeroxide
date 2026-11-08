@@ -146,17 +146,13 @@ fn secretstream_encrypt(
     // tag_block is now the full encrypted block; tag_block[0] = encrypted tag
     let encrypted_tag = tag_block[0];
 
-    // Counter=2+: encrypt message
-    let mut encrypted_msg = message.to_vec();
-    cipher.apply_keystream(&mut encrypted_msg);
-
-    // Compute MAC over full 64-byte encrypted block + encrypted message
-    let mac = compute_mac(&poly_key, aad, &tag_block, &encrypted_msg);
-
-    // Output: enc_tag || enc_msg || mac
-    let mut output = Vec::with_capacity(1 + message.len() + 16);
+    // Encrypt directly into the final wire buffer.
+    let mut output = Vec::with_capacity(ABYTES + message.len());
     output.push(encrypted_tag);
-    output.extend_from_slice(&encrypted_msg);
+    output.extend_from_slice(message);
+    cipher.apply_keystream(&mut output[1..]);
+
+    let mac = compute_mac(&poly_key, aad, &tag_block, &output[1..]);
     output.extend_from_slice(&mac);
     output
 }
@@ -360,6 +356,22 @@ mod tests {
         assert_eq!(tag2, TAG_MESSAGE);
         assert_eq!(tag3, TAG_MESSAGE);
         assert_eq!(tag4, TAG_FINAL);
+    }
+
+    #[test]
+    fn frame_boundaries_and_associated_data_round_trip() {
+        let key = make_key();
+        let header = [7; HEADERBYTES];
+        let mut push = Push::with_header(&key, &header);
+        let mut pull = Pull::new(&key, &header);
+        for size in (0..=33).chain([65536]) {
+            let message = vec![42; size];
+            let ciphertext = push.push(&message, Some(b"associated data"), TAG_MESSAGE);
+            assert_eq!(ciphertext.len(), size + ABYTES);
+            let (plaintext, tag) = pull.pull(&ciphertext, Some(b"associated data")).unwrap();
+            assert_eq!(plaintext, message);
+            assert_eq!(tag, TAG_MESSAGE);
+        }
     }
 
     #[test]

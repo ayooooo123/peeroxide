@@ -44,6 +44,19 @@ dht.announce(topic, &key_pair, &[]).await?;
 - Pure Rust cryptography: Uses `ed25519-dalek`, `chacha20poly1305`, and `blake2`. No `libsodium` dependency.
 - Interoperability: Validated through golden byte fixtures and live cross-language tests.
 
+### Concurrency and resource limits
+
+Connections own independent Noise and secretstream state; keep each connection's
+cipher operations ordered. Randomized NAT punches share one active slot per DHT
+and wait 20 seconds after completion, matching hyperdht's default resource budget.
+The 256-socket birthday strategy and hyperswarm retry tiers are unchanged.
+Busy attempts abort without a relay; with a relay they back off 10–20 seconds,
+within the existing punch deadline. Cancelled reservations do not start a cooldown.
+
+The ignored `secretstream_bench` test reports verified encrypt/decrypt throughput
+for `UDX_WORKERS`, `UDX_CONNECTIONS` and aggregate `UDX_MIB`. Compare 1 and 4 workers
+in release and dev profiles; time the built executable for CPU and peak RSS.
+
 ### Project
 
 Part of the [peeroxide](https://github.com/Rightbracket/peeroxide) project.

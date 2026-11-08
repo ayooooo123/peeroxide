@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Socket stream registration rejects a different stream at an occupied ID while permitting same-stream idempotent registration.
 - Firewall hooks can reject a packet without closing the listening stream.
 - Firewall hooks stay armed after the stream connects and run for packets arriving on another socket than the stream's, as C `on_firewall` does; a connected stream only gates the packet.
+- Common ACKs use stack storage; ordered receive events reuse a per-processor buffer, with reader wakeups outside the stream lock.
+- Unreliable datagrams send immediately when the socket is writable, reserving allocation and a task for backpressure.
 
 ### Fixed
 
@@ -27,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Aborting a stream now stops its processor task; abort handles expose liveness for registry pruning.
 - Stream retirement synchronously releases socket registrations and reserved IDs; stale handles cannot deregister a replacement or re-arm a closed stream.
 - Destroying a relay leg is quiet, matching C libudx, so relay teardown does not destroy an upgraded endpoint.
+- Stream termination releases send, retransmit and receive-reorder buffers even while an abort handle remains alive.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/libudx-v1.7.3...libudx-v1.7.4) - 2026-11-02
 

@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking:** `HyperDhtHandle::register_server` takes the server's public key instead of its target and also serves the server's own record to `FIND_PEER`/`LOOKUP` (Node `server.listen()` → `dht._router.set(target, { record })`). Previously a node that was itself the closest to its server — or the only DHT node, as a relay in a local testnet is — answered `PEER_NOT_FOUND` for its own key.
+- Secretstream encrypts directly into its final wire buffer instead of allocating and copying an intermediate ciphertext.
 
 ### Fixed
 
@@ -29,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Direct hooks are armed before relay pairing starts. Delayed relay data and ACKs remain accepted during migration without confirming the direct path.
 - Raw-stream allocation reserves IDs atomically, closed handles are pruned on close, and relayed application closure also releases its control mux.
 - Keep the remote-client interop fixture firewalled throughout NAT sampling so loopback reachability cannot silently disable its holepunch addresses.
+- Randomized NAT punches share hyperdht's per-DHT limit of one active attempt and a 20-second cooldown after completion; busy passive punches reply `TRY_LATER` instead of opening another birthday-socket batch. Relayed clients back off 10–20 seconds on busy budgets or `TRY_LATER`; clients without a relay abort.
+- Dropping a holepuncher now aborts its receive adapters and releases every unclaimed birthday socket, including on a successful connection's early return; a connected stream retains only its chosen socket.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.3...peeroxide-dht-v1.7.4) - 2026-11-02
 

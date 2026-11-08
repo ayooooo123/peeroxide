@@ -16,8 +16,8 @@
 #![allow(missing_docs)]
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use libudx::UdxSocket;
 use tokio::sync::mpsc;
@@ -32,6 +32,46 @@ use crate::socket_pool::{
 };
 
 const BIRTHDAY_SOCKETS: usize = 256;
+
+/// hyperdht allows one randomized punch and waits 20 s after it finishes.
+#[derive(Default)]
+pub(crate) struct RandomPunchBudget {
+    active: bool,
+    last_finished: Option<tokio::time::Instant>,
+}
+
+struct RandomPunch {
+    budget: Arc<Mutex<RandomPunchBudget>>,
+    started: bool,
+}
+
+impl RandomPunch {
+    fn reserve(budget: &Arc<Mutex<RandomPunchBudget>>) -> Option<Self> {
+        let mut state = budget.lock().unwrap_or_else(|err| err.into_inner());
+        if state.active
+            || state
+                .last_finished
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(20))
+        {
+            return None;
+        }
+        state.active = true;
+        Some(Self {
+            budget: Arc::clone(budget),
+            started: false,
+        })
+    }
+}
+
+impl Drop for RandomPunch {
+    fn drop(&mut self) {
+        let mut state = self.budget.lock().unwrap_or_else(|err| err.into_inner());
+        state.active = false;
+        if self.started {
+            state.last_finished = Some(tokio::time::Instant::now());
+        }
+    }
+}
 
 #[non_exhaustive]
 pub enum HolepunchEvent {
@@ -70,6 +110,8 @@ pub struct Holepuncher {
     /// socket opened by `open_birthday_sockets`). `destroy()` aborts all
     /// of them so cleanup is bounded and no task outlives the Holepuncher.
     recv_tasks: Vec<JoinHandle<()>>,
+    random_budget: Option<Arc<Mutex<RandomPunchBudget>>>,
+    random_punch: Option<RandomPunch>,
 }
 
 impl Holepuncher {
@@ -104,6 +146,8 @@ impl Holepuncher {
             event_tx,
             connected_flag,
             recv_tasks: recv_task.into_iter().collect(),
+            random_budget: None,
+            random_punch: None,
         })
     }
 
@@ -215,6 +259,7 @@ impl Holepuncher {
     /// puncher has no primary socket or its `dht_reply_rx` has already
     /// been consumed.
     pub async fn auto_sample(&mut self, dht: &crate::rpc::DhtHandle) -> usize {
+        self.random_budget = Some(Arc::clone(&dht.random_punch_budget));
         let (socket_clone, rx) = {
             let Some(socket_ref) = self.sockets.first_mut() else {
                 return 0;
@@ -251,8 +296,39 @@ impl Holepuncher {
         !self.unstable()
     }
 
+    pub(crate) fn reserve_random_punch(&mut self) -> bool {
+        if self.random_punch.is_some()
+            || (self.nat.firewall < FIREWALL_RANDOM && self.remote_firewall < FIREWALL_RANDOM)
+        {
+            return true;
+        }
+        let Some(budget) = &self.random_budget else {
+            return true;
+        };
+        self.random_punch = RandomPunch::reserve(budget);
+        self.random_punch.is_some()
+    }
+
+    pub(crate) async fn retry_random_punch(
+        &mut self,
+        has_relay: bool,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        self.random_punch = None;
+        if !has_relay || tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        let delay = Duration::from_millis(rand::random_range(10_000..=20_000));
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + delay)).await;
+        tokio::time::Instant::now() < deadline
+    }
+
     pub async fn punch(&mut self, pool: &SocketPool, runtime: &libudx::UdxRuntime) -> bool {
         if self.done() || self.remote_addresses.is_empty() {
+            return false;
+        }
+        if !self.reserve_random_punch() {
+            self.destroy();
             return false;
         }
 
@@ -273,11 +349,17 @@ impl Holepuncher {
         };
 
         if local == FIREWALL_CONSISTENT && remote >= FIREWALL_RANDOM {
+            if let Some(lease) = &mut self.random_punch {
+                lease.started = true;
+            }
             self.random_probes(&verified_addr).await;
             return true;
         }
 
         if local >= FIREWALL_RANDOM && remote == FIREWALL_CONSISTENT {
+            if let Some(lease) = &mut self.random_punch {
+                lease.started = true;
+            }
             self.open_birthday_sockets(pool, runtime, &verified_addr)
                 .await;
             if self.punching {
@@ -460,6 +542,7 @@ impl Holepuncher {
         }
         self.destroyed = true;
         self.punching = false;
+        self.random_punch = None;
         self.sockets.clear();
         self.nat.destroy();
 
@@ -470,6 +553,12 @@ impl Holepuncher {
         if !self.connected && !self.connected_flag.load(Ordering::Acquire) {
             let _ = self.event_tx.send(HolepunchEvent::Aborted);
         }
+    }
+}
+
+impl Drop for Holepuncher {
+    fn drop(&mut self) {
+        self.destroy();
     }
 }
 
@@ -582,6 +671,197 @@ pub fn match_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn assert_birthday_punch_drop(connected: bool) {
+        let runtime = libudx::UdxRuntime::new().unwrap();
+        let pool = SocketPool::new("127.0.0.1".into());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut puncher = Holepuncher::new(&pool, &runtime, true, true, FIREWALL_CONSISTENT, tx)
+            .await
+            .unwrap();
+        puncher.punching = true;
+        puncher
+            .open_birthday_sockets(&pool, &runtime, &peer("127.0.0.1", 9))
+            .await;
+        assert_eq!(puncher.sockets.len(), BIRTHDAY_SOCKETS);
+        let mut addresses = Vec::new();
+        for socket in &puncher.sockets {
+            addresses.push(socket.socket.local_addr().await.unwrap());
+        }
+        let adapters: Vec<_> = puncher
+            .recv_tasks
+            .iter()
+            .map(JoinHandle::abort_handle)
+            .collect();
+        let kept = if connected {
+            let primary = puncher.primary_socket().unwrap().socket.clone();
+            let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            probe.send_to(&[0], addresses[0]).await.unwrap();
+            let events = &mut rx;
+            Some(
+                async move {
+                    let _owner = puncher;
+                    if matches!(
+                        tokio::time::timeout(Duration::from_secs(2), events.recv())
+                            .await
+                            .unwrap(),
+                        Some(HolepunchEvent::Connected { .. })
+                    ) {
+                        return primary;
+                    }
+                    panic!("expected connected probe");
+                }
+                .await,
+            )
+        } else {
+            drop(puncher);
+            None
+        };
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if adapters.iter().all(|task| task.is_finished())
+                    && addresses
+                        .iter()
+                        .skip(usize::from(connected))
+                        .all(|addr| std::net::UdpSocket::bind(addr).is_ok())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "dropping the puncher retained adapters or UDP sockets"
+        );
+        if connected {
+            assert!(std::net::UdpSocket::bind(addresses[0]).is_err());
+            assert!(!matches!(rx.try_recv(), Ok(HolepunchEvent::Aborted)));
+        }
+        drop(kept);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while std::net::UdpSocket::bind(addresses[0]).is_err() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_birthday_punch_aborts_all_adapters() {
+        assert_birthday_punch_drop(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connected_early_return_keeps_only_primary_socket() {
+        assert_birthday_punch_drop(true).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn randomized_punches_share_a_limit_and_completion_cooldown() {
+        let budget = Arc::new(Mutex::new(RandomPunchBudget::default()));
+        let mut lease = RandomPunch::reserve(&budget).unwrap();
+        lease.started = true;
+        for _ in 0..8 {
+            assert!(RandomPunch::reserve(&budget).is_none());
+        }
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(
+            RandomPunch::reserve(&budget).is_none(),
+            "active punch never expires"
+        );
+        drop(lease);
+        assert!(RandomPunch::reserve(&budget).is_none());
+        tokio::time::advance(Duration::from_millis(19_999)).await;
+        assert!(RandomPunch::reserve(&budget).is_none());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(RandomPunch::reserve(&budget).is_some());
+    }
+
+    #[test]
+    fn cancelled_reservation_does_not_start_a_cooldown() {
+        let budget = Arc::new(Mutex::new(RandomPunchBudget::default()));
+        drop(RandomPunch::reserve(&budget).unwrap());
+        assert!(RandomPunch::reserve(&budget).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_random_punch_retries_only_with_a_relay_and_before_deadline() {
+        let runtime = libudx::UdxRuntime::new().unwrap();
+        let pool = SocketPool::new("127.0.0.1".into());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut puncher = Holepuncher::new(&pool, &runtime, true, true, FIREWALL_RANDOM, tx)
+            .await
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        assert!(
+            !puncher
+                .retry_random_punch(false, start + Duration::from_secs(60))
+                .await
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(
+            puncher
+                .retry_random_punch(true, start + Duration::from_secs(60))
+                .await
+        );
+        assert!((Duration::from_secs(10)..=Duration::from_secs(20)).contains(&start.elapsed()));
+        let start = tokio::time::Instant::now();
+        assert!(
+            !puncher
+                .retry_random_punch(true, start + Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+        puncher.destroy();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "socket-budget performance benchmark"]
+    async fn randomized_punch_socket_benchmark() {
+        let limited = std::env::var("UDX_BUDGET").as_deref() != Ok("0");
+        let runtime = libudx::UdxRuntime::new().unwrap();
+        let pool = SocketPool::new("127.0.0.1".into());
+        let budget = Arc::new(Mutex::new(RandomPunchBudget::default()));
+        let mut punchers = Vec::new();
+        let start = std::time::Instant::now();
+        for _ in 0..4 {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut puncher =
+                Holepuncher::new(&pool, &runtime, true, true, FIREWALL_CONSISTENT, tx)
+                    .await
+                    .unwrap();
+            puncher.nat.firewall = FIREWALL_RANDOM;
+            if limited {
+                puncher.random_budget = Some(Arc::clone(&budget));
+            }
+            if puncher.reserve_random_punch() {
+                puncher.punching = true;
+                puncher
+                    .open_birthday_sockets(&pool, &runtime, &peer("127.0.0.1", 9))
+                    .await;
+            }
+            punchers.push(puncher);
+        }
+        let sockets: usize = punchers.iter().map(|puncher| puncher.sockets.len()).sum();
+        assert_eq!(
+            sockets,
+            if limited {
+                BIRTHDAY_SOCKETS + 3
+            } else {
+                BIRTHDAY_SOCKETS * 4
+            }
+        );
+        println!(
+            "PUNCH budget={limited} sockets={sockets} seconds={:.6}",
+            start.elapsed().as_secs_f64()
+        );
+        for puncher in &mut punchers {
+            puncher.destroy();
+        }
+        tokio::task::yield_now().await;
+    }
 
     fn peer(host: &str, port: u16) -> Ipv4Peer {
         Ipv4Peer {

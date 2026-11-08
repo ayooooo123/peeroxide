@@ -292,6 +292,12 @@ impl StreamInner {
                 let _ = tx.send(Err(UdxError::StreamClosed));
             }
         }
+        // Abort handles can outlive the stream; they must not pin packet storage.
+        self.send_queue = VecDeque::new();
+        self.outgoing.clear();
+        self.recv_buf.clear();
+        self.queued_bytes = 0;
+        self.unacked_bytes = 0;
         if let Some(w) = self.write_waker.take() {
             w.wake();
         }
@@ -773,27 +779,31 @@ impl StreamInner {
     ///
     /// In-order packets are delivered immediately. Out-of-order packets are
     /// buffered. When gaps are filled, consecutive buffered packets are drained
-    /// and delivered in order. Returns events to deliver to the application.
+    /// and delivered in order.
     ///
     /// A single packet may carry both FLAG_DATA and FLAG_END (C libudx combines
     /// the last data chunk with the end marker). In that case two events are
     /// produced: Data followed by End.
-    fn receive_data(&mut self, seq: u32, payload: Vec<u8>, flags: u8) -> Vec<StreamEvent> {
-        let mut events = Vec::new();
-
+    fn receive_data(
+        &mut self,
+        seq: u32,
+        payload: Vec<u8>,
+        flags: u8,
+        events: &mut Vec<StreamEvent>,
+    ) {
         // Duplicate or already-received packet — ignore
         if seq < self.next_remote_seq {
-            return events;
+            return;
         }
 
         if seq == self.next_remote_seq {
             // In-order: deliver directly
-            push_events(&mut events, payload, flags);
+            push_events(events, payload, flags);
             self.next_remote_seq = seq + 1;
 
             // Drain consecutive buffered packets
             while let Some(recvd) = self.recv_buf.remove(&self.next_remote_seq) {
-                push_events(&mut events, recvd.payload, recvd.flags);
+                push_events(events, recvd.payload, recvd.flags);
                 self.next_remote_seq += 1;
             }
         } else {
@@ -802,8 +812,6 @@ impl StreamInner {
                 .entry(seq)
                 .or_insert(RecvdPacket { payload, flags });
         }
-
-        events
     }
 
     // ── SACK generation ──────────────────────────────────────────────────────
@@ -1631,6 +1639,7 @@ async fn process_incoming(
     use tokio::time::{self, Duration, Instant as TokioInstant};
 
     let mut shutting_down = false;
+    let mut read_events = Vec::new();
 
     // RTO timer starts far in the future (no data in flight initially).
     let rto_sleep = time::sleep(FAR_FUTURE);
@@ -1880,13 +1889,12 @@ async fn process_incoming(
                     let recv_flags = (if is_data { FLAG_DATA } else { 0 })
                         | (if is_end { FLAG_END } else { 0 });
 
-                    let (events, read_tx, udp, remote_addr, remote_id, ack_val, sack_ranges) = {
+                    let (read_tx, udp, remote_addr, remote_id, ack_val, sack_ranges) = {
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                        let events = guard.receive_data(header.seq, payload, recv_flags);
+                        guard.receive_data(header.seq, payload, recv_flags, &mut read_events);
                         let sacks = guard.sack_ranges();
                         let ack_val = guard.next_remote_seq;
                         (
-                            events,
                             guard.read_tx.clone(),
                             guard.udp.clone(),
                             guard.remote_addr,
@@ -1895,7 +1903,7 @@ async fn process_incoming(
                             sacks,
                         )
                     };
-                    for event in events {
+                    for event in read_events.drain(..) {
                         let _ = read_tx.send(event);
                     }
                     send_ack(&udp, remote_addr, remote_id, ack_val, &sack_ranges);
@@ -2212,6 +2220,26 @@ fn send_ack(
     let (Some(udp), Some(addr)) = (udp.as_ref(), remote_addr) else {
         return;
     };
+    if sack_ranges.is_empty() {
+        let packet = Header {
+            type_flags: 0,
+            data_offset: 0,
+            remote_id,
+            recv_window: DEFAULT_RWND,
+            seq: 0,
+            ack,
+        }
+        .encode();
+        if !matches!(udp.try_send_to(&packet, addr), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
+        {
+            return;
+        }
+        let udp = Arc::clone(udp);
+        tokio::spawn(async move {
+            let _ = udp.send_to(&packet, addr).await;
+        });
+        return;
+    }
     let sack_byte_len = sack_ranges.len() * 8;
     let header = Header {
         type_flags: if sack_ranges.is_empty() { 0 } else { FLAG_SACK },
@@ -2291,6 +2319,95 @@ mod mtu_tests {
             observed_current_remote: false,
             runtime: None,
         }
+    }
+
+    fn fill_packet_buffers(inner: &mut StreamInner) {
+        let addr = "127.0.0.1:9".parse().unwrap();
+        for seq in 0..1024 {
+            inner.register_sent(seq, vec![1; MTU_MAX], addr, false);
+            inner.recv_buf.insert(
+                seq,
+                RecvdPacket {
+                    payload: vec![2; MTU_MAX],
+                    flags: FLAG_DATA,
+                },
+            );
+            inner.send_queue.push_back(QueuedPacket {
+                seq,
+                packet: vec![3; MTU_MAX],
+                remote_addr: addr,
+            });
+            inner.queued_bytes += MTU_MAX;
+        }
+    }
+
+    #[test]
+    #[ignore = "terminated-stream memory benchmark"]
+    fn terminated_stream_memory_benchmark() {
+        let mut retained = Vec::new();
+        for _ in 0..2 {
+            for _ in 0..8 {
+                let mut inner = make_stream_inner();
+                fill_packet_buffers(&mut inner);
+                inner.terminate();
+                retained.push(inner);
+            }
+        }
+        let bytes: usize = retained
+            .iter()
+            .map(|inner| {
+                inner
+                    .outgoing
+                    .values()
+                    .map(|packet| packet.packet.len())
+                    .sum::<usize>()
+                    + inner
+                        .recv_buf
+                        .values()
+                        .map(|packet| packet.payload.len())
+                        .sum::<usize>()
+                    + inner
+                        .send_queue
+                        .iter()
+                        .map(|packet| packet.packet.len())
+                        .sum::<usize>()
+            })
+            .sum();
+        println!(
+            "TERMINATED streams={} retained_payload_bytes={bytes}",
+            retained.len()
+        );
+        std::hint::black_box(&retained);
+    }
+
+    #[test]
+    fn terminated_stream_releases_packet_buffers() {
+        let mut inner = make_stream_inner();
+        fill_packet_buffers(&mut inner);
+        inner.terminate();
+        assert!(inner.send_queue.is_empty());
+        assert!(inner.outgoing.is_empty());
+        assert!(inner.recv_buf.is_empty());
+        assert_eq!(inner.send_queue.capacity(), 0);
+        assert_eq!(inner.queued_bytes, 0);
+        assert_eq!(inner.unacked_bytes, 0);
+        inner.terminate();
+    }
+
+    #[test]
+    fn receive_events_remain_ordered_across_gaps_and_combined_fin() {
+        let mut inner = make_stream_inner();
+        let mut events = Vec::new();
+        inner.receive_data(1, b"second".to_vec(), FLAG_DATA | FLAG_END, &mut events);
+        assert!(events.is_empty());
+        inner.receive_data(0, b"first".to_vec(), FLAG_DATA, &mut events);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0], StreamEvent::Data(bytes) if bytes == b"first"));
+        assert!(matches!(&events[1], StreamEvent::Data(bytes) if bytes == b"second"));
+        assert!(matches!(&events[2], StreamEvent::End));
+        events.clear();
+        inner.receive_data(1, b"duplicate".to_vec(), FLAG_DATA | FLAG_END, &mut events);
+        assert!(events.is_empty());
     }
 
     // T3: MTU state starts at BASE

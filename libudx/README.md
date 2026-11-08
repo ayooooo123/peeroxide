@@ -53,6 +53,26 @@ congestion control details, and protocol constants.
 - tokio async runtime
 - Part of the [peeroxide](https://github.com/Rightbracket/peeroxide) workspace
 
+## Performance checks
+
+`tests/bulk_bench.rs` streams verified data through 1–8 connections sharing two
+UDP sockets without retaining the transferred payload. It reports throughput and
+allocation counts; use `/usr/bin/time -l` on macOS for process CPU and peak RSS:
+
+```sh
+UDX_WORKERS=4 UDX_CONNECTIONS=8 UDX_MIB=128 \
+  cargo test -p libudx --release --test bulk_bench -- --ignored --nocapture
+```
+
+Build once with `--no-run`, then time the emitted test executable rather than
+Cargo so compilation is excluded.
+
+Compare the same workload with `UDX_WORKERS=1`. A socket has one receive task;
+stream processors are independent, while ordering within a stream is preserved.
+More workers do not eliminate contention in the kernel's shared UDP socket.
+Set `UDX_SEPARATE_PEERS=1` to give each receiver its own UDP socket while keeping
+the sender's socket shared, matching a multi-peer sender.
+
 ## License
 
 MIT OR Apache-2.0

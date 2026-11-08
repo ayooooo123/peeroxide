@@ -215,6 +215,10 @@ impl UdxSocket {
     /// Send an unreliable datagram to `addr`. Fire-and-forget.
     pub fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<()> {
         let udp = self.inner.udp_arc()?;
+        if !matches!(udp.try_send_to(data, addr), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
+        {
+            return Ok(());
+        }
         let data = data.to_vec();
         tokio::spawn(async move {
             let _ = udp.send_to(&data, addr).await;
@@ -279,6 +283,43 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "unreliable datagram task-allocation benchmark"]
+    async fn datagram_task_benchmark() {
+        let spawned = std::env::var("UDX_ASYNC_DATAGRAMS").as_deref() == Ok("1");
+        let sender = UdxSocket::new();
+        let receiver = UdxSocket::new();
+        sender.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        receiver.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let destination = receiver.local_addr().await.unwrap();
+        let mut incoming = receiver.recv_start().unwrap();
+        let payload = [42; 64];
+        let start = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            for _ in 0..1024 {
+                for _ in 0..32 {
+                    if spawned {
+                        let udp = sender.udp_arc().unwrap();
+                        let data = payload.to_vec();
+                        tokio::spawn(async move {
+                            let _ = udp.send_to(&data, destination).await;
+                        });
+                    } else {
+                        sender.send_to(&payload, destination).unwrap();
+                    }
+                }
+                for _ in 0..32 {
+                    assert_eq!(incoming.recv().await.unwrap().data, payload);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        println!(
+            "DATAGRAM spawned={spawned} packets=32768 seconds={:.6}",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dropping_socket_handles_releases_udp_sockets() {
         let mut sockets = Vec::new();
         for _ in 0..64 {
@@ -301,7 +342,10 @@ mod tests {
             .iter()
             .filter(|socket| socket.upgrade().is_some())
             .count();
-        assert_eq!(live, 0, "dropping 64 bound handles leaked {live} UDP sockets");
+        assert_eq!(
+            live, 0,
+            "dropping 64 bound handles leaked {live} UDP sockets"
+        );
     }
 
     #[tokio::test]
