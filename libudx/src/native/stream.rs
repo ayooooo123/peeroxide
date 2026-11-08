@@ -211,6 +211,7 @@ pub(crate) struct StreamInner {
     rttvar: u32,
     rto: u32,
     rto_timeouts: u32,
+    retransmits: u64,
 
     // ── Flow control ──
     /// Remote's last advertised receive window.
@@ -877,6 +878,7 @@ impl StreamInner {
             }
         }
         self.unacked_bytes = self.unacked_bytes.saturating_sub(stripped);
+        self.retransmits += retransmits.len() as u64;
         if probe_failed {
             self.mtu_probe_count += 1;
             tracing::debug!(
@@ -1008,6 +1010,7 @@ impl UdxStream {
             rttvar: 0,
             rto: INITIAL_RTO_MS,
             rto_timeouts: 0,
+            retransmits: 0,
             send_rwnd: DEFAULT_RWND,
             mtu_state: MtuState::Base,
             mtu: MTU_BASE,
@@ -1402,6 +1405,12 @@ pub struct UdxStreamAbort {
 impl UdxStreamAbort {
     pub(crate) fn new(inner: Arc<Mutex<StreamInner>>) -> Self {
         Self { inner }
+    }
+
+    /// Smoothed RTT in milliseconds and packets retransmitted, as in C libudx.
+    pub fn stats(&self) -> (u32, u64) {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        (inner.srtt, inner.retransmits)
     }
 
     /// Fail pending writes and reads; send DESTROY unless this is a relay leg.
@@ -2290,6 +2299,7 @@ mod mtu_tests {
             rttvar: 0,
             rto: INITIAL_RTO_MS,
             rto_timeouts: 0,
+            retransmits: 0,
             send_rwnd: DEFAULT_RWND,
             mtu_state: MtuState::Base,
             mtu: MTU_BASE,
@@ -2319,6 +2329,18 @@ mod mtu_tests {
             observed_current_remote: false,
             runtime: None,
         }
+    }
+
+    #[test]
+    fn stream_stats_keep_cumulative_retransmits_after_ack() {
+        let mut inner = make_stream_inner();
+        inner.update_rtt(25);
+        inner.register_sent(0, vec![1; MTU_BASE], "127.0.0.1:9".parse().unwrap(), false);
+        assert_eq!(inner.collect_retransmits(false).len(), 1);
+        assert_eq!(inner.collect_retransmits(false).len(), 1);
+        inner.outgoing.clear();
+        let handle = UdxStreamAbort::new(Arc::new(Mutex::new(inner)));
+        assert_eq!(handle.stats(), (25, 2));
     }
 
     fn fill_packet_buffers(inner: &mut StreamInner) {

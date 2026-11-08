@@ -33,6 +33,10 @@ Cloned sockets share ownership. Dropping the last socket/stream handle closes th
 socket and aborts its receive loop; the receive task must not keep its own socket alive.
 `close()`/`shutdown()` explicitly close the shared socket even while other handles remain.
 
+`UdxStreamAbort::stats()` snapshots `(smoothed_rtt_ms, retransmitted_packets)`.
+The retransmit count survives packet acknowledgement; RTT is zero before a
+sample. Reading these values adds no timer or per-packet atomic bookkeeping.
+
 ## Features
 
 - BBR congestion control
