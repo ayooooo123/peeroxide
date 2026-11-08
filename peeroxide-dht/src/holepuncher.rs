@@ -75,7 +75,7 @@ impl Drop for RandomPunch {
 
 #[non_exhaustive]
 pub enum HolepunchEvent {
-    Connected { addr: SocketAddr },
+    Connected { addr: SocketAddr, socket: UdxSocket },
     Aborted,
 }
 
@@ -520,10 +520,19 @@ impl Holepuncher {
             return;
         }
 
+        let Some(socket) = self
+            .sockets
+            .get(socket_idx)
+            .map(|holder| holder.socket.clone())
+        else {
+            return;
+        };
         self.connected = true;
         self.punching = false;
 
-        let _ = self.event_tx.send(HolepunchEvent::Connected { addr });
+        let _ = self
+            .event_tx
+            .send(HolepunchEvent::Connected { addr, socket });
     }
 
     fn done(&self) -> bool {
@@ -608,7 +617,10 @@ async fn run_recv_adapter(
                     addr = %probe.addr,
                     "holepuncher(initiator): probe received, firing Connected"
                 );
-                let _ = event_tx.send(HolepunchEvent::Connected { addr: probe.addr });
+                let _ = event_tx.send(HolepunchEvent::Connected {
+                    addr: probe.addr,
+                    socket,
+                });
                 return;
             }
         } else {
@@ -694,20 +706,18 @@ mod tests {
             .map(JoinHandle::abort_handle)
             .collect();
         let kept = if connected {
-            let primary = puncher.primary_socket().unwrap().socket.clone();
             let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             probe.send_to(&[0], addresses[0]).await.unwrap();
             let events = &mut rx;
             Some(
                 async move {
                     let _owner = puncher;
-                    if matches!(
+                    if let Some(HolepunchEvent::Connected { socket, .. }) =
                         tokio::time::timeout(Duration::from_secs(2), events.recv())
                             .await
-                            .unwrap(),
-                        Some(HolepunchEvent::Connected { .. })
-                    ) {
-                        return primary;
+                            .unwrap()
+                    {
+                        return socket;
                     }
                     panic!("expected connected probe");
                 }
@@ -953,7 +963,7 @@ mod recv_adapter_tests {
             .expect("Connected within 2s")
             .expect("event_rx open");
         match evt {
-            HolepunchEvent::Connected { addr } => {
+            HolepunchEvent::Connected { addr, .. } => {
                 assert_eq!(addr, probe_local, "Connected.addr matches probe source");
             }
             _ => panic!("expected Connected, got something else"),
@@ -1016,11 +1026,37 @@ mod recv_adapter_tests {
             .expect("Connected within 2s")
             .expect("event_rx open");
         match evt {
-            HolepunchEvent::Connected { addr } => {
+            HolepunchEvent::Connected { addr, socket } => {
                 assert_eq!(
                     addr, probe_local,
                     "Connected fires from a probe landing on the birthday socket"
                 );
+                assert_eq!(socket.local_addr().await.unwrap(), extra_addr);
+                drop(puncher);
+                let mut packets = probe_socket.recv_start().unwrap();
+                let stream = runtime.create_stream(500).await.unwrap();
+                stream.connect(&socket, 501, probe_local).await.unwrap();
+                let abort = stream.abort_handle();
+                let writer = tokio::spawn(async move {
+                    let result = stream.write(b"birthday path").await;
+                    (stream, result)
+                });
+                let source = timeout(Duration::from_secs(2), async {
+                    loop {
+                        let packet = packets.recv().await.unwrap();
+                        if packet.data.len() >= 20 && packet.data[2] & 1 != 0 {
+                            break packet.addr;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    source, extra_addr,
+                    "stream must use the winning birthday port"
+                );
+                abort.abort();
+                let _ = writer.await.unwrap();
             }
             _ => panic!("expected Connected, got something else"),
         }

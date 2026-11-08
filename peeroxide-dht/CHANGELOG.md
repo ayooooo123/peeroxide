@@ -32,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep the remote-client interop fixture firewalled throughout NAT sampling so loopback reachability cannot silently disable its holepunch addresses.
 - Randomized NAT punches share hyperdht's per-DHT limit of one active attempt and a 20-second cooldown after completion; busy passive punches reply `TRY_LATER` instead of opening another birthday-socket batch. Relayed clients back off 10–20 seconds on busy budgets or `TRY_LATER`; clients without a relay abort.
 - Dropping a holepuncher now aborts its receive adapters and releases every unclaimed birthday socket, including on a successful connection's early return; a connected stream retains only its chosen socket.
+- Connected punch events carry the winning socket, so a probe on a non-primary birthday socket keeps and uses that exact UDP port.
+- Socket holders abort their datagram routers on drop. Busy passive punches without a relay immediately close their socket; rejected legacy punches cannot restart after the budget becomes available.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.3...peeroxide-dht-v1.7.4) - 2026-11-02
 

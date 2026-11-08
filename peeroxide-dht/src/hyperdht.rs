@@ -371,10 +371,7 @@ pub struct ConnectResult {
     pub local_stream_id: u32,
     /// Remote UDX metadata advertised by the peer.
     pub remote_udx: Option<UdxInfo>,
-    /// Clone of the puncher's primary UDX socket when holepunching lands.
-    ///
-    /// When set by `run_holepunch_rounds`' `Connected` arm in a follow-up
-    /// commit, this is the socket whose punched 4-tuple is established.
+    /// The socket that received the successful holepunch probe, preserving its NAT mapping.
     /// Consumers should prefer it over the DHT server socket when present.
     pub udx_socket: Option<UdxSocket>,
 }
@@ -2554,23 +2551,6 @@ impl HyperDhtHandle {
         // we exit the scope so the borrow is released before we call
         // `puncher.destroy()`.
 
-        // Clone the puncher's primary UDX socket BEFORE punch_fut takes &mut
-        // puncher, so it is available inside the Connected arm below.
-        //
-        // Per D8 (Node connect.js): the initiator's rawStream attaches to the
-        // SAME socket the puncher used — that is where the NAT mapping was
-        // opened by the probe exchange. Using the DHT server socket would send
-        // the UDX SYN through an unrelated NAT path and never reach the peer.
-        //
-        // The Arc-clone keeps the socket alive after the Holepuncher is
-        // dropped on the early-return; SocketPool::acquire's route_messages
-        // task continues running as long as one clone exists.
-        let puncher_udx: Option<UdxSocket> = puncher.primary_socket().map(|sr| sr.socket.clone());
-        debug_assert!(
-            puncher_udx.is_some(),
-            "primary socket missing before punch loop — logic error"
-        );
-
         let timed_out = {
             let punch_fut = puncher.punch(&pool, runtime);
             tokio::pin!(punch_fut);
@@ -2582,7 +2562,7 @@ impl HyperDhtHandle {
                 tokio::select! {
                     ev = event_rx.recv() => {
                         match ev {
-                            Some(HolepunchEvent::Connected { addr }) => {
+                            Some(HolepunchEvent::Connected { addr, socket }) => {
                                 tracing::info!(
                                     target: "peeroxide::_events::holepunch::connected",
                                     from = %addr,
@@ -2600,7 +2580,7 @@ impl HyperDhtHandle {
                                     noise: nw_result.clone(),
                                     local_stream_id,
                                     remote_udx: remote_payload.udx.clone(),
-                                    udx_socket: puncher_udx,
+                                    udx_socket: Some(socket),
                                 });
                             }
                             Some(HolepunchEvent::Aborted) | None => {
@@ -3213,6 +3193,7 @@ struct ServerPassivePunch {
     noise_result: NoiseWrapResult,
     round: u64,
     addresses: Vec<Ipv4Peer>,
+    has_relay: bool,
     abort: tokio::task::JoinHandle<()>,
 }
 
@@ -3349,6 +3330,7 @@ async fn stage_server_punch(
         noise_result: noise_result.clone(),
         round: 0,
         addresses,
+        has_relay: false,
         abort,
     })
 }
@@ -3404,6 +3386,15 @@ async fn server_punch_round(
             .puncher
             .as_mut()
             .is_some_and(|puncher| !puncher.reserve_random_punch());
+    let abort_for_budget = try_later && !state.has_relay;
+    if abort_for_budget {
+        if let Some(mut puncher) = state.puncher.take() {
+            puncher.destroy();
+        }
+        state.raced.abort.abort();
+        state.reply_socket = None;
+        state.socket.shutdown().await;
+    }
     // `punch()` owns the puncher for the rest of the exchange; later rounds
     // only rebuild the reply, as Node does once its probe loop is running.
     if remote_hp.punching && !try_later && state.puncher.is_some() {
@@ -3417,9 +3408,13 @@ async fn server_punch_round(
         }
     }
 
-    let reply = if aborted {
+    let reply = if aborted || abort_for_budget {
         HolepunchPayload {
-            error: ERROR_ABORTED,
+            error: if abort_for_budget {
+                ERROR_TRY_LATER
+            } else {
+                ERROR_ABORTED
+            },
             firewall: FIREWALL_UNKNOWN,
             round: remote_hp.round,
             connected: false,
@@ -3458,7 +3453,7 @@ async fn server_punch_round(
         peer_address: Some(peer_address.clone()),
     })
     .ok()?;
-    let socket = if aborted {
+    let socket = if aborted || abort_for_budget {
         None
     } else {
         state.reply_socket.clone()
@@ -3929,7 +3924,8 @@ async fn accept_server_handshake(
         )
         .await
         {
-            Ok(punch) => {
+            Ok(mut punch) => {
+                punch.has_relay = relay.is_some();
                 accepted.reply_socket = punch.reply_socket.clone();
                 accepted.punch = Some((holepunch_id, Box::new(punch)));
             }
@@ -4090,7 +4086,7 @@ async fn passive_holepunch_reply(
     .await
     .ok()?;
 
-    if result.remote_hp.punching {
+    if result.remote_hp.punching && !result.puncher.destroyed {
         let pool_clone = SocketPool::new("0.0.0.0".into());
         let mut puncher = result.puncher;
         tokio::spawn(async move {
@@ -4325,6 +4321,9 @@ pub async fn build_passive_holepunch_reply(
     };
 
     let try_later = remote_hp.punching && !puncher.reserve_random_punch();
+    if try_later {
+        puncher.destroy();
+    }
     let reply_hp = HolepunchPayload {
         error: if try_later {
             ERROR_TRY_LATER
@@ -5454,6 +5453,113 @@ mod tests {
         ));
         server.close().await;
         dht.destroy().await.expect("destroy");
+    }
+
+    #[tokio::test]
+    async fn busy_passive_punches_abort_without_a_relay_and_cannot_restart_after_rejection() {
+        let runtime = UdxRuntime::new().unwrap();
+        let (_task, dht, _events) = spawn(&runtime, HyperDhtConfig::default()).await.unwrap();
+        let pool = SocketPool::new("127.0.0.1".into());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut blocker = Holepuncher::new(&pool, &runtime, true, true, FIREWALL_RANDOM, tx)
+            .await
+            .unwrap();
+        blocker.auto_sample(dht.dht()).await;
+        assert!(blocker.reserve_random_punch());
+        let noise = NoiseWrapResult {
+            remote_public_key: [1; 32],
+            tx: [2; 32],
+            rx: [3; 32],
+            handshake_hash: [4; 64],
+            holepunch_secret: [5; 32],
+            is_initiator: false,
+        };
+        let peer = Ipv4Peer {
+            host: "127.0.0.1".into(),
+            port: 1234,
+        };
+        let payload = SecurePayload::new(noise.holepunch_secret);
+        let incoming = HolepunchPayload {
+            error: ERROR_NONE,
+            firewall: FIREWALL_RANDOM,
+            round: 1,
+            connected: false,
+            punching: true,
+            addresses: Some(vec![peer.clone()]),
+            remote_address: None,
+            token: Some([6; 32]),
+            remote_token: None,
+        };
+        let message = HolepunchMessage {
+            mode: MODE_FROM_RELAY,
+            id: 1,
+            peer_address: None,
+            payload: payload.encrypt(&incoming).unwrap(),
+        };
+        for has_relay in [false, true] {
+            let (events, _rx) = mpsc::unbounded_channel();
+            let raced = RacedStream::new(runtime.create_random_stream().await.unwrap().1);
+            let mut state = stage_server_punch(
+                &runtime,
+                dht.dht(),
+                None,
+                &noise,
+                &peer.host,
+                FIREWALL_RANDOM,
+                1,
+                raced,
+                43,
+                &events,
+            )
+            .await
+            .unwrap();
+            state.has_relay = has_relay;
+            state.reply_socket = Some(state.socket.clone());
+            let address = state.socket.local_addr().await.unwrap();
+            let reply = server_punch_round(&runtime, &mut state, &message, &peer, FIREWALL_RANDOM)
+                .await
+                .unwrap();
+            let message =
+                crate::hyperdht_messages::decode_holepunch_msg_from_bytes(&reply.value).unwrap();
+            let decoded = payload.decrypt(&message.payload).unwrap();
+            assert_eq!(decoded.error, ERROR_TRY_LATER);
+            assert!(!decoded.punching);
+            assert!(state.punch_task.is_none());
+            if has_relay {
+                assert!(state.puncher.is_some());
+                assert!(reply.socket.is_some());
+                assert!(state.socket.local_addr().await.is_ok());
+            } else {
+                assert!(state.puncher.is_none());
+                assert!(reply.socket.is_none());
+                assert!(state.socket.local_addr().await.is_err());
+                assert!(std::net::UdpSocket::bind(address).is_ok());
+                assert!(!state.raced.abort.is_alive());
+            }
+        }
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut rejected = build_passive_holepunch_reply(
+            FIREWALL_RANDOM,
+            &pool,
+            &runtime,
+            &peer,
+            noise.holepunch_secret,
+            &message.payload,
+            1,
+            tx,
+            Some(dht.dht()),
+        )
+        .await
+        .unwrap();
+        assert!(rejected.remote_hp.punching);
+        assert!(rejected.puncher.destroyed);
+        assert!(rejected.puncher.primary_socket().is_none());
+        drop(blocker);
+        assert!(
+            !rejected.puncher.punch(&pool, &runtime).await,
+            "TRY_LATER must remain rejected after the slot becomes free"
+        );
+        dht.destroy().await.unwrap();
     }
 
     #[tokio::test]

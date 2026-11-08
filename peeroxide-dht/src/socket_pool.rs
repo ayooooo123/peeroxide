@@ -98,6 +98,14 @@ pub struct SocketRef {
     _recv_task: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl Drop for SocketRef {
+    fn drop(&mut self) {
+        if let Some(task) = self._recv_task.take() {
+            task.abort();
+        }
+    }
+}
+
 impl SocketRef {
     /// The holepunch receiver is `Some(...)` immediately after `SocketPool::acquire()`.
     /// The Holepuncher recv-adapter takes ownership through this accessor exactly once;
@@ -179,6 +187,33 @@ mod tests {
     use crate::hyperdht_messages::{
         FIREWALL_CONSISTENT, FIREWALL_OPEN, FIREWALL_RANDOM, FIREWALL_UNKNOWN,
     };
+
+    #[tokio::test]
+    async fn dropping_holder_aborts_router_without_closing_retained_socket() {
+        let runtime = UdxRuntime::new().unwrap();
+        let pool = SocketPool::new("127.0.0.1".into());
+        let holder = pool.acquire(&runtime).await.unwrap();
+        let socket = holder.socket.clone();
+        let port = socket.local_addr().await.unwrap();
+        let router = holder._recv_task.as_ref().unwrap().abort_handle();
+        drop(holder);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !router.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(std::net::UdpSocket::bind(port).is_err());
+        let mut receiver = socket.recv_start().unwrap();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(b"still live", port).await.unwrap();
+        let datagram = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(datagram.data, b"still live");
+    }
 
     #[test]
     fn random_port_in_range() {
