@@ -59,30 +59,48 @@ impl UdxSocketInner {
         let socket = Arc::downgrade(&handle.inner);
 
         let handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
-            while let Ok((len, addr)) = udp.recv_from(&mut buf).await {
-                let packet = buf[..len].to_vec();
+            let mut buffers = vec![vec![0u8; super::udp::DATAGRAM_SIZE]];
+            let mut packets = [(0, "0.0.0.0:0".parse().unwrap()); super::udp::BATCH_SIZE];
+            'receive: while let Ok(count) =
+                super::udp::recv_batch(&udp, &mut buffers, &mut packets).await
+            {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let mut stream_packet = false;
+                for (index, &(len, addr)) in packets[..count].iter().enumerate() {
+                    let packet = buffers[index][..len].to_vec();
 
-                if len >= super::header::HEADER_SIZE {
-                    if let Ok(hdr) = super::header::Header::decode(&packet) {
-                        let guard = streams.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(tx) = guard.get(&hdr.remote_id) {
-                            let Some(inner) = socket.upgrade() else {
-                                break;
-                            };
-                            let _ = tx.send(super::stream::IncomingPacket {
-                                data: packet,
-                                addr,
-                                socket: UdxSocket { inner },
-                            });
-                            continue;
+                    if len >= super::header::HEADER_SIZE {
+                        if let Ok(hdr) = super::header::Header::decode(&packet) {
+                            let guard = streams.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(tx) = guard.get(&hdr.remote_id) {
+                                #[cfg(any(target_os = "linux", target_os = "android"))]
+                                {
+                                    stream_packet = true;
+                                }
+                                let Some(inner) = socket.upgrade() else {
+                                    break 'receive;
+                                };
+                                let _ = tx.send(super::stream::IncomingPacket {
+                                    data: packet,
+                                    addr,
+                                    socket: UdxSocket { inner },
+                                });
+                                continue;
+                            }
                         }
                     }
-                }
 
-                let guard = fallback_tx.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(ref tx) = *guard {
-                    let _ = tx.send(Datagram { data: packet, addr });
+                    let guard = fallback_tx.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(ref tx) = *guard {
+                        let _ = tx.send(Datagram { data: packet, addr });
+                    }
+                }
+                // Probe-only birthday sockets keep one buffer, not an entire batch.
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                if stream_packet && buffers.len() == 1 {
+                    buffers.resize_with(super::udp::BATCH_SIZE, || {
+                        vec![0; super::udp::DATAGRAM_SIZE]
+                    });
                 }
             }
         });

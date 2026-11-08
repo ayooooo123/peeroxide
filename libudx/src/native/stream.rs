@@ -2011,9 +2011,7 @@ async fn process_incoming(
                     guard.udp.clone()
                 };
                 if let Some(udp) = udp_clone {
-                    for (pkt, addr) in &packets_to_send {
-                        let _ = udp.send_to(pkt, *addr).await;
-                    }
+                    super::udp::send_batch(&udp, packets_to_send).await;
                 }
 
                 if should_arm_rto {

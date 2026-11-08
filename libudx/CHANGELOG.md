@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `UdxStreamAbort::closed` / `UdxAsyncStream::closed`: race-free close notification supporting multiple observers both before and after stream closure.
 - `UdxStream::local_id`: accessor for the local stream identifier.
 - `UdxStreamRemote` (`UdxStream::remote_handle` / `UdxAsyncStream::remote_handle`): `change_remote` moves a connected stream to another peer and socket with C libudx semantics (in-flight packets keep their destination, completion once they are ACKed, MTU search restarted, no MTU probes while changing); `remote_observed` resolves when the peer reaches us on the new path; `try_send` sends an unreliable message (Node `rawStream.trySend`).
+- Linux and Android use bounded `sendmmsg`/`recvmmsg` batches, retaining single-datagram fallbacks. Receive batches are allocated only for sockets carrying registered stream traffic.
 
 ### Changed
 
