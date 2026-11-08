@@ -29,6 +29,10 @@ stream.write(b"hello").await?;
 - `UdxStream`: A handle to a reliable byte stream.
 - `UdxAsyncStream`: An adapter implementing `AsyncRead` and `AsyncWrite` for tokio integration.
 
+Cloned sockets share ownership. Dropping the last socket/stream handle closes the UDP
+socket and aborts its receive loop; the receive task must not keep its own socket alive.
+`close()`/`shutdown()` explicitly close the shared socket even while other handles remain.
+
 ## Features
 
 - BBR congestion control

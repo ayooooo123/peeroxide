@@ -55,7 +55,8 @@ impl UdxSocketInner {
         // Identify the arrival socket on every demultiplexed packet so a
         // stream mid-`change_remote` can answer on the path the packet came
         // from (C libudx routes by the `udx_socket_t` it arrived on).
-        let socket = handle.clone();
+        // The receive task must not keep its own owner (and thus its fd) alive.
+        let socket = Arc::downgrade(&handle.inner);
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -66,10 +67,13 @@ impl UdxSocketInner {
                     if let Ok(hdr) = super::header::Header::decode(&packet) {
                         let guard = streams.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(tx) = guard.get(&hdr.remote_id) {
+                            let Some(inner) = socket.upgrade() else {
+                                break;
+                            };
                             let _ = tx.send(super::stream::IncomingPacket {
                                 data: packet,
                                 addr,
-                                socket: socket.clone(),
+                                socket: UdxSocket { inner },
                             });
                             continue;
                         }
@@ -273,6 +277,32 @@ impl UdxSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_socket_handles_releases_udp_sockets() {
+        let mut sockets = Vec::new();
+        for _ in 0..64 {
+            let socket = UdxSocket::new();
+            socket.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let udp = socket.udp_arc().unwrap();
+            sockets.push(Arc::downgrade(&udp));
+            let clone = socket.clone();
+            drop(socket);
+            assert!(sockets.last().unwrap().upgrade().is_some());
+            drop(clone);
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while sockets.iter().any(|socket| socket.upgrade().is_some()) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        let live = sockets
+            .iter()
+            .filter(|socket| socket.upgrade().is_some())
+            .count();
+        assert_eq!(live, 0, "dropping 64 bound handles leaked {live} UDP sockets");
+    }
 
     #[tokio::test]
     async fn socket_registration_rejects_overwrite_permits_idempotent() {
