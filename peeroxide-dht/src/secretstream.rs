@@ -15,7 +15,7 @@
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::hchacha;
 use poly1305::Poly1305;
-use poly1305::universal_hash::KeyInit;
+use poly1305::universal_hash::{KeyInit, UniversalHash};
 use rand::{TryRngCore, rngs::OsRng};
 use thiserror::Error;
 use tracing::debug;
@@ -29,9 +29,6 @@ pub const TAG_MESSAGE: u8 = 0x00;
 pub const TAG_PUSH: u8 = 0x01;
 pub const TAG_REKEY: u8 = 0x02;
 pub const TAG_FINAL: u8 = 0x03;
-
-/// Zero pad used for explicit Poly1305 padding (max 16 bytes needed).
-static PAD0: [u8; 16] = [0u8; 16];
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -97,22 +94,23 @@ fn compute_mac(
 ) -> [u8; 16] {
     let adlen = aad.len();
     let mlen = encrypted_msg.len();
-    let pad_aad = (16usize.wrapping_sub(adlen)) & 0xf;
-    let pad_msg = mlen & 0xf; // libsodium's quirky formula: (0x10 - sizeof(block) + mlen) & 0xf
-
-    // Build the full MAC input with explicit padding
-    let total = adlen + pad_aad + 64 + mlen + pad_msg + 16;
-    let mut mac_input = Vec::with_capacity(total);
-    mac_input.extend_from_slice(aad);
-    mac_input.extend_from_slice(&PAD0[..pad_aad]);
-    mac_input.extend_from_slice(tag_block);
-    mac_input.extend_from_slice(encrypted_msg);
-    mac_input.extend_from_slice(&PAD0[..pad_msg]);
-    mac_input.extend_from_slice(&(adlen as u64).to_le_bytes());
-    mac_input.extend_from_slice(&((64 + mlen) as u64).to_le_bytes());
-
-    let mac = Poly1305::new(poly_key.into());
-    let result = mac.compute_unpadded(&mac_input);
+    // aad's zero pad and the 64-byte block keep the stream 16-aligned, so
+    // `update_padded` hashes them and the message's whole blocks in place
+    // (the multi-block SIMD path); only the tail needs assembling.
+    let mut mac = Poly1305::new(poly_key.into());
+    mac.update_padded(aad);
+    mac.update_padded(tag_block);
+    let whole = mlen & !0xf;
+    mac.update_padded(&encrypted_msg[..whole]);
+    // tail = rest of msg || pad_msg zeros (libsodium: mlen & 0xf, the same
+    // count) || le64(adlen) || le64(64 + mlen)
+    let rest = &encrypted_msg[whole..];
+    let mut tail = [0u8; 15 + 15 + 16];
+    tail[..rest.len()].copy_from_slice(rest);
+    let lens = 2 * rest.len();
+    tail[lens..lens + 8].copy_from_slice(&(adlen as u64).to_le_bytes());
+    tail[lens + 8..lens + 16].copy_from_slice(&((64 + mlen) as u64).to_le_bytes());
+    let result = mac.compute_unpadded(&tail[..lens + 16]);
     let mut out = [0u8; 16];
     out.copy_from_slice(result.as_slice());
     out

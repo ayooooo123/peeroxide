@@ -19,6 +19,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 rand = "0.9"
+# Kernel socket buffer sizes (tokio's UdpSocket has no setter); tokio already builds it.
+socket2 = "0.6"
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+# UDP GSO sends and recvmmsg/GRO receives (src/native/udp.rs).
+quinn-udp = { version = "0.5", default-features = false, features = ["tracing"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

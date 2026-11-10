@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Firewall hooks stay armed after the stream connects and run for packets arriving on another socket than the stream's, as C `on_firewall` does; a connected stream only gates the packet.
 - Common ACKs use stack storage; ordered receive events reuse a per-processor buffer, with reader wakeups outside the stream lock.
 - Unreliable datagrams send immediately when the socket is writable, reserving allocation and a task for backpressure.
+- Per-packet bookkeeping no longer walks every unacknowledged packet: `inflight()` is a counter, RACK loss detection reads a send-time-ordered queue, fast retransmit visits only the packets marked lost, and SACK processing skips blocks it has already applied. A seeder serving four loopback peers on Linux went from about 30 to 8 CPU-seconds per GiB with the changes below.
+- On Linux and Android a paced burst to one peer leaves in one UDP GSO `sendmsg`, and the socket reads up to eight datagram buffers per call (`recvmmsg`, GRO) via `quinn-udp`. On macOS one stream sends its burst at a time, which removed kernel lock contention between worker threads (about 3x the CPU per packet with four peers).
+- Sockets ask for 8 MiB kernel send and receive buffers (falling back to 4 and 2 MiB, as PearTube's JS `tuneUdxSocket`), so a full congestion window sent at once is not dropped by a 208 KiB default.
+- A receiver ACKs in-order data once per receive burst, at most every 8 packets; out-of-order data and END are still ACKed at once. C libudx ACKs every packet; both peers now handle about a third fewer datagrams per MiB.
 
 ### Fixed
 
@@ -30,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stream retirement synchronously releases socket registrations and reserved IDs; stale handles cannot deregister a replacement or re-arm a closed stream.
 - Destroying a relay leg is quiet, matching C libudx, so relay teardown does not destroy an upgraded endpoint.
 - Stream termination releases send, retransmit and receive-reorder buffers even while an abort handle remains alive.
+- A pacing pass counted the packets it had just registered twice against the congestion window, so it sent only about half the window.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/libudx-v1.7.3...libudx-v1.7.4) - 2026-11-02
 

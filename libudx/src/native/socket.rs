@@ -16,7 +16,7 @@ pub struct Datagram {
 }
 
 struct UdxSocketInner {
-    udp: Mutex<Option<Arc<tokio::net::UdpSocket>>>,
+    udp: Mutex<Option<Arc<super::udp::Udp>>>,
     recv_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     streams: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<super::stream::IncomingPacket>>>>,
     fallback_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Datagram>>>>,
@@ -32,7 +32,7 @@ impl UdxSocketInner {
         }
     }
 
-    fn udp_arc(&self) -> Result<Arc<tokio::net::UdpSocket>> {
+    fn udp_arc(&self) -> Result<Arc<super::udp::Udp>> {
         self.udp
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -59,30 +59,41 @@ impl UdxSocketInner {
         let socket = Arc::downgrade(&handle.inner);
 
         let handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
-            while let Ok((len, addr)) = udp.recv_from(&mut buf).await {
-                let packet = buf[..len].to_vec();
+            use super::udp::{DATAGRAM_SIZE, Udp};
+            // Probe-only sockets (holepunch) keep one buffer; a batch is allocated
+            // once stream traffic arrives.
+            let mut bufs = vec![vec![0u8; DATAGRAM_SIZE]];
+            let mut datagrams = Vec::new();
+            'receive: while udp.recv_batch(&mut bufs, &mut datagrams).await.is_ok() {
+                let mut stream_packet = false;
+                for (index, range, addr) in datagrams.drain(..) {
+                    let packet = bufs[index][range].to_vec();
 
-                if len >= super::header::HEADER_SIZE {
-                    if let Ok(hdr) = super::header::Header::decode(&packet) {
-                        let guard = streams.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(tx) = guard.get(&hdr.remote_id) {
-                            let Some(inner) = socket.upgrade() else {
-                                break;
-                            };
-                            let _ = tx.send(super::stream::IncomingPacket {
-                                data: packet,
-                                addr,
-                                socket: UdxSocket { inner },
-                            });
-                            continue;
+                    if packet.len() >= super::header::HEADER_SIZE {
+                        if let Ok(hdr) = super::header::Header::decode(&packet) {
+                            let guard = streams.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(tx) = guard.get(&hdr.remote_id) {
+                                let Some(inner) = socket.upgrade() else {
+                                    break 'receive;
+                                };
+                                stream_packet = true;
+                                let _ = tx.send(super::stream::IncomingPacket {
+                                    data: packet,
+                                    addr,
+                                    socket: UdxSocket { inner },
+                                });
+                                continue;
+                            }
                         }
                     }
-                }
 
-                let guard = fallback_tx.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(ref tx) = *guard {
-                    let _ = tx.send(Datagram { data: packet, addr });
+                    let guard = fallback_tx.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(tx) = &*guard {
+                        let _ = tx.send(Datagram { data: packet, addr });
+                    }
+                }
+                if stream_packet && bufs.len() == 1 {
+                    bufs.resize_with(Udp::batch_buffers(), || vec![0; DATAGRAM_SIZE]);
                 }
             }
         });
@@ -142,7 +153,7 @@ impl UdxSocket {
         {
             return Err(UdxError::Io(std::io::Error::other("socket already bound")));
         }
-        let socket = tokio::net::UdpSocket::bind(addr).await?;
+        let socket = super::udp::Udp::bind(addr).await?;
         *self.inner.udp.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(socket));
         // A rebind after `shutdown` restarts the demux loop for the same
         // stream map and datagram channel.
@@ -173,7 +184,7 @@ impl UdxSocket {
     }
 
     /// Get a shared reference to the underlying UDP socket.
-    pub(crate) fn udp_arc(&self) -> Result<Arc<tokio::net::UdpSocket>> {
+    pub(crate) fn udp_arc(&self) -> Result<Arc<super::udp::Udp>> {
         self.inner.udp_arc()
     }
 

@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking:** `HyperDhtHandle::register_server` takes the server's public key instead of its target and also serves the server's own record to `FIND_PEER`/`LOOKUP` (Node `server.listen()` → `dht._router.set(target, { record })`). Previously a node that was itself the closest to its server — or the only DHT node, as a relay in a local testnet is — answered `PEER_NOT_FOUND` for its own key.
 - Secretstream encrypts directly into its final wire buffer instead of allocating and copying an intermediate ciphertext.
+- Secretstream's Poly1305 MAC hashes the message in place with the multi-block (AVX2) path instead of copying it into a padded buffer and hashing one block at a time.
 
 ### Fixed
 
