@@ -53,20 +53,8 @@ The 256-socket birthday strategy and hyperswarm retry tiers are unchanged.
 Busy attempts abort without a relay; with a relay they back off 10–20 seconds,
 within the existing punch deadline. Cancelled reservations do not start a cooldown.
 
-### Local fork: cross-egress LAN fallback
-
 Handshake replies retain the request's reflexive `to` address for HyperDHT's
 same-NAT test, rather than substituting a different relay's global NAT sample.
-Beyond JS parity, a relayed handshake whose public hosts differ can race one
-authenticated, advertised RFC 1918 endpoint against normal holepunching. This
-requires a private local interface and `local_connection`; it does not probe
-loopback, link-local, CGN or public candidates. The closest private prefix wins.
-A one-shot DHT ping has a two-second deadline; the resulting stream still uses
-the negotiated Noise keys. Failure leaves the normal path running.
-Each peer gets at most one probe per 60 seconds, with ten total per node per
-60 seconds across all topics and direct dials. No address-range scanning or
-peer exchange is introduced. This deliberate fork extension supports sites
-whose VLANs use different WAN/VPN egress but can route private addresses.
 
 The ignored `secretstream_bench` test reports verified encrypt/decrypt throughput
 for `UDX_WORKERS`, `UDX_CONNECTIONS` and aggregate `UDX_MIB`. Compare 1 and 4 workers
