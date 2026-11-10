@@ -131,6 +131,7 @@ impl Router {
         reply_value: &[u8],
         expected_from: &Ipv4Peer,
         actual_from: &Ipv4Peer,
+        actual_to: &Ipv4Peer,
     ) -> Result<HandshakeResult> {
         let hs = hyperdht_messages::decode_handshake_from_bytes(reply_value)
             .map_err(|_| RouterError::BadHandshakeReply)?;
@@ -150,7 +151,7 @@ impl Router {
             noise: hs.noise,
             relayed,
             server_address,
-            client_address: actual_from.clone(),
+            client_address: actual_to.clone(),
         })
     }
 
@@ -651,11 +652,34 @@ mod tests {
 
         let router = Router::new();
         let result = router
-            .validate_handshake_reply(&encoded, &from, &from)
+            .validate_handshake_reply(&encoded, &from, &from, &peer("10.0.0.2", 4000))
             .unwrap();
         assert_eq!(result.noise, vec![1, 2, 3]);
         assert!(!result.relayed);
         assert_eq!(result.server_address.host, "1.2.3.4");
+        assert_eq!(result.client_address, peer("10.0.0.2", 4000));
+    }
+
+    #[test]
+    fn relayed_handshake_keeps_its_own_reflexive_address() {
+        let server = peer("107.194.4.98", 5000);
+        let encoded = hyperdht_messages::encode_handshake_to_bytes(&HandshakeMessage {
+            mode: MODE_REPLY,
+            noise: vec![1, 2, 3],
+            peer_address: Some(server.clone()),
+            relay_address: None,
+        })
+        .unwrap();
+        let relay = peer("88.99.3.86", 49737);
+        let client = peer("107.194.4.98", 6000);
+        let result = Router::new()
+            .validate_handshake_reply(&encoded, &relay, &relay, &client)
+            .unwrap();
+        assert!(result.relayed);
+        assert_eq!(result.server_address, server);
+        assert_eq!(result.client_address, client);
+        assert_eq!(result.client_address.host, result.server_address.host);
+        assert_ne!(result.client_address.host, relay.host);
     }
 
     #[test]
@@ -672,7 +696,7 @@ mod tests {
         let router = Router::new();
         assert!(
             router
-                .validate_handshake_reply(&encoded, &from, &from)
+                .validate_handshake_reply(&encoded, &from, &from, &from)
                 .is_err()
         );
     }
@@ -690,7 +714,12 @@ mod tests {
         let router = Router::new();
         assert!(
             router
-                .validate_handshake_reply(&encoded, &peer("1.2.3.4", 1000), &peer("5.6.7.8", 2000))
+                .validate_handshake_reply(
+                    &encoded,
+                    &peer("1.2.3.4", 1000),
+                    &peer("5.6.7.8", 2000),
+                    &peer("10.0.0.2", 4000)
+                )
                 .is_err()
         );
     }

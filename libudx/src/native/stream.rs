@@ -1413,6 +1413,14 @@ impl UdxStreamAbort {
         (inner.srtt, inner.retransmits)
     }
 
+    /// Current peer endpoint, including direct-path upgrades.
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remote_addr
+    }
+
     /// Fail pending writes and reads; send DESTROY unless this is a relay leg.
     pub fn abort(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());

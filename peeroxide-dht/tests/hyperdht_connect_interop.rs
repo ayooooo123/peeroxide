@@ -137,7 +137,7 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
             .router()
             .lock()
             .map_err(|_| "router lock poisoned")?;
-        router.validate_handshake_reply(&reply_value, &srv_peer, &resp.from)?
+        router.validate_handshake_reply(&reply_value, &srv_peer, &resp.from, &resp.to)?
     };
 
     let remote_payload = nw.recv(&hs_result.noise)?;

@@ -74,6 +74,58 @@ fn is_addr_private(host: &str) -> bool {
         || ip.octets()[0] == 100 && ip.octets()[1] >= 64 && ip.octets()[1] <= 127 // CGN
 }
 
+/// Cross-egress LAN probes never target loopback, link-local, CGN or public addresses.
+fn local_candidate(local: &[Ipv4Peer], remote: &[Ipv4Peer]) -> Option<Ipv4Peer> {
+    remote
+        .iter()
+        .filter_map(|peer| {
+            let ip = peer.host.parse::<std::net::Ipv4Addr>().ok()?;
+            if !ip.is_private() || peer.port == 0 {
+                return None;
+            }
+            let score = local
+                .iter()
+                .filter_map(|ours| {
+                    let ours = ours.host.parse::<std::net::Ipv4Addr>().ok()?;
+                    ours.is_private()
+                        .then(|| (u32::from(ip) ^ u32::from(ours)).leading_zeros())
+                })
+                .max()?;
+            Some((score, peer))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, peer)| peer.clone())
+}
+
+#[derive(Default)]
+struct LocalProbeBudget {
+    attempts: [Option<(tokio::time::Instant, [u8; 32])>; 10],
+}
+
+impl LocalProbeBudget {
+    fn take(&mut self, peer: [u8; 32], now: tokio::time::Instant) -> bool {
+        let live =
+            |at: tokio::time::Instant| now.duration_since(at) < std::time::Duration::from_secs(60);
+        if self
+            .attempts
+            .iter()
+            .flatten()
+            .any(|(at, key)| *key == peer && live(*at))
+        {
+            return false;
+        }
+        let Some(slot) = self
+            .attempts
+            .iter_mut()
+            .find(|slot| slot.is_none_or(|(at, _)| !live(at)))
+        else {
+            return false;
+        };
+        *slot = Some((now, peer));
+        true
+    }
+}
+
 /// Determines whether a direct connection should be attempted instead of holepunching.
 ///
 /// Returns `true` (direct connect) when ANY of:
@@ -752,6 +804,7 @@ pub struct HyperDhtHandle {
     /// Abort handles for every raw stream this DHT created
     /// (Node `HyperDHT#rawStreams`).
     raw_streams: Arc<Mutex<Vec<libudx::UdxStreamAbort>>>,
+    local_probes: Arc<Mutex<LocalProbeBudget>>,
 }
 
 impl HyperDhtHandle {
@@ -1871,7 +1924,7 @@ impl HyperDhtHandle {
                 .router
                 .lock()
                 .map_err(|_| HyperDhtError::ChannelClosed)?;
-            router.validate_handshake_reply(&reply_value, relay, &resp.from)?
+            router.validate_handshake_reply(&reply_value, relay, &resp.from, &resp.to)?
         };
 
         let remote_payload = nw.recv(&hs_result.noise)?;
@@ -1901,6 +1954,11 @@ impl HyperDhtHandle {
             (None, None) => None,
         };
         let raced = RacedStream::new(local_stream);
+        let local_candidate = (opts.local_connection
+            && hs_result.relayed
+            && hs_result.client_address.host != hs_result.server_address.host)
+            .then(|| local_candidate(&local_payload.addresses4, &remote_payload.addresses4))
+            .flatten();
         let direct = DirectDial {
             dht: self.clone(),
             hs_result,
@@ -1912,6 +1970,7 @@ impl HyperDhtHandle {
             remote_id,
             local_connection: opts.local_connection,
             has_relay: relay_through.is_some(),
+            local_candidate,
         };
 
         let Some((relay_pk, token, initiator)) = relay_through else {
@@ -1990,10 +2049,45 @@ struct DirectDial {
     remote_id: u32,
     local_connection: bool,
     has_relay: bool,
+    local_candidate: Option<Ipv4Peer>,
 }
 
 impl DirectDial {
-    async fn run(self, runtime: &UdxRuntime) -> Result<Landing, HyperDhtError> {
+    async fn run(mut self, runtime: &UdxRuntime) -> Result<Landing, HyperDhtError> {
+        let candidate = self.local_candidate.take().filter(|_| {
+            self.dht
+                .local_probes
+                .lock()
+                .is_ok_and(|mut budget| budget.take(self.target, tokio::time::Instant::now()))
+        });
+        let Some(candidate) = candidate else {
+            return self.run_public(runtime).await;
+        };
+        let dht = self.dht.clone();
+        let remote_id = self.remote_id;
+        let local = async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let socket = socket_or_new(dht.server_socket().await?, runtime).await?;
+                dht.dht.ping_via_socket(candidate.clone(), socket.clone()).await?;
+                tracing::debug!(host = %candidate.host, port = candidate.port, "authenticated advertised LAN endpoint answered");
+                Ok::<_, HyperDhtError>(Landing { socket, remote_id, addr: to_socket_addr(&candidate)?, relay: None })
+            }).await.map_err(|_| HyperDhtError::HolepunchFailed)?
+        };
+        let public = self.run_public(runtime);
+        tokio::pin!(local, public);
+        tokio::select! {
+            result = &mut local => match result {
+                Ok(landing) => Ok(landing),
+                Err(_) => public.await,
+            },
+            result = &mut public => match result {
+                Ok(landing) => Ok(landing),
+                Err(error) => local.await.or(Err(error)),
+            },
+        }
+    }
+
+    async fn run_public(self, runtime: &UdxRuntime) -> Result<Landing, HyperDhtError> {
         let DirectDial {
             dht,
             hs_result,
@@ -2005,6 +2099,7 @@ impl DirectDial {
             remote_id,
             local_connection,
             has_relay,
+            local_candidate: _,
         } = self;
         let this = &dht;
         let relay = &node;
@@ -2020,20 +2115,9 @@ impl DirectDial {
             .as_ref()
             .is_some_and(|hp| !hp.relays.is_empty());
 
-        // NAT-derived same-host check. `hs_result.client_address.host` is the
-        // FE-holder's source IP (not our own public address), so comparing it
-        // to `server_address.host` is always false on relayed handshakes and
-        // cannot be the same-host signal. Use our own NAT-sampled public
-        // address instead. Disabled when the caller opts out via
-        // `local_connection=false`.
-        let same_host = if !local_connection {
-            false
-        } else {
-            match this.dht.remote_address().await {
-                Ok(Some(my_remote)) => my_remote.host == hs_result.server_address.host,
-                _ => false,
-            }
-        };
+        // Use this handshake's reflexive address, not a sample from another relay/egress.
+        let same_host =
+            local_connection && hs_result.client_address.host == hs_result.server_address.host;
 
         tracing::debug!(
             relayed = hs_result.relayed,
@@ -4444,6 +4528,7 @@ pub async fn spawn(
         admin_tx,
         current_relays: Arc::new(Mutex::new(Vec::new())),
         raw_streams: Arc::new(Mutex::new(Vec::new())),
+        local_probes: Arc::new(Mutex::new(LocalProbeBudget::default())),
     };
     Ok((join, handle, server_rx))
 }
@@ -4963,6 +5048,42 @@ fn to_hex(bytes: impl AsRef<[u8]>) -> String {
 mod tests {
     use super::*;
     use crate::hyperdht_messages::{FIREWALL_CONSISTENT, FIREWALL_RANDOM};
+
+    #[test]
+    fn advertised_lan_candidate_requires_private_interfaces() {
+        let peer = |host: &str| Ipv4Peer {
+            host: host.to_owned(),
+            port: 49737,
+        };
+        let advertised = [
+            peer("127.0.0.1"),
+            peer("169.254.1.1"),
+            peer("100.64.1.1"),
+            peer("8.8.8.8"),
+            peer("172.17.0.2"),
+            peer("10.0.40.100"),
+        ];
+        assert_eq!(
+            local_candidate(&[peer("10.0.10.129")], &advertised),
+            Some(peer("10.0.40.100")),
+        );
+        assert!(local_candidate(&[peer("8.8.4.4")], &advertised).is_none());
+        assert!(local_candidate(&[peer("10.0.10.129")], &advertised[..4]).is_none());
+    }
+
+    #[test]
+    fn advertised_lan_probes_have_peer_and_node_budgets() {
+        let mut budget = LocalProbeBudget::default();
+        let now = tokio::time::Instant::now();
+        assert!(budget.take([0; 32], now));
+        assert!(!budget.take([0; 32], now + std::time::Duration::from_secs(59)));
+        for key in 1..10 {
+            assert!(budget.take([key; 32], now));
+        }
+        assert!(!budget.take([10; 32], now));
+        assert!(budget.take([0; 32], now + std::time::Duration::from_secs(60)));
+        assert!(budget.take([10; 32], now + std::time::Duration::from_secs(60)));
+    }
 
     #[test]
     fn hyperdht_config_defaults() {

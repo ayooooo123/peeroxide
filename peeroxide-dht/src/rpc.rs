@@ -138,6 +138,8 @@ pub struct PingResponse {
 pub struct ResponseData {
     /// Remote peer that replied.
     pub from: Ipv4Peer,
+    /// Our address as seen by the responder, scoped to this request.
+    pub to: Ipv4Peer,
     /// Optional peer id reported by the remote node.
     pub id: Option<NodeId>,
     /// Optional response token.
@@ -974,6 +976,7 @@ impl DhtNode {
                         standalone,
                         ResponseData {
                             from,
+                            to: to.clone(),
                             id,
                             token,
                             closer_nodes,
