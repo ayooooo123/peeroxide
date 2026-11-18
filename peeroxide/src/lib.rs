@@ -82,5 +82,5 @@ pub use swarm::{JoinOpts, SwarmConfig, SwarmConnection, SwarmHandle, spawn};
 pub use peeroxide_dht::crypto::hash as discovery_key;
 pub use peeroxide_dht::hyperdht::{
     DEFAULT_BOOTSTRAP, HyperDhtHandle, ImmutablePutResult, KeyPair, MutableGetResult,
-    MutablePutResult,
+    MutablePutResult, PeerFirewall,
 };

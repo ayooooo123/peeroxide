@@ -166,6 +166,13 @@ impl NoiseWrap {
         self.handshake.complete()
     }
 
+    /// The remote peer's static public key, once known: from the start for
+    /// an initiator, after [`recv`](Self::recv) of message 1 for a responder.
+    /// A server reads it here to refuse a peer before it sends a reply.
+    pub fn remote_public_key(&self) -> Option<[u8; 32]> {
+        self.handshake.remote_static_key().copied()
+    }
+
     /// Pre-set the ephemeral keypair (for deterministic testing only).
     pub fn set_ephemeral(&mut self, keypair: Keypair) {
         self.handshake.set_ephemeral(keypair);

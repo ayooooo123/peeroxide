@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HyperDhtHandle::validate_local_addresses` (hyperdht `validateLocalAddresses`).
 - Secret-stream keep-alive (Node `setKeepAlive` / `sendKeepAlive`): `SecretStream::keep_alive_handle` and `SecretStreamWriteHalf::keep_alive_handle` return a cloneable `SecretStreamKeepAlive` whose `send_keep_alive()` writes one empty encrypted message through the stream's encryptor and write side, serialized with normal writes; a handle taken before `into_split` keeps working on the write half, and it holds the stream only weakly. `SecretStream::set_keep_alive(interval)` sends one whenever `interval` passes without a write. `SecretStreamError::Closed` reports a dropped or failed stream.
 - `HyperDhtConfig::connection_keep_alive` (default `DEFAULT_CONNECTION_KEEP_ALIVE`, 5000 ms; `None` = Node `connectionKeepAlive: false`).
+- `ServerConfig::peer_firewall` (`PeerFirewall`) refuses a peer by public key before the server replies, as Node `createServer({ firewall })` does. It runs after the client's Noise message is verified and before any reply, puncher, relay token or stream exists; `true` refuses, and a panicking hook refuses too. `HyperDhtServer` (from `create_server` or `create_shared_server`) and `run_server` both honor it.
+- `NoiseWrap::remote_public_key` returns the remote static key once message 1 is received.
 
 ### Changed
 
