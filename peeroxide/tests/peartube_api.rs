@@ -7,6 +7,8 @@
 //!   that knows only the key can find it. Calling it twice is a no-op.
 //! - `join_peer_connects_and_moves_data_without_a_topic`: Node `joinPeer()`
 //!   dials a peer without any topic join.
+//! - `peer_firewall_admits_only_allowed_keys`: Node hyperswarm `firewall`
+//!   refuses an inbound peer by key, and the allowed key still connects.
 //! - `leave_peer_keeps_an_established_connection`: Node `leavePeer()` only
 //!   clears the explicit flag; unknown peers are ignored and the stream stays
 //!   open.
@@ -342,6 +344,46 @@ async fn join_peer_connects_and_moves_data_without_a_topic() {
 
         server.destroy().await?;
         client.destroy().await?;
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn peer_firewall_admits_only_allowed_keys() {
+    with_timeout("peer_firewall", async {
+        let net = Testnet::start().await?;
+        let (_refused_task, refused, mut refused_conns) = net.swarm().await?;
+        let (_allowed_task, allowed, mut allowed_conns) = net.swarm().await?;
+        let allowed_pk = allowed.key_pair().public_key;
+
+        let mut config = SwarmConfig::default();
+        config.dht = local_dht(net.addrs.clone(), false);
+        config.peer_firewall = Some(std::sync::Arc::new(move |remote, _, _| {
+            *remote != allowed_pk
+        }));
+        let (_server_task, server, mut server_conns) = spawn_swarm(config).await?;
+        server.listen().await?;
+        let server_pk = server.key_pair().public_key;
+
+        refused.join_peer(server_pk).await?;
+        no_conn_within(&mut server_conns, "the server", Duration::from_secs(5)).await;
+        no_conn_within(
+            &mut refused_conns,
+            "the refused peer",
+            Duration::from_millis(1),
+        )
+        .await;
+
+        allowed.join_peer(server_pk).await?;
+        let server_conn = next_conn(&mut server_conns, "the server side").await;
+        let client_conn = next_conn(&mut allowed_conns, "the allowed peer").await;
+        assert_eq!(server_conn.remote_public_key(), &allowed_pk);
+        assert_eq!(client_conn.remote_public_key(), &server_pk);
+
+        server.destroy().await?;
+        refused.destroy().await?;
+        allowed.destroy().await?;
         Ok(())
     })
     .await;

@@ -15,7 +15,7 @@ use libudx::{RuntimeHandle, UdxRuntime};
 use peeroxide_dht::crypto::hash;
 use peeroxide_dht::hyperdht::{
     self, HyperDhtConfig, HyperDhtError, HyperDhtHandle, HyperDhtServer, KeyPair, PeerConnection,
-    ServerConfig,
+    PeerFirewall, ServerConfig,
 };
 use peeroxide_dht::hyperdht_messages::FIREWALL_RANDOM;
 use peeroxide_dht::messages::Ipv4Peer;
@@ -198,6 +198,11 @@ pub struct SwarmConfig {
     /// Tests that want to exercise the real network path (without leaning
     /// on same-host loopback) should set this to `false`.
     pub local_connection: bool,
+    /// Refuse inbound peers by public key before the server replies (Node
+    /// hyperswarm `firewall`, `true` refuses). The swarm always refuses its
+    /// own key. This checks inbound handshakes only: peers this swarm dials
+    /// are not passed to it. See [`PeerFirewall`].
+    pub peer_firewall: Option<PeerFirewall>,
 }
 
 impl Default for SwarmConfig {
@@ -211,6 +216,7 @@ impl Default for SwarmConfig {
             firewall: 0,
             relay_through: None,
             relay_address: None,
+            peer_firewall: None,
             local_connection: true,
         }
     }
@@ -645,15 +651,23 @@ pub async fn spawn(
     let (connect_result_tx, connect_result_rx) = mpsc::unbounded_channel::<ConnectAttemptResult>();
     let (retry_tx, retry_rx) = mpsc::unbounded_channel::<[u8; 32]>();
 
-    let mut server = dht.create_shared_server(
-        &runtime,
-        ServerConfig::for_swarm(
-            key_pair.clone(),
-            config.firewall,
-            config.relay_through,
-            config.relay_address,
-        ),
+    let mut server_config = ServerConfig::for_swarm(
+        key_pair.clone(),
+        config.firewall,
+        config.relay_through,
+        config.relay_address,
     );
+    // Hyperswarm `_handleFirewall`: our own key is always refused, then the
+    // caller's firewall decides.
+    let own_key = key_pair.public_key;
+    let user_firewall = config.peer_firewall.clone();
+    server_config.peer_firewall = Some(Arc::new(move |remote, payload, client| {
+        *remote == own_key
+            || user_firewall
+                .as_ref()
+                .is_some_and(|f| f(remote, payload, client))
+    }));
+    let mut server = dht.create_shared_server(&runtime, server_config);
     let server_conn_rx = server.take_connections();
 
     let handle_dht = dht.clone();

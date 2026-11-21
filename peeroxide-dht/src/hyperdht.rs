@@ -557,6 +557,17 @@ impl fmt::Debug for PeerConnection {
     }
 }
 
+/// Decides whether a server answers a peer's handshake (Node
+/// `createServer({ firewall(remotePublicKey, remotePayload, clientAddress) })`).
+///
+/// `true` refuses the peer, as in Node. The hook runs after the client's
+/// Noise message is verified and before any reply, puncher, relay token or
+/// stream exists, so a refused peer gets no reply at all. The address is the
+/// client's address as the server sees it: the relayed `peer_address`, or
+/// the sender of a direct handshake. A hook that panics refuses the peer
+/// (Node fails closed when its firewall throws).
+pub type PeerFirewall = Arc<dyn Fn(&[u8; 32], &NoisePayload, &Ipv4Peer) -> bool + Send + Sync>;
+
 /// Configuration used by the server-side handshake and holepunch handler.
 #[derive(Clone)]
 #[non_exhaustive]
@@ -571,6 +582,9 @@ pub struct ServerConfig {
     pub relay_through: Option<[u8; 32]>,
     relay_randomized_only: bool,
     relay_addresses: Vec<Ipv4Peer>,
+    /// Refuse peers by public key before replying (Node `firewall`).
+    /// `None` answers every peer.
+    pub peer_firewall: Option<PeerFirewall>,
 }
 
 impl ServerConfig {
@@ -582,6 +596,7 @@ impl ServerConfig {
             relay_through: None,
             relay_randomized_only: false,
             relay_addresses: Vec::new(),
+            peer_firewall: None,
         }
     }
 
@@ -605,7 +620,24 @@ impl ServerConfig {
             relay_through,
             relay_randomized_only: true,
             relay_addresses,
+            peer_firewall: None,
         }
+    }
+
+    /// Whether [`Self::peer_firewall`] refuses the client of `nw`, whose
+    /// message 1 has been received. Node `server.js:269-278`: no reply when
+    /// the firewall says so or throws.
+    fn refuses(&self, nw: &NoiseWrap, payload: &NoisePayload, client: &Ipv4Peer) -> bool {
+        let Some(firewall) = &self.peer_firewall else {
+            return false;
+        };
+        let Some(remote_public_key) = nw.remote_public_key() else {
+            return true;
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            firewall(&remote_public_key, payload, client)
+        }))
+        .unwrap_or(true)
     }
 }
 
@@ -4138,6 +4170,10 @@ async fn accept_server_handshake(
     if remote_payload.error != 0 || remote_payload.version != 1 {
         return None;
     }
+    // Node `_onpeerhandshake`: the client is `peerAddress || req.from`.
+    if config.refuses(&nw, &remote_payload, peer_address.unwrap_or(from)) {
+        return None;
+    }
 
     let socket = dht.server_socket().await.ok().flatten()?;
     let port = socket.local_addr().await.ok()?.port();
@@ -4416,10 +4452,11 @@ pub async fn run_server(
             ServerEvent::PeerHandshake {
                 msg,
                 from,
+                peer_address,
                 reply_tx,
                 ..
             } => {
-                let reply = legacy_handshake_reply(&config, &msg, &from);
+                let reply = legacy_handshake_reply(&config, &msg, &from, peer_address.as_ref());
                 let _ = reply_tx.send(reply.map(Into::into));
             }
             ServerEvent::PeerHolepunch { reply_tx, .. } => {
@@ -4434,10 +4471,14 @@ fn legacy_handshake_reply(
     config: &ServerConfig,
     msg: &HandshakeMessage,
     from: &Ipv4Peer,
+    peer_address: Option<&Ipv4Peer>,
 ) -> Option<Vec<u8>> {
     let mut nw = NoiseWrap::new_responder(config.key_pair.to_noise_keypair());
     let remote_payload = nw.recv(&msg.noise).ok()?;
     if remote_payload.error != 0 {
+        return None;
+    }
+    if config.refuses(&nw, &remote_payload, peer_address.unwrap_or(from)) {
         return None;
     }
     let reply_payload = NoisePayload {
@@ -5494,6 +5535,140 @@ mod tests {
         stream.abort_handle().abort();
         task.abort();
         dht.destroy().await.unwrap();
+    }
+
+    /// Message 1 from `client` to `server`, as a relayed firewalled client sends it.
+    fn firewall_test_handshake(server: [u8; 32], client: &KeyPair) -> HandshakeMessage {
+        let mut noise = NoiseWrap::new_initiator(client.to_noise_keypair(), server);
+        HandshakeMessage {
+            mode: MODE_FROM_RELAY,
+            peer_address: None,
+            relay_address: None,
+            noise: noise
+                .send(&NoisePayload {
+                    version: 1,
+                    error: 0,
+                    firewall: FIREWALL_UNKNOWN,
+                    holepunch: None,
+                    addresses4: vec![],
+                    addresses6: vec![],
+                    udx: Some(UdxInfo {
+                        version: 1,
+                        reusable_socket: true,
+                        id: 42,
+                        seq: 0,
+                    }),
+                    secret_stream: Some(SecretStreamInfo { version: 1 }),
+                    relay_through: Some(RelayThroughInfo {
+                        version: 1,
+                        public_key: [7; 32],
+                        token: [8; 32],
+                    }),
+                    relay_addresses: None,
+                })
+                .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_firewall_refuses_before_any_reply() {
+        let runtime = UdxRuntime::new().unwrap();
+        let config = HyperDhtConfig {
+            dht: DhtConfig {
+                bootstrap: vec![],
+                port: 0,
+                firewalled: false,
+                quick_firewall: false,
+                ..DhtConfig::default()
+            },
+            ..HyperDhtConfig::default()
+        };
+        let (_task, dht, _events) = spawn(&runtime, config).await.unwrap();
+        let keys = KeyPair::generate();
+        let allowed = KeyPair::generate();
+        let refused = KeyPair::generate();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut config = ServerConfig::new(keys.clone(), FIREWALL_OPEN);
+        let allowed_key = allowed.public_key;
+        let log = Arc::clone(&seen);
+        config.peer_firewall = Some(Arc::new(move |remote, _, client| {
+            log.lock().unwrap().push((*remote, client.clone()));
+            *remote != allowed_key
+        }));
+        let from = Ipv4Peer {
+            host: "10.0.0.1".into(),
+            port: 49737,
+        };
+        let client = Ipv4Peer {
+            host: "127.0.0.1".into(),
+            port: 1234,
+        };
+        let (events, mut punch_rx) = mpsc::unbounded_channel();
+
+        let refused_msg = firewall_test_handshake(keys.public_key, &refused);
+        let reply = accept_server_handshake(
+            &dht,
+            &runtime,
+            &config,
+            1,
+            &events,
+            &refused_msg,
+            &from,
+            Some(&client),
+        )
+        .await;
+        assert!(reply.is_none(), "a refused peer gets no Noise reply");
+        assert!(
+            punch_rx.try_recv().is_err(),
+            "no punch staged for a refused peer"
+        );
+
+        let allowed_msg = firewall_test_handshake(keys.public_key, &allowed);
+        let reply = accept_server_handshake(
+            &dht,
+            &runtime,
+            &config,
+            2,
+            &events,
+            &allowed_msg,
+            &from,
+            Some(&client),
+        )
+        .await
+        .expect("an allowed peer is answered");
+        assert!(
+            reply.relay.is_some(),
+            "an allowed peer still gets the relay path"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (refused.public_key, client.clone()),
+                (allowed.public_key, client.clone())
+            ],
+            "the hook sees the client key and the relayed peer address"
+        );
+
+        // The deprecated `run_server` path honors the hook too, and a direct
+        // handshake reports the sender as the client.
+        assert!(legacy_handshake_reply(&config, &refused_msg, &from, None).is_none());
+        assert!(legacy_handshake_reply(&config, &allowed_msg, &from, None).is_some());
+        assert_eq!(seen.lock().unwrap().last().unwrap().1, from);
+
+        // Node fails closed when its firewall throws.
+        config.peer_firewall = Some(Arc::new(|_, _, _| panic!("firewall bug")));
+        let reply = accept_server_handshake(
+            &dht,
+            &runtime,
+            &config,
+            3,
+            &events,
+            &allowed_msg,
+            &from,
+            Some(&client),
+        )
+        .await;
+        assert!(reply.is_none(), "a panicking firewall refuses the peer");
     }
 
     #[tokio::test]

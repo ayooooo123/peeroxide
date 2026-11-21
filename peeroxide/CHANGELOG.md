@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Swarm controls for listening by public key, explicit peers, suspension, resumption, and forceful shutdown.
+- `SwarmConfig::peer_firewall` refuses inbound peers by public key before the server replies (Node hyperswarm `firewall`). It checks inbound handshakes only; peers the swarm dials are not passed to it.
+
+### Changed
+
+- The swarm server always refuses a handshake from its own public key, as hyperswarm's `_handleFirewall` does.
 
 ### Fixed
 
