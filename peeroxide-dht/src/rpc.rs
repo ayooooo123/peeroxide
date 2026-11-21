@@ -208,6 +208,8 @@ pub struct UserRequest {
     /// Optional request payload.
     pub value: Option<Vec<u8>>,
     reply_tx: Option<oneshot::Sender<(u64, Option<Vec<u8>>)>>,
+    /// The puncher socket the request arrived on, if any.
+    inbound_socket: Option<UdxSocket>,
 }
 
 impl UserRequest {
@@ -242,6 +244,12 @@ impl UserRequest {
         if let Some(tx) = self.reply_tx.take() {
             let _ = tx.send((SUPPRESS_REPLY_SENTINEL, None));
         }
+    }
+
+    /// The puncher socket the request arrived on (dht-rpc `req.socket`
+    /// when it is not one of the node's own sockets).
+    pub(crate) fn inbound_socket(&self) -> Option<UdxSocket> {
+        self.inbound_socket.clone()
     }
 }
 
@@ -312,17 +320,25 @@ enum DhtCommand {
         reply_tx: oneshot::Sender<Option<UdxSocket>>,
     },
     RemoteAddress {
-        reply_tx: oneshot::Sender<(Option<Ipv4Peer>, u64)>,
+        reply_tx: oneshot::Sender<(Option<Ipv4Peer>, u64, bool)>,
     },
-    #[allow(dead_code)] // constructed by T6 forwarder task; variant + handler land in T4
+    /// Bytes that arrived on a puncher socket, which also answers any
+    /// request among them.
     InboundReplyBytes {
         addr: SocketAddr,
         data: Vec<u8>,
+        socket: UdxSocket,
     },
     PingViaSocket {
         target: Ipv4Peer,
         socket: UdxSocket,
         reply_tx: oneshot::Sender<Result<PingResponse, DhtError>>,
+    },
+    RequestViaSocket {
+        params: UserRequestParams,
+        to: Ipv4Peer,
+        socket: UdxSocket,
+        reply_tx: oneshot::Sender<Result<ResponseData, DhtError>>,
     },
 }
 
@@ -389,6 +405,9 @@ pub struct DhtHandle {
     wire: crate::io::WireCounters,
     table: Arc<Mutex<RoutingTable>>,
     pub(crate) random_punch_budget: Arc<Mutex<crate::holepuncher::RandomPunchBudget>>,
+    /// hyperdht `_validatedLocalAddresses`: per host, whether a socket
+    /// bound to it hears itself.
+    validated_local_addresses: Arc<tokio::sync::Mutex<std::collections::HashMap<String, bool>>>,
 }
 
 impl DhtHandle {
@@ -404,6 +423,51 @@ impl DhtHandle {
     /// going through `wire_stats()` repeatedly.
     pub fn wire_counters(&self) -> crate::io::WireCounters {
         self.wire.clone()
+    }
+
+    /// hyperdht `validateLocalAddresses`: keep the addresses whose host a
+    /// fresh socket can bind and hear its own packet on within 500 ms.
+    /// The verdict per host is cached for the life of the node.
+    pub(crate) async fn validate_local_addresses(
+        &self,
+        addresses: Vec<crate::messages::Ipv4Peer>,
+    ) -> Vec<crate::messages::Ipv4Peer> {
+        let mut cache = self.validated_local_addresses.lock().await;
+        let mut probes = tokio::task::JoinSet::new();
+        for addr in &addresses {
+            if cache.contains_key(&addr.host) {
+                continue;
+            }
+            let host = addr.host.clone();
+            // Marks the host as in flight so a duplicate probes once.
+            cache.insert(host.clone(), false);
+            probes.spawn(async move {
+                let heard = async {
+                    let socket = tokio::net::UdpSocket::bind((host.as_str(), 0)).await.ok()?;
+                    let port = socket.local_addr().ok()?.port();
+                    socket.send_to(&[0], (host.as_str(), port)).await.ok()?;
+                    let mut buf = [0u8; 1];
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        socket.recv_from(&mut buf),
+                    )
+                    .await
+                    .ok()?
+                    .ok()
+                };
+                let ok = heard.await.is_some();
+                (host, ok)
+            });
+        }
+        while let Some(done) = probes.join_next().await {
+            if let Ok((host, ok)) = done {
+                cache.insert(host, ok);
+            }
+        }
+        addresses
+            .into_iter()
+            .filter(|a| cache.get(&a.host).copied().unwrap_or(false))
+            .collect()
     }
 
     /// Return up to `limit` recently-responsive DHT nodes from the local
@@ -427,14 +491,18 @@ impl DhtHandle {
             .collect()
     }
 
-    /// Forward inbound reply bytes from a non-`Io` socket (puncher socket)
-    /// to the actor for TID matching. Used by the auto_sample forwarder
-    /// task. Fire-and-forget; the actor is the source of truth for TID
-    /// resolution.
-    pub(crate) fn forward_inbound_reply_bytes(&self, addr: SocketAddr, data: Vec<u8>) {
+    /// Forward bytes from a non-`Io` socket (puncher socket) to the actor:
+    /// replies for TID matching, requests to be answered from `socket`.
+    /// Used by the auto_sample forwarder task. Fire-and-forget.
+    pub(crate) fn forward_inbound_reply_bytes(
+        &self,
+        addr: SocketAddr,
+        data: Vec<u8>,
+        socket: UdxSocket,
+    ) {
         let _ = self
             .cmd_tx
-            .send(DhtCommand::InboundReplyBytes { addr, data });
+            .send(DhtCommand::InboundReplyBytes { addr, data, socket });
     }
 
     /// Insert a node directly into the local routing table, bypassing the
@@ -517,6 +585,29 @@ impl DhtHandle {
         self.cmd_tx
             .send(DhtCommand::PingViaSocket {
                 target,
+                socket,
+                reply_tx: tx,
+            })
+            .map_err(|_| DhtError::ChannelClosed)?;
+        rx.await.map_err(|_| DhtError::ChannelClosed)?
+    }
+
+    /// Send one request out `socket` (a puncher socket) instead of the DHT
+    /// socket, as dht-rpc `request(..., { socket })` does for hyperdht's
+    /// holepunch rounds. The reply arrives on that socket and must be fed
+    /// back with [`Self::forward_inbound_reply_bytes`]. Retries follow
+    /// `params.retries` and leave from the same socket.
+    pub(crate) async fn request_via_socket(
+        &self,
+        params: UserRequestParams,
+        to: Ipv4Peer,
+        socket: UdxSocket,
+    ) -> Result<ResponseData, DhtError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DhtCommand::RequestViaSocket {
+                params,
+                to,
                 socket,
                 reply_tx: tx,
             })
@@ -731,7 +822,7 @@ impl DhtHandle {
         self.cmd_tx
             .send(DhtCommand::RemoteAddress { reply_tx: tx })
             .map_err(|_| DhtError::ChannelClosed)?;
-        let (addr, _firewall) = rx.await.map_err(|_| DhtError::ChannelClosed)?;
+        let (addr, _firewall, _reachable) = rx.await.map_err(|_| DhtError::ChannelClosed)?;
         Ok(addr)
     }
 
@@ -745,8 +836,27 @@ impl DhtHandle {
         self.cmd_tx
             .send(DhtCommand::RemoteAddress { reply_tx: tx })
             .map_err(|_| DhtError::ChannelClosed)?;
-        let (_addr, firewall) = rx.await.map_err(|_| DhtError::ChannelClosed)?;
+        let (_addr, firewall, _reachable) = rx.await.map_err(|_| DhtError::ChannelClosed)?;
         Ok(firewall)
+    }
+
+    /// Whether our server socket is reachable from the network: dht-rpc
+    /// `!dht.firewalled`. This, not [`Self::firewalled`], decides whether a
+    /// handshake payload says `FIREWALL_OPEN` (hyperdht `server.js:388`,
+    /// `connect.js:441`).
+    pub async fn reachable(&self) -> Result<bool, DhtError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(DhtCommand::RemoteAddress { reply_tx: tx })
+            .map_err(|_| DhtError::ChannelClosed)?;
+        let (_addr, _firewall, reachable) = rx.await.map_err(|_| DhtError::ChannelClosed)?;
+        Ok(reachable)
+    }
+
+    /// Whether the main socket's NAT maps each destination to a new port:
+    /// dht-rpc `dht.randomized`.
+    pub async fn randomized(&self) -> Result<bool, DhtError> {
+        Ok(self.firewalled().await? == crate::hyperdht_messages::FIREWALL_RANDOM)
     }
 }
 
@@ -808,7 +918,7 @@ impl DhtNode {
                 biased;
 
                 Some(event) = self.io.recv() => {
-                    self.handle_io_event(event);
+                    self.handle_io_event(event, true);
                 },
 
                 _ = drain_interval.tick() => {
@@ -885,7 +995,10 @@ impl DhtNode {
         tracing::debug!(query_id, "bootstrap query started");
     }
 
-    fn handle_io_event(&mut self, event: IoEvent) {
+    /// `sample` is false for replies that arrived on a socket other than the
+    /// one our requests leave from (dht-rpc `external`): they must never
+    /// feed this node's NAT sampler.
+    fn handle_io_event(&mut self, event: IoEvent, sample: bool) {
         match event {
             IoEvent::IncomingRequest(req) => {
                 self.add_node_from_network(req.from.clone(), req.id);
@@ -909,7 +1022,8 @@ impl DhtNode {
                 // Only responses on the socket our requests leave from tell
                 // us how that socket is seen (dht-rpc `!external`); a pong
                 // on the server socket says nothing about the client socket.
-                let expected_socket = (socket == SocketKind::Client) == self.io.firewalled();
+                let expected_socket =
+                    sample && (socket == SocketKind::Client) == self.io.firewalled();
                 if to.port != 0 && !to.host.is_empty() && expected_socket {
                     if self.needs_id_update {
                         self.addr_samples.push(to.clone());
@@ -1016,7 +1130,7 @@ impl DhtNode {
                         };
                         self.io.send_reply_deferred(
                             &to,
-                            req.reply_ctx,
+                            req.reply_ctx.clone(),
                             req.tid,
                             req.target,
                             0,
@@ -1100,7 +1214,13 @@ impl DhtNode {
             }
         };
 
-        if pinged_tick < self.tick {
+        // dht-rpc caps concurrent liveness checks at 10 (`_checks < 10`).
+        let checks = self
+            .standalone_tids
+            .values()
+            .filter(|s| matches!(s, StandaloneRequest::Check { .. }))
+            .count();
+        if checks < 10 && pinged_tick < self.tick {
             if let Ok(mut table) = self.table.lock() {
                 if let Some(node) = table.get_mut(&found_id) {
                     node.down_hints += 1;
@@ -1146,6 +1266,7 @@ impl DhtNode {
             target: req.target,
             value: req.value.clone(),
             reply_tx: Some(reply_tx),
+            inbound_socket: req.reply_ctx.via.clone(),
         };
 
         let mut maybe_req = Some(user_req);
@@ -1260,6 +1381,11 @@ impl DhtNode {
 
     fn handle_timeout(&mut self, evt: TimeoutEvent) {
         if let Some((query_id, is_commit)) = self.tid_to_query.remove(&evt.tid) {
+            // dht-rpc `_ontimeout`: a node that let a query request time out
+            // leaves the routing table.
+            if let Ok(mut table) = self.table.lock() {
+                table.remove(&peer_id(&evt.to.host, evt.to.port));
+            }
             if is_commit {
                 let finished = self
                     .active_queries
@@ -1510,7 +1636,8 @@ impl DhtNode {
                 self.run_refresh();
                 return;
             }
-            let all = table.closest(table.id(), table.len().min(50));
+            // dht-rpc `_pingSome` walks from the globally oldest node.
+            let all = table.closest(table.id(), table.len());
             let mut v: Vec<_> = all
                 .iter()
                 .filter(|n| n.pinged_tick < self.tick)
@@ -1811,11 +1938,12 @@ impl DhtNode {
             DhtCommand::RemoteAddress { reply_tx } => {
                 let addr = self.nat.public_address();
                 let firewall = self.nat.firewall;
-                let _ = reply_tx.send((addr, firewall));
+                let _ = reply_tx.send((addr, firewall, !self.io.firewalled()));
             }
-            DhtCommand::InboundReplyBytes { addr, data } => {
-                if let Some(event) = self.io.handle_inbound_reply_bytes(addr, data) {
-                    self.handle_io_event(event);
+            // Bytes from a puncher socket: match the TID, never sample.
+            DhtCommand::InboundReplyBytes { addr, data, socket } => {
+                if let Some(event) = self.io.handle_inbound_reply_bytes(addr, data, socket) {
+                    self.handle_io_event(event, false);
                 }
             }
             DhtCommand::PingViaSocket {
@@ -1831,12 +1959,37 @@ impl DhtNode {
                     command: CMD_FIND_NODE,
                     target: id_target,
                     value: None,
-                    timeout_ms: None,
-                    retries: None,
+                    // `nat.js` pings with `retry: false`; one 2 s attempt
+                    // replaces the old 1 s budget (finding 22).
+                    timeout_ms: Some(2000),
+                    retries: Some(0),
                 };
                 if let Some(tid) = self.io.send_request_via_socket(params, &socket) {
                     self.standalone_tids
                         .insert(tid, StandaloneRequest::Ping(reply_tx));
+                } else {
+                    let _ = reply_tx.send(Err(self.io_unavailable()));
+                }
+            }
+            DhtCommand::RequestViaSocket {
+                params,
+                to,
+                socket,
+                reply_tx,
+            } => {
+                let rparams = RequestParams {
+                    to,
+                    token: params.token,
+                    internal: false,
+                    command: params.command,
+                    target: params.target,
+                    value: params.value,
+                    timeout_ms: params.timeout_ms,
+                    retries: params.retries,
+                };
+                if let Some(tid) = self.io.send_request_via_socket(rparams, &socket) {
+                    self.standalone_tids
+                        .insert(tid, StandaloneRequest::UserRequest(reply_tx));
                 } else {
                     let _ = reply_tx.send(Err(self.io_unavailable()));
                 }
@@ -2222,6 +2375,7 @@ pub async fn spawn(
         wire,
         table: Arc::clone(&table_for_handle),
         random_punch_budget: Arc::new(Mutex::new(crate::holepuncher::RandomPunchBudget::default())),
+        validated_local_addresses: Arc::default(),
     };
 
     Ok((handle, dht_handle))

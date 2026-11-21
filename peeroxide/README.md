@@ -54,6 +54,17 @@ peeroxide          <- this crate
 
 Peeroxide is part of the [peeroxide workspace](https://github.com/Rightbracket/peeroxide) and joins the same network as Node.js Hyperswarm peers.
 
+## Deviations from hyperswarm 4.17.2
+
+- No JavaScript-style `firewall(remotePublicKey, payload)` callback.
+- Incoming connections are capped by `max_peers`; hyperswarm does not impose this cap by default.
+- Network changes do not trigger an immediate discovery refresh or connection probe.
+- `join()` returns no per-topic session, and the status, events, peer statistics, per-topic limits, and explicit-peer priority factor are not exposed.
+- Rediscovery does not reset low-priority peer retry attempts.
+- A replacement connection can be delivered before the replaced stream closes.
+- The connection channel has capacity 64. Dropping the final `SwarmHandle` stops the swarm.
+- `relay_through` accepts only a fixed relay key, not hyperswarm's function form.
+
 ## License
 
 MIT OR Apache-2.0

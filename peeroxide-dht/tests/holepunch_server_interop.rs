@@ -166,6 +166,48 @@ fn open_config(bootstrap: u64) -> HyperDhtConfig {
     config
 }
 
+/// A reachable Rust client says OPEN (hyperdht `connect.js:441`); the
+/// firewalled JS server dials it and the client waits for that dial
+/// instead of punching (`connect.js:243-245`).
+#[tokio::test]
+async fn an_open_rust_client_is_dialled_by_a_js_server() {
+    let _ = tracing_subscriber::fmt::try_init();
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_js, ready) = JsPeer::start("holepunch-server.js")
+            .await
+            .expect("JS server");
+        let port = ready["port"].as_u64().expect("port");
+        let js_key: [u8; 32] = hex::decode(ready["publicKey"].as_str().expect("key"))
+            .expect("key hex")
+            .try_into()
+            .expect("key length");
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let (_task, dht, _events) = hyperdht::spawn(&runtime, open_config(port))
+            .await
+            .expect("DHT");
+        dht.fully_bootstrapped().await.expect("bootstrapped");
+        while dht.remote_address().await.expect("address").is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let keys = KeyPair::generate();
+        let mut client = dht
+            .connect(&keys, js_key, &runtime)
+            .await
+            .expect("the JS server dials us");
+        client.stream.write(b"open-client").await.expect("write");
+        assert_eq!(
+            client.stream.read().await.expect("read").as_deref(),
+            Some(&b"open-client"[..])
+        );
+
+        dht.destroy().await.expect("destroy");
+    })
+    .await
+    .expect("open Rust -> JS timed out");
+}
+
 /// A relayed handshake from a firewalled JS client must be answered by an
 /// OPEN Rust server: it replies with its stream id and waits on the DHT
 /// socket for the client's dial instead of staging a passive punch.

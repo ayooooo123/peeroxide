@@ -1,6 +1,6 @@
 {
   "generator": "generate-hyperdht-golden.js",
-  "hyperdht_version": "6.30.0",
+  "hyperdht_version": "6.36.0",
   "fixtures": [
     {
       "type": "hyper_peer",
@@ -255,6 +255,11 @@
       "type": "namespace",
       "label": "NS_PEER_HOLEPUNCH",
       "hex": "f1191cd5e67b10b54a507033280ed1ff0e12278268d5679c8f93d417210d168b"
+    },
+    {
+      "type": "namespace",
+      "label": "NS_PLUGIN",
+      "hex": "6b8a2a8623f28c6c02a1e22abe515ce31cafd9af61d4b69970639aa7eb96a8d5"
     },
     {
       "type": "handshake",

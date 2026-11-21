@@ -14,7 +14,7 @@ fn addr() -> SocketAddr {
 ///
 /// peer_a writes "hello" → relay_1 receives → relays to relay_2 → peer_b reads "hello"
 /// peer_b writes "world" → relay_2 receives → relays to relay_1 → peer_a reads "world"
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udx_relay_bidirectional() {
     let _ = tracing_subscriber::fmt::try_init();
 

@@ -69,7 +69,6 @@
 
 #![deny(clippy::all)]
 
-mod connection_set;
 mod error;
 mod peer_discovery;
 mod peer_info;

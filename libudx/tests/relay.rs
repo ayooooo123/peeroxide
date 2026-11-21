@@ -12,7 +12,7 @@ fn addr() -> SocketAddr {
     LOCALHOST.parse().expect("parse localhost")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_basic_forward() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -70,7 +70,7 @@ async fn relay_basic_forward() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_large_transfer() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -131,7 +131,7 @@ async fn relay_large_transfer() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_bidirectional_concurrent() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -219,7 +219,7 @@ async fn relay_bidirectional_concurrent() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_chain() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -301,7 +301,7 @@ async fn relay_chain() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_destroy_propagation() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -363,6 +363,106 @@ async fn relay_destroy_propagation() {
             Err(_) => panic!("timed out waiting for destroy propagation through relay"),
             Ok(Ok(Some(_))) => panic!("expected EOF or error after peer destroy"),
         }
+    })
+    .await;
+}
+
+/// M1: two relay legs forwarding to each other under traffic in both
+/// directions on four workers keep making progress. Each leg used to hold
+/// its own lock while taking the other's (ABBA deadlock).
+///
+/// A deadlock never recovers, but a direction may legally stand still for
+/// a while: when a burst loss takes the whole flight and the tail loss
+/// probe (a loaded machine overflowing a socket buffer), nothing moves
+/// until the RTO, which C floors at 1 s, fires 1 s after the probe, and
+/// fires again at twice that if the retransmission is lost too
+/// (udx.c:1232, 1379). So a direction fails only after `IDLE_BOUND`
+/// without progress, which covers that schedule, and the check runs
+/// `IDLE_BOUND` past the traffic window so a deadlock inside it is seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_legs_forward_both_ways_without_deadlock() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    with_timeout(Duration::from_secs(20), async {
+        let rt = create_runtime();
+        let mut socks = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..4 {
+            let sock = rt.create_socket().await.expect("socket");
+            sock.bind(addr()).await.expect("bind");
+            addrs.push(sock.local_addr().await.expect("addr"));
+            socks.push(sock);
+        }
+        let relay_1 = rt.create_stream(10).await.expect("relay_1");
+        let relay_2 = rt.create_stream(20).await.expect("relay_2");
+        let peer_a = rt.create_stream(1).await.expect("peer_a");
+        let peer_b = rt.create_stream(2).await.expect("peer_b");
+        relay_1.relay_to(&relay_2).expect("relay 1→2");
+        relay_2.relay_to(&relay_1).expect("relay 2→1");
+        relay_1
+            .connect(&socks[0], 1, addrs[2])
+            .await
+            .expect("connect relay_1");
+        relay_2
+            .connect(&socks[1], 2, addrs[3])
+            .await
+            .expect("connect relay_2");
+        peer_a
+            .connect(&socks[2], 10, addrs[0])
+            .await
+            .expect("connect peer_a");
+        peer_b
+            .connect(&socks[3], 20, addrs[1])
+            .await
+            .expect("connect peer_b");
+
+        let received = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let mut tasks = Vec::new();
+        for (stream, count) in [peer_a, peer_b].into_iter().zip(received.iter().cloned()) {
+            let (mut read, mut write) = tokio::io::split(stream.into_async_stream());
+            tasks.push(tokio::spawn(async move {
+                let chunk = random_payload(16 * 1024);
+                while write.write_all(&chunk).await.is_ok() {}
+            }));
+            tasks.push(tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(n) = read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    count.fetch_add(n, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        // Loss probe, then the 1 s RTO, then the 2 s backed-off RTO, + slack.
+        const IDLE_BOUND: Duration = Duration::from_millis(3_500);
+        const TRAFFIC: Duration = Duration::from_secs(2);
+        let start = tokio::time::Instant::now();
+        let mut last = [0, 0];
+        let mut last_progress = [start, start];
+        while start.elapsed() < TRAFFIC + IDLE_BOUND {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for (side, count) in received.iter().enumerate() {
+                let now = count.load(Ordering::Relaxed);
+                if now > last[side] {
+                    last[side] = now;
+                    last_progress[side] = tokio::time::Instant::now();
+                }
+                assert!(
+                    last_progress[side].elapsed() <= IDLE_BOUND,
+                    "relay stalled: direction {side} at {} bytes for {:?}",
+                    last[side],
+                    last_progress[side].elapsed()
+                );
+            }
+        }
+        for task in tasks {
+            task.abort();
+        }
+        drop((relay_1, relay_2, socks));
     })
     .await;
 }

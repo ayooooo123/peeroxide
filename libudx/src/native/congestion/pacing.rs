@@ -2,6 +2,9 @@
 
 use std::time::{Duration, Instant};
 
+/// Bytes in the bucket of a new stream (C `UDX_INIT_PACING_RATE`).
+const INITIAL_BUCKET: u32 = 25_000;
+
 /// Token bucket pacing for BBR congestion control.
 /// Matches C libudx's `tb_available` / `tb_last_refill_ms` fields and
 /// `update_pacing_time`: once a whole millisecond has passed the bucket is
@@ -13,21 +16,18 @@ pub(crate) struct TokenBucket {
     available: u32,
     /// Last time tokens were refilled, advanced in whole milliseconds so
     /// sub-millisecond polling never discards elapsed time.
-    last_refill: Option<Instant>,
-    /// Pacing rate set by BBR (bytes per millisecond).
+    last_refill: Instant,
+    /// Pacing rate set by BBR (bytes per millisecond, at least 1).
     rate_bytes_per_ms: u32,
-    /// Burst allowed before the first rate is known and after `reset`.
-    initial_burst: u32,
 }
 
 impl TokenBucket {
-    /// Create a new token bucket with initial burst of 2 * MSS.
-    pub(crate) fn new(mss: u32) -> Self {
+    /// A full initial bucket at BBR's initial rate, as C `udx_stream_init`.
+    pub(crate) fn new(rate_bytes_per_ms: u32, now: Instant) -> Self {
         Self {
-            available: 2 * mss,
-            last_refill: None,
-            rate_bytes_per_ms: 0,
-            initial_burst: 2 * mss,
+            available: INITIAL_BUCKET,
+            last_refill: now,
+            rate_bytes_per_ms,
         }
     }
 
@@ -38,16 +38,12 @@ impl TokenBucket {
 
     /// Refill tokens for the whole milliseconds elapsed since the last refill.
     pub(crate) fn refill(&mut self, now: Instant) {
-        let Some(last) = self.last_refill else {
-            self.last_refill = Some(now);
-            return;
-        };
-        let elapsed_ms = now.duration_since(last).as_millis() as u32;
-        if elapsed_ms == 0 || self.rate_bytes_per_ms == 0 {
+        let elapsed_ms = now.saturating_duration_since(self.last_refill).as_millis() as u32;
+        if elapsed_ms == 0 {
             return;
         }
         self.available = elapsed_ms.saturating_mul(self.rate_bytes_per_ms);
-        self.last_refill = Some(last + Duration::from_millis(elapsed_ms as u64));
+        self.last_refill += Duration::from_millis(u64::from(elapsed_ms));
     }
 
     /// Spend `bytes` on a packet. Refills first. The bucket floors at zero,
@@ -64,20 +60,14 @@ impl TokenBucket {
     }
 
     /// Delay before the next packet may go out: zero while the bucket holds
-    /// anything (or no rate is known yet), else C's 1 ms refill timer
-    /// (`stream_may_send` / `refill_pacing_timer`).
+    /// anything, else C's 1 ms refill timer (`stream_may_send` /
+    /// `refill_pacing_timer`).
     pub(crate) fn delay(&self) -> Duration {
-        if self.rate_bytes_per_ms == 0 || self.available > 0 {
+        if self.available > 0 {
             Duration::ZERO
         } else {
             Duration::from_millis(1)
         }
-    }
-
-    /// Reset the bucket (initial burst available).
-    pub(crate) fn reset(&mut self, now: Instant) {
-        self.available = self.initial_burst;
-        self.last_refill = Some(now);
     }
 }
 
@@ -86,85 +76,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_has_initial_burst() {
-        let tb = TokenBucket::new(1180);
-        assert_eq!(tb.available, 2360);
-    }
-
-    #[test]
-    fn test_try_consume_success() {
-        let mut tb = TokenBucket::new(1180);
-        let now = Instant::now();
-
-        assert!(tb.try_consume(2360, now));
-        assert_eq!(tb.available, 0);
+    fn new_bucket_holds_c_initial_burst() {
+        let tb = TokenBucket::new(100, Instant::now());
+        assert_eq!(tb.available, 25_000);
+        assert_eq!(tb.delay(), Duration::ZERO);
     }
 
     /// A packet larger than the balance still goes out; the bucket floors
     /// at zero instead of refusing (C `_send_packet`).
     #[test]
-    fn test_try_consume_floors_at_zero() {
-        let mut tb = TokenBucket::new(1180);
+    fn try_consume_floors_at_zero() {
         let now = Instant::now();
-
-        assert!(tb.try_consume(2361, now));
+        let mut tb = TokenBucket::new(100, now);
+        assert!(tb.try_consume(25_001, now));
         assert_eq!(tb.available, 0);
         assert!(!tb.try_consume(1, now));
-    }
-
-    #[test]
-    fn test_set_rate_and_refill() {
-        let mut tb = TokenBucket::new(1180);
-        let now = Instant::now();
-        assert!(tb.try_consume(1000, now));
-
-        tb.set_rate(100);
-        let later = now + Duration::from_millis(10);
-        tb.refill(later);
-
-        assert_eq!(tb.available, 1000);
-    }
-
-    /// Polling faster than once per millisecond must not lose elapsed time
-    /// (the old refill reset `last_refill` on every call, so a busy sender
-    /// never earned tokens).
-    #[test]
-    fn test_refill_keeps_sub_millisecond_remainder() {
-        let mut tb = TokenBucket::new(1180);
-        let now = Instant::now();
-        assert!(tb.try_consume(2360, now));
-        tb.set_rate(20_000);
-
-        tb.refill(now + Duration::from_micros(600));
-        assert_eq!(tb.available, 0);
-        tb.refill(now + Duration::from_micros(1200));
-        assert_eq!(tb.available, 20_000);
-        assert_eq!(tb.last_refill, Some(now + Duration::from_millis(1)));
-    }
-
-    #[test]
-    fn test_delay_one_ms_when_exhausted() {
-        let mut tb = TokenBucket::new(1180);
-        let now = Instant::now();
-        assert!(tb.try_consume(2360, now));
-
-        tb.set_rate(100);
         assert_eq!(tb.delay(), Duration::from_millis(1));
     }
 
     #[test]
-    fn test_delay_zero_when_available() {
-        let tb = TokenBucket::new(1180);
-        assert_eq!(tb.delay(), Duration::ZERO);
+    fn refill_sets_elapsed_times_rate() {
+        let now = Instant::now();
+        let mut tb = TokenBucket::new(100, now);
+        assert!(tb.try_consume(25_000, now));
+        tb.refill(now + Duration::from_millis(10));
+        assert_eq!(tb.available, 1000);
     }
 
+    /// Polling faster than once per millisecond must not lose elapsed time.
     #[test]
-    fn test_delay_zero_when_rate_zero() {
-        let mut tb = TokenBucket::new(1180);
+    fn refill_keeps_sub_millisecond_remainder() {
         let now = Instant::now();
-        assert!(tb.try_consume(2360, now));
-
-        assert_eq!(tb.delay(), Duration::ZERO);
+        let mut tb = TokenBucket::new(20_000, now);
+        assert!(tb.try_consume(25_000, now));
+        tb.refill(now + Duration::from_micros(600));
+        assert_eq!(tb.available, 0);
+        tb.refill(now + Duration::from_micros(1200));
+        assert_eq!(tb.available, 20_000);
+        assert_eq!(tb.last_refill, now + Duration::from_millis(1));
     }
 
     /// Drive the bucket the way the stream's send loop does (a tick every
@@ -172,12 +121,10 @@ mod tests {
     /// 1200-byte packet per tick, C still sends one packet per tick; a gate
     /// that waits for a whole packet's worth of tokens would send nothing.
     #[test]
-    fn test_low_rate_sends_one_packet_per_tick() {
-        let mut tb = TokenBucket::new(1180);
+    fn low_rate_sends_one_packet_per_tick() {
         let now = Instant::now();
-        assert!(tb.try_consume(2360, now));
-        tb.set_rate(625);
-
+        let mut tb = TokenBucket::new(625, now);
+        assert!(tb.try_consume(25_000, now));
         let mut sent = 0;
         for ms in 1..=100 {
             let tick = now + Duration::from_millis(ms);
@@ -191,17 +138,5 @@ mod tests {
             (95..=105).contains(&sent),
             "sent {sent} packets in 100 ms at 625 B/ms"
         );
-    }
-
-    #[test]
-    fn test_reset() {
-        let mut tb = TokenBucket::new(1180);
-        let now = Instant::now();
-        assert!(tb.try_consume(500, now));
-
-        tb.reset(now + Duration::from_millis(1));
-
-        assert_eq!(tb.available, 2360);
-        assert!(tb.last_refill.is_some());
     }
 }

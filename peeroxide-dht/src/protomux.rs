@@ -326,13 +326,15 @@ pub fn decode_frame(data: &[u8]) -> Result<DecodedFrame> {
                 let end = state.end;
 
                 while state.start < end {
-                    let len = c::decode_uint(&mut state)? as usize;
+                    let len = usize::try_from(c::decode_uint(&mut state)?).map_err(|_| {
+                        ProtomuxError::InvalidFrame("batch item length does not fit usize".into())
+                    })?;
                     if len == 0 {
                         // Channel switch
                         current_channel = c::decode_uint(&mut state)?;
                         continue;
                     }
-                    if state.start + len > end {
+                    if len > end - state.start {
                         return Err(ProtomuxError::InvalidFrame(
                             "batch item overflows frame".into(),
                         ));
@@ -626,19 +628,13 @@ struct LocalChannel {
 }
 
 struct RemoteChannel {
-    /// Handshake state buffer from the Open frame (consumed on pairing).
-    handshake_state: Option<Vec<u8>>,
-    /// Paired local channel ID (set when pairing completes).
-    local_id: Option<u32>,
-    /// Messages buffered before the channel was fully opened locally.
-    pending: Vec<(u64, Vec<u8>)>,
+    /// Paired local channel ID.
+    local_id: u32,
 }
 
 struct ChannelInfo {
     /// Local channel IDs that sent Open but haven't been paired yet.
     outgoing: Vec<u32>,
-    /// Remote channel IDs received via Open that haven't been paired yet.
-    incoming: Vec<u32>,
 }
 
 struct MuxState {
@@ -702,6 +698,23 @@ async fn run_mux<S: FramedStream>(mut stream: S, mut cmd_rx: mpsc::UnboundedRece
         }
 
         tokio::select! {
+            biased;
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(cmd) => {
+                        handle_command(cmd, &mut state, &mut write_queue);
+                        // Drain all immediately available commands
+                        while let Ok(cmd) = cmd_rx.try_recv() {
+                            handle_command(cmd, &mut state, &mut write_queue);
+                        }
+                    }
+                    None => {
+                        debug!("protomux all handles dropped");
+                        shutdown_all(&mut state);
+                        return;
+                    }
+                }
+            }
             result = stream.read_frame() => {
                 match result {
                     Ok(Some(data)) => {
@@ -721,22 +734,6 @@ async fn run_mux<S: FramedStream>(mut stream: S, mut cmd_rx: mpsc::UnboundedRece
                     }
                     Err(e) => {
                         warn!(err = %e, "protomux read error");
-                        shutdown_all(&mut state);
-                        return;
-                    }
-                }
-            }
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(cmd) => {
-                        handle_command(cmd, &mut state, &mut write_queue);
-                        // Drain all immediately available commands
-                        while let Ok(cmd) = cmd_rx.try_recv() {
-                            handle_command(cmd, &mut state, &mut write_queue);
-                        }
-                    }
-                    None => {
-                        debug!("protomux all handles dropped");
                         shutdown_all(&mut state);
                         return;
                     }
@@ -818,71 +815,20 @@ fn create_channel_internal(
     };
     state.local[internal_id as usize] = Some(ch);
 
-    // Check if remote already sent Open for this protocol+id
+    // This mux has no remote-open pairing API. Channels are paired only with
+    // an existing local Open, so a remote open with no local match is rejected.
     let info = state.infos.entry(key).or_insert_with(|| ChannelInfo {
         outgoing: Vec::new(),
-        incoming: Vec::new(),
     });
+    info.outgoing.push(local_id_wire);
 
-    if let Some(remote_id) = info.incoming.first().copied() {
-        // Pair with pending remote channel
-        info.incoming.remove(0);
-
-        if let Some(ch) = &mut state.local[internal_id as usize] {
-            ch.remote_id = Some(remote_id);
-        }
-
-        // Get handshake state from remote
-        let remote_hs = if let Some(rc) = state.remote.get_mut(remote_id as usize - 1) {
-            if let Some(rc) = rc.as_mut() {
-                rc.local_id = Some(internal_id);
-                rc.handshake_state.take()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Send our Open
-        let frame = encode_open(
-            local_id_wire as u64,
-            protocol,
-            id.as_deref(),
-            handshake.as_deref(),
-        );
-        enqueue_write(state, write_queue, frame);
-
-        // Fully open: notify the channel
-        let _ = event_tx.send(ChannelEvent::Opened {
-            handshake: remote_hs,
-        });
-        if let Some(ch) = &mut state.local[internal_id as usize] {
-            ch.opened = true;
-        }
-
-        // Drain any buffered messages
-        if let Some(Some(rc)) = state.remote.get_mut(remote_id as usize - 1) {
-            let pending: Vec<_> = std::mem::take(&mut rc.pending);
-            for (msg_type, data) in pending {
-                let _ = event_tx.send(ChannelEvent::Message {
-                    message_type: msg_type as u32,
-                    data,
-                });
-            }
-        }
-    } else {
-        // No pending remote — register as outgoing and send Open
-        info.outgoing.push(local_id_wire);
-
-        let frame = encode_open(
-            local_id_wire as u64,
-            protocol,
-            id.as_deref(),
-            handshake.as_deref(),
-        );
-        enqueue_write(state, write_queue, frame);
-    }
+    let frame = encode_open(
+        local_id_wire as u64,
+        protocol,
+        id.as_deref(),
+        handshake.as_deref(),
+    );
+    enqueue_write(state, write_queue, frame);
 
     Ok(ChannelHandle {
         local_id: local_id_wire,
@@ -945,6 +891,10 @@ fn close_channel_internal(
     // Free the local ID
     state.local[internal_id] = None;
     state.free_ids.push(internal_id as u32);
+
+    for info in state.infos.values_mut() {
+        info.outgoing.retain(|&id| id != local_id);
+    }
 }
 
 fn enqueue_write(state: &MuxState, write_queue: &mut VecDeque<Vec<u8>>, frame: Vec<u8>) {
@@ -972,10 +922,14 @@ fn handle_incoming_frame(
             channel_id,
             message_type,
             payload,
-        } => {
-            dispatch_message(state, channel_id as u32, message_type, &payload);
-            Ok(())
-        }
+        } => dispatch_message(
+            state,
+            u32::try_from(channel_id)
+                .map_err(|_| ProtomuxError::InvalidFrame("channel ID does not fit u32".into()))?,
+            u32::try_from(message_type)
+                .map_err(|_| ProtomuxError::InvalidFrame("message type does not fit u32".into()))?,
+            &payload,
+        ),
         DecodedFrame::Batch(items) => {
             for item in items {
                 dispatch_batch_item(state, item)?;
@@ -1010,10 +964,7 @@ fn handle_control(
             handle_remote_close(state, remote_local_id);
             Ok(())
         }
-        ControlFrame::Reject { remote_id } => {
-            handle_remote_reject(state, remote_id);
-            Ok(())
-        }
+        ControlFrame::Reject { remote_id } => handle_remote_reject(state, remote_id),
     }
 }
 
@@ -1025,72 +976,61 @@ fn handle_remote_open(
     id: Option<Vec<u8>>,
     handshake_state: Option<Vec<u8>>,
 ) -> Result<()> {
-    let remote_id = remote_local_id as u32; // Remote's local_id is our remote_id
+    let remote_id = u32::try_from(remote_local_id)
+        .map_err(|_| ProtomuxError::InvalidFrame("remote channel ID does not fit u32".into()))?;
 
     // Reject remote_id == 0 (control session)
     if remote_id == 0 {
-        let frame = encode_reject(0);
-        write_queue.push_back(frame);
+        write_queue.push_back(encode_reject(0));
         return Ok(());
     }
 
-    // Grow remote channel list if needed
     let rid = (remote_id - 1) as usize;
-    while state.remote.len() <= rid {
+    if rid == state.remote.len() {
         state.remote.push(None);
     }
-
-    if state.remote[rid].is_some() {
+    if rid >= state.remote.len() || state.remote[rid].is_some() {
         return Err(ProtomuxError::InvalidFrame(
-            "duplicate remote channel ID".into(),
+            "invalid remote channel ID".into(),
         ));
     }
 
     let key = MuxState::channel_key(protocol, id.as_deref());
-    let info = state.infos.entry(key).or_insert_with(|| ChannelInfo {
-        outgoing: Vec::new(),
-        incoming: Vec::new(),
+    let Some(info) = state.infos.get_mut(&key) else {
+        write_queue.push_back(encode_reject(remote_id as u64));
+        return Ok(());
+    };
+    let Some(pos) = info.outgoing.first().copied() else {
+        write_queue.push_back(encode_reject(remote_id as u64));
+        return Ok(());
+    };
+    info.outgoing.remove(0);
+    let internal_id = (pos - 1) as usize;
+
+    state.remote[rid] = Some(RemoteChannel {
+        local_id: internal_id as u32,
+    });
+    let Some(ch) = state
+        .local
+        .get_mut(internal_id)
+        .and_then(|channel| channel.as_mut())
+    else {
+        return Err(ProtomuxError::Internal(
+            "outgoing channel was not live".into(),
+        ));
+    };
+    ch.remote_id = Some(remote_id);
+    ch.opened = true;
+    let _ = ch.event_tx.send(ChannelEvent::Opened {
+        handshake: handshake_state,
     });
 
-    // Check if we have an outgoing channel waiting for this protocol+id
-    if let Some(pos) = info.outgoing.first().copied() {
-        info.outgoing.remove(0);
-        let internal_id = (pos - 1) as usize;
-
-        state.remote[rid] = Some(RemoteChannel {
-            handshake_state: handshake_state.clone(),
-            local_id: Some(internal_id as u32),
-            pending: Vec::new(),
-        });
-
-        if let Some(ch) = &mut state.local[internal_id] {
-            ch.remote_id = Some(remote_id);
-            ch.opened = true;
-            let _ = ch.event_tx.send(ChannelEvent::Opened {
-                handshake: handshake_state,
-            });
-        }
-
-        debug!(
-            protocol,
-            local_id = pos,
-            remote_id,
-            "protomux channel fully opened"
-        );
-    } else {
-        // No local channel yet — buffer as incoming
-        state.remote[rid] = Some(RemoteChannel {
-            handshake_state,
-            local_id: None,
-            pending: Vec::new(),
-        });
-        info.incoming.push(remote_id);
-        debug!(
-            protocol,
-            remote_id, "protomux remote channel queued (awaiting local create)"
-        );
-    }
-
+    debug!(
+        protocol,
+        local_id = pos,
+        remote_id,
+        "protomux channel fully opened"
+    );
     Ok(())
 }
 
@@ -1102,13 +1042,11 @@ fn handle_remote_close(state: &mut MuxState, remote_local_id: u64) {
     let rid = (remote_id - 1) as usize;
 
     if let Some(Some(rc)) = state.remote.get(rid) {
-        if let Some(local_id) = rc.local_id {
-            let internal_id = local_id as usize;
-            if let Some(ch) = state.local.get_mut(internal_id).and_then(|c| c.as_mut()) {
-                if !ch.closed {
-                    ch.closed = true;
-                    let _ = ch.event_tx.send(ChannelEvent::Closed { is_remote: true });
-                }
+        let internal_id = rc.local_id as usize;
+        if let Some(ch) = state.local.get_mut(internal_id).and_then(|c| c.as_mut()) {
+            if !ch.closed {
+                ch.closed = true;
+                let _ = ch.event_tx.send(ChannelEvent::Closed { is_remote: true });
             }
         }
     }
@@ -1118,47 +1056,69 @@ fn handle_remote_close(state: &mut MuxState, remote_local_id: u64) {
     }
 }
 
-fn handle_remote_reject(state: &mut MuxState, remote_id: u64) {
-    // Remote rejected one of our channels
-    let local_id_wire = remote_id as u32;
-    let internal_id = (local_id_wire - 1) as usize;
+fn handle_remote_reject(state: &mut MuxState, remote_id: u64) -> Result<()> {
+    let local_id_wire = u32::try_from(remote_id)
+        .map_err(|_| ProtomuxError::InvalidFrame("rejected channel ID does not fit u32".into()))?;
+    if local_id_wire == 0 {
+        return Err(ProtomuxError::InvalidFrame(
+            "remote rejected control channel".into(),
+        ));
+    }
 
-    if let Some(ch) = state.local.get_mut(internal_id).and_then(|c| c.as_mut()) {
+    let found = state.infos.values_mut().find_map(|info| {
+        info.outgoing
+            .iter()
+            .position(|&id| id == local_id_wire)
+            .map(|position| info.outgoing.remove(position))
+    });
+    let Some(local_id_wire) = found else {
+        return Err(ProtomuxError::InvalidFrame(
+            "remote rejected unknown channel".into(),
+        ));
+    };
+    let internal_id = (local_id_wire - 1) as usize;
+    let Some(slot) = state.local.get_mut(internal_id) else {
+        return Err(ProtomuxError::Internal(
+            "outgoing channel ID was out of bounds".into(),
+        ));
+    };
+
+    if let Some(ch) = slot.as_mut() {
         if !ch.closed {
             ch.closed = true;
             let _ = ch.event_tx.send(ChannelEvent::Closed { is_remote: true });
         }
     }
-
-    state.local[internal_id] = None;
+    *slot = None;
     state.free_ids.push(internal_id as u32);
+    Ok(())
 }
 
-fn dispatch_message(state: &mut MuxState, remote_id: u32, message_type: u64, payload: &[u8]) {
+fn dispatch_message(
+    state: &mut MuxState,
+    remote_id: u32,
+    message_type: u32,
+    payload: &[u8],
+) -> Result<()> {
     if remote_id == 0 {
-        return;
+        return Ok(());
     }
     let rid = (remote_id - 1) as usize;
 
     let Some(Some(rc)) = state.remote.get_mut(rid) else {
-        return;
+        return Ok(());
     };
 
-    if let Some(local_id) = rc.local_id {
-        let internal_id = local_id as usize;
-        if let Some(ch) = state.local.get(internal_id).and_then(|c| c.as_ref()) {
-            if ch.opened {
-                let _ = ch.event_tx.send(ChannelEvent::Message {
-                    message_type: message_type as u32,
-                    data: payload.to_vec(),
-                });
-                return;
-            }
+    let internal_id = rc.local_id as usize;
+    if let Some(ch) = state.local.get(internal_id).and_then(|c| c.as_ref()) {
+        if ch.opened {
+            let _ = ch.event_tx.send(ChannelEvent::Message {
+                message_type,
+                data: payload.to_vec(),
+            });
         }
     }
-
-    // Buffer the message (channel not yet fully opened)
-    rc.pending.push((message_type, payload.to_vec()));
+    Ok(())
 }
 
 fn dispatch_batch_item(state: &mut MuxState, item: BatchItem) -> Result<()> {
@@ -1166,8 +1126,14 @@ fn dispatch_batch_item(state: &mut MuxState, item: BatchItem) -> Result<()> {
     let mut s = State::from_buffer(&item.data);
     let message_type = c::decode_uint(&mut s)?;
     let payload = s.buffer[s.start..s.end].to_vec();
-    dispatch_message(state, item.channel_id as u32, message_type, &payload);
-    Ok(())
+    dispatch_message(
+        state,
+        u32::try_from(item.channel_id)
+            .map_err(|_| ProtomuxError::InvalidFrame("channel ID does not fit u32".into()))?,
+        u32::try_from(message_type)
+            .map_err(|_| ProtomuxError::InvalidFrame("message type does not fit u32".into()))?,
+        &payload,
+    )
 }
 
 // ── hex helper (minimal, no external dep) ────────────────────────────────────
@@ -1322,15 +1288,13 @@ mod tests {
         tokio::spawn(run_a);
         tokio::spawn(run_b);
 
-        // Both sides create a channel with the same protocol
-        let mut ch_a = mux_a
-            .create_channel("test-protocol", None, None)
-            .await
-            .unwrap();
-        let mut ch_b = mux_b
-            .create_channel("test-protocol", None, None)
-            .await
-            .unwrap();
+        // Both sides must register the channel before either peer sends Open.
+        let (ch_a, ch_b) = tokio::join!(
+            mux_a.create_channel("test-protocol", None, None),
+            mux_b.create_channel("test-protocol", None, None),
+        );
+        let mut ch_a = ch_a.unwrap();
+        let mut ch_b = ch_b.unwrap();
 
         // Both should eventually open
         let hs_a = ch_a.wait_opened().await.unwrap();
@@ -1351,8 +1315,12 @@ mod tests {
         tokio::spawn(run_a);
         tokio::spawn(run_b);
 
-        let mut ch_a = mux_a.create_channel("echo", None, None).await.unwrap();
-        let mut ch_b = mux_b.create_channel("echo", None, None).await.unwrap();
+        let (ch_a, ch_b) = tokio::join!(
+            mux_a.create_channel("echo", None, None),
+            mux_b.create_channel("echo", None, None),
+        );
+        let mut ch_a = ch_a.unwrap();
+        let mut ch_b = ch_b.unwrap();
 
         ch_a.wait_opened().await.unwrap();
         ch_b.wait_opened().await.unwrap();
@@ -1390,14 +1358,12 @@ mod tests {
         tokio::spawn(run_a);
         tokio::spawn(run_b);
 
-        let mut ch_a = mux_a
-            .create_channel("close-test", None, None)
-            .await
-            .unwrap();
-        let mut ch_b = mux_b
-            .create_channel("close-test", None, None)
-            .await
-            .unwrap();
+        let (ch_a, ch_b) = tokio::join!(
+            mux_a.create_channel("close-test", None, None),
+            mux_b.create_channel("close-test", None, None),
+        );
+        let mut ch_a = ch_a.unwrap();
+        let mut ch_b = ch_b.unwrap();
 
         ch_a.wait_opened().await.unwrap();
         ch_b.wait_opened().await.unwrap();
@@ -1423,11 +1389,17 @@ mod tests {
         tokio::spawn(run_a);
         tokio::spawn(run_b);
 
-        // Open two different channels
-        let mut ch_a1 = mux_a.create_channel("proto-1", None, None).await.unwrap();
-        let mut ch_a2 = mux_a.create_channel("proto-2", None, None).await.unwrap();
-        let mut ch_b1 = mux_b.create_channel("proto-1", None, None).await.unwrap();
-        let mut ch_b2 = mux_b.create_channel("proto-2", None, None).await.unwrap();
+        // Register both sides before either peer emits Open.
+        let (ch_a1, ch_a2, ch_b1, ch_b2) = tokio::join!(
+            mux_a.create_channel("proto-1", None, None),
+            mux_a.create_channel("proto-2", None, None),
+            mux_b.create_channel("proto-1", None, None),
+            mux_b.create_channel("proto-2", None, None),
+        );
+        let mut ch_a1 = ch_a1.unwrap();
+        let mut ch_a2 = ch_a2.unwrap();
+        let mut ch_b1 = ch_b1.unwrap();
+        let mut ch_b2 = ch_b2.unwrap();
 
         ch_a1.wait_opened().await.unwrap();
         ch_a2.wait_opened().await.unwrap();
@@ -1461,14 +1433,12 @@ mod tests {
         tokio::spawn(run_a);
         tokio::spawn(run_b);
 
-        let mut ch_a = mux_a
-            .create_channel("hs-test", None, Some(vec![1, 2, 3]))
-            .await
-            .unwrap();
-        let mut ch_b = mux_b
-            .create_channel("hs-test", None, Some(vec![4, 5, 6]))
-            .await
-            .unwrap();
+        let (ch_a, ch_b) = tokio::join!(
+            mux_a.create_channel("hs-test", None, Some(vec![1, 2, 3])),
+            mux_b.create_channel("hs-test", None, Some(vec![4, 5, 6])),
+        );
+        let mut ch_a = ch_a.unwrap();
+        let mut ch_b = ch_b.unwrap();
 
         let hs_a = ch_a.wait_opened().await.unwrap();
         let hs_b = ch_b.wait_opened().await.unwrap();
@@ -1476,5 +1446,62 @@ mod tests {
         // Each side receives the other's handshake
         assert_eq!(hs_a, Some(vec![4, 5, 6]));
         assert_eq!(hs_b, Some(vec![1, 2, 3]));
+    }
+    #[test]
+    fn hostile_open_id_is_rejected_without_growing_remote_table() {
+        let mut state = MuxState::new();
+        let mut writes = VecDeque::new();
+        let frame = encode_open(u64::from(u32::MAX), "hostile", None, None);
+
+        assert!(handle_incoming_frame(&frame, &mut state, &mut writes).is_err());
+        assert!(state.remote.is_empty());
+        assert!(writes.is_empty());
+    }
+
+    #[test]
+    fn hostile_reject_ids_return_errors_without_panicking() {
+        let mut state = MuxState::new();
+        let mut writes = VecDeque::new();
+        create_channel_internal(&mut state, &mut writes, "test", None, None).unwrap();
+
+        assert!(handle_incoming_frame(&encode_reject(0), &mut state, &mut writes).is_err());
+        assert!(handle_incoming_frame(&encode_reject(7), &mut state, &mut writes).is_err());
+    }
+
+    #[test]
+    fn oversized_batch_entry_returns_error() {
+        let mut frame = State::new();
+        frame.end = 2;
+        c::preencode_uint(&mut frame, 1);
+        c::preencode_uint(&mut frame, u64::MAX - 1);
+        frame.alloc();
+        frame.buffer[0] = 0;
+        frame.buffer[1] = 0;
+        frame.start = 2;
+        c::encode_uint(&mut frame, 1);
+        c::encode_uint(&mut frame, u64::MAX - 1);
+
+        assert!(decode_frame(&frame.buffer).is_err());
+    }
+
+    #[test]
+    fn unanswered_open_is_rejected_and_messages_are_not_buffered() {
+        let mut state = MuxState::new();
+        let mut writes = VecDeque::new();
+        let open = encode_open(1, "unanswered", None, None);
+        handle_incoming_frame(&open, &mut state, &mut writes).unwrap();
+
+        for _ in 0..1024 {
+            let message = encode_message(1, 0, &[0; 1024]);
+            handle_incoming_frame(&message, &mut state, &mut writes).unwrap();
+        }
+
+        assert_eq!(state.remote.len(), 1);
+        assert!(state.remote[0].is_none());
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            decode_frame(&writes.pop_front().unwrap()).unwrap(),
+            DecodedFrame::Control(ControlFrame::Reject { remote_id: 1 })
+        );
     }
 }

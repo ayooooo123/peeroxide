@@ -45,9 +45,11 @@ pub fn peer_id(host: &str, port: u16) -> NodeId {
     let mut enc = State::new();
     compact_encoding::preencode_ipv4_address(&mut enc, host, port);
     enc.alloc();
-    compact_encoding::encode_ipv4_address(&mut enc, host, port)
-        // SAFETY: caller provides host/port; encoding to buffer cannot fail for valid inputs.
-        .expect("valid ipv4 address");
+    if compact_encoding::encode_ipv4_address(&mut enc, host, port).is_err() {
+        enc.buffer.clear();
+        enc.buffer.extend_from_slice(host.as_bytes());
+        enc.buffer.extend_from_slice(&port.to_le_bytes());
+    }
 
     let mut hasher = Blake2b256::new();
     hasher.update(&enc.buffer);
@@ -95,5 +97,10 @@ mod tests {
         let id = peer_id("0.0.0.0", 0);
         assert_eq!(id.len(), 32);
         assert_ne!(id, [0u8; 32]);
+    }
+
+    #[test]
+    fn peer_id_ipv6_does_not_panic() {
+        let _ = peer_id("::1", 49737);
     }
 }

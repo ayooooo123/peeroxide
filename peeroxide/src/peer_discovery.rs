@@ -4,7 +4,6 @@ use std::time::Duration;
 use rand::Rng;
 use tokio::sync::mpsc;
 
-use peeroxide_dht::crypto::hash;
 use peeroxide_dht::hyperdht::{HyperDhtHandle, KeyPair};
 use peeroxide_dht::messages::Ipv4Peer;
 
@@ -69,54 +68,21 @@ async fn do_refresh(
     event_tx: &mpsc::UnboundedSender<DiscoveryEvent>,
 ) {
     if config.is_server {
-        // Run topic-announce and self-announce on hash(pk) in parallel.
-        // - Self-announce stores ForwardEntries on hash(pk)-close nodes,
-        //   making them PEER_HANDSHAKE FE-holders for receivers' Phase 2
-        //   (query_find_peer in connect_with_nodes).
-        // - Topic-announce stores peer records on topic-close nodes, which
-        //   are returned by `lookup(topic)` to discover this peer.
-        // Both are independent queries and parallelizing halves refresh
-        // latency on first start (which matters for short test windows).
-        //
-        // On first refresh `current_relay_addresses` is empty — the topic
-        // record then carries no relay hints; receivers fall through Phase 1
-        // immediately into Phase 2 which queries FE-holders directly via
-        // FIND_PEER on hash(pk). On subsequent refreshes the prior cycle's
-        // self-announce will have populated `current_relay_addresses` from
-        // the hash(pk) acker set, which the topic-announce then propagates.
-        // Mirrors Node's `Announcer.relayAddresses` semantics.
-        let pk_target = hash(&key_pair.public_key);
         let topic_relays: Vec<Ipv4Peer> = if relay_addresses.is_empty() {
             dht.current_relay_addresses()
         } else {
             relay_addresses.to_vec()
         };
-
-        let topic_announce = dht.announce(config.topic, key_pair, &topic_relays);
-        let self_announce = dht.announce(pk_target, key_pair, relay_addresses);
-        let (topic_res, self_res) = tokio::join!(topic_announce, self_announce);
-
-        match topic_res {
-            Ok(r) => {
+        match dht.announce(config.topic, key_pair, &topic_relays).await {
+            Ok(result) => {
                 tracing::debug!(
-                    closest = r.closest_nodes.len(),
+                    closest = result.closest_nodes.len(),
                     advertised_relays = topic_relays.len(),
                     "announce complete"
                 );
             }
             Err(e) => {
                 tracing::warn!(err = %e, "announce failed");
-            }
-        }
-        match self_res {
-            Ok(r) => {
-                tracing::debug!(
-                    closest = r.closest_nodes.len(),
-                    "self-announce (hash(pk)) complete"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "self-announce (hash(pk)) failed");
             }
         }
     }

@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
-use super::stream::{StreamEvent, StreamInner, build_data_packets, build_end_packet};
+use super::stream::{StreamEvent, StreamInner};
 
 /// Adapter that implements [`tokio::io::AsyncRead`] and [`tokio::io::AsyncWrite`]
 /// over a [`super::stream::UdxStream`].
@@ -72,6 +72,11 @@ impl UdxAsyncStream {
         self.abort_handle().closed().await
     }
 
+    /// Keepalive interval; see [`super::stream::UdxStream::set_keepalive`].
+    pub fn set_keepalive(&self, interval: Option<std::time::Duration>) {
+        self.lock().set_keepalive(interval);
+    }
+
     fn lock(&self) -> MutexGuard<'_, StreamInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -125,6 +130,10 @@ impl AsyncRead for UdxAsyncStream {
                 }
                 Poll::Ready(Ok(()))
             }
+            Poll::Ready(Some(StreamEvent::Error(kind))) => {
+                self.read_eof = true;
+                Poll::Ready(Err(io::Error::new(kind, "UDX stream failed")))
+            }
             Poll::Ready(Some(StreamEvent::End)) | Poll::Ready(None) => {
                 self.read_eof = true;
                 Poll::Ready(Ok(()))
@@ -140,36 +149,30 @@ impl AsyncWrite for UdxAsyncStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let (prep, max_payload, len) = {
-            let mut inner = self.lock();
-            let max_payload = inner.max_payload();
-            // A partial write is only worth a whole packet: wait for room
-            // for one, then send full packets, so freed room is not spent
-            // on 20-byte tails (silly window).
-            let room = inner.send_buffer_room();
-            let len = if buf.len() <= room {
-                buf.len()
-            } else {
-                room / max_payload * max_payload
-            };
-            if len == 0 && !buf.is_empty() {
-                if !inner.is_alive() {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "UDX stream closed",
-                    )));
-                }
-                inner.set_write_waker(cx.waker());
-                return Poll::Pending;
-            }
-            let prep = inner
-                .prepare_write(len)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            (prep, max_payload, len)
+        let mut inner = self.lock();
+        let max_payload = inner.max_payload();
+        // A partial write is only worth a whole packet: wait for room
+        // for one, then send full packets, so freed room is not spent
+        // on 20-byte tails (silly window).
+        let room = inner.send_buffer_room();
+        let len = if buf.len() <= room {
+            buf.len()
+        } else {
+            room / max_payload * max_payload
         };
-
-        let packets = build_data_packets(&prep, &buf[..len], max_payload);
-        self.lock().queue_write(packets, prep.remote_addr);
+        if len == 0 && !buf.is_empty() {
+            if !inner.is_alive() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "UDX stream closed",
+                )));
+            }
+            inner.set_write_waker(cx.waker());
+            return Poll::Pending;
+        }
+        inner
+            .queue_write(&buf[..len], None)
+            .map_err(|e| io::Error::other(e.to_string()))?;
         Poll::Ready(Ok(len))
     }
 
@@ -185,13 +188,9 @@ impl AsyncWrite for UdxAsyncStream {
         }
         if !this.fin_queued {
             // Not connected (firewall hook never fired): nothing to end.
-            let Ok(prep) = inner.prepare_end() else {
+            if inner.queue_end(None).is_err() {
                 return Poll::Ready(Ok(()));
-            };
-            inner.queue_write(
-                vec![(prep.first_seq, build_end_packet(&prep))],
-                prep.remote_addr,
-            );
+            }
             this.fin_queued = true;
         }
         poll_all_acked(&mut inner, cx)
@@ -201,14 +200,15 @@ impl AsyncWrite for UdxAsyncStream {
 impl Unpin for UdxAsyncStream {}
 
 impl Drop for UdxAsyncStream {
-    /// The processor sends what is still queued, then exits without waiting
+    /// The processor sends what is still queued, then DESTROY (C
+    /// `udx_stream_destroy`; not on relay legs) and exits without waiting
     /// for ACKs: up to a send buffer of unacked data is lost if the network
     /// drops it. Call `shutdown()` first when delivery matters.
     fn drop(&mut self) {
         let _ = self.processor.take();
         let mut guard = self.lock();
         if let Some(tx) = &guard.notify_tx {
-            let _ = tx.send(super::stream::StreamNotify::Shutdown);
+            let _ = tx.send(super::stream::StreamNotify::Dropped);
         } else {
             guard.terminate();
         }

@@ -1,5 +1,5 @@
 use peeroxide_dht::crypto::{
-    NS_ANNOUNCE, NS_MUTABLE_PUT, NS_PEER_HANDSHAKE, NS_PEER_HOLEPUNCH, NS_UNANNOUNCE,
+    NS_ANNOUNCE, NS_MUTABLE_PUT, NS_PEER_HANDSHAKE, NS_PEER_HOLEPUNCH, NS_PLUGIN, NS_UNANNOUNCE,
 };
 use peeroxide_dht::hyperdht_messages::{
     AnnounceMessage, HandshakeMessage, HolepunchInfo, HolepunchMessage, HolepunchPayload,
@@ -152,6 +152,7 @@ fn golden_announce() {
             refresh,
             signature,
             bump,
+            lookup: flds["lookup"].as_bool().unwrap_or(false),
         };
 
         let encoded =
@@ -355,6 +356,7 @@ fn golden_namespaces() {
         ("NS_MUTABLE_PUT", &*NS_MUTABLE_PUT),
         ("NS_PEER_HANDSHAKE", &*NS_PEER_HANDSHAKE),
         ("NS_PEER_HOLEPUNCH", &*NS_PEER_HOLEPUNCH),
+        ("NS_PLUGIN", &*NS_PLUGIN),
     ];
 
     for f in load_fixtures().iter().filter(|f| f.typ == "namespace") {

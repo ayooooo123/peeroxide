@@ -13,6 +13,11 @@ use std::net::SocketAddr;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const GSO_MAX_BYTES: usize = 65_507;
 
+/// `EMSGSIZE` on Linux and Android (generic errno table; this crate does
+/// not depend on `libc` directly).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const EMSGSIZE: i32 = 90;
+
 /// Receive buffer for one datagram (UDX packets are at most 1500 bytes; DHT
 /// messages are smaller than 64 KiB).
 pub(crate) const DATAGRAM_SIZE: usize = 65_536;
@@ -76,10 +81,13 @@ impl Udp {
     }
 
     /// Send `packets` in order. Errors are dropped like single sends: UDX
-    /// retransmits what the network loses.
-    pub(crate) async fn send_batch(&self, packets: &[(Vec<u8>, SocketAddr)]) {
+    /// retransmits what the network loses. Returns the datagram size of a
+    /// GSO run the kernel refused with `EMSGSIZE` (segment plus headers above
+    /// the route MTU); that run went out again one datagram at a time.
+    pub(crate) async fn send_batch(&self, packets: &[(Vec<u8>, SocketAddr)]) -> Option<usize> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
+            let mut too_big = None;
             let mut scratch = Vec::new();
             let mut rest = packets;
             while !rest.is_empty() {
@@ -102,13 +110,21 @@ impl Udp {
                     segment_size: Some(batch[0].0.len()),
                     src_ip: None,
                 };
-                let _ = self
+                // `try_send`, not `send`: `send` reports EMSGSIZE as success.
+                let sent = self
                     .socket
                     .async_io(tokio::io::Interest::WRITABLE, || {
-                        self.state.send((&self.socket).into(), &transmit)
+                        self.state.try_send((&self.socket).into(), &transmit)
                     })
                     .await;
+                if matches!(&sent, Err(e) if e.raw_os_error() == Some(EMSGSIZE)) {
+                    too_big = Some(batch[0].0.len());
+                    for (packet, to) in batch {
+                        let _ = self.socket.send_to(packet, *to).await;
+                    }
+                }
             }
+            too_big
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
@@ -124,9 +140,10 @@ impl Udp {
                     }
                 }
                 if sent < packets.len() && self.socket.writable().await.is_err() {
-                    return;
+                    return None;
                 }
             }
+            None
         }
     }
 

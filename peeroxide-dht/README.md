@@ -60,6 +60,16 @@ The ignored `secretstream_bench` test reports verified encrypt/decrypt throughpu
 for `UDX_WORKERS`, `UDX_CONNECTIONS` and aggregate `UDX_MIB`. Compare 1 and 4 workers
 in release and dev profiles; time the built executable for CPU and peak RSS.
 
+### Deviations from npm
+
+- Relay control secret-streams cap a frame at 64 KiB (Node allows 16 MiB); the default for other streams is unchanged.
+- A connection whose secret-stream header does not arrive within 15 seconds after the Noise handshake fails with `StreamEstablishment`; Node waits without a bound.
+- Holepunch and Noise payloads size `error`, `firewall` and `round` as real varints. Node reserves one byte each and garbles values of 253 or more; valid values encode to identical bytes.
+- `connect` opens each candidate's handshake reply with its own copy of the Noise initiator state, so a bogus reply only fails that candidate. Node shares one state across candidates, so one bad reply spoils the honest ones that follow.
+- The client's holepunch (rounds, punch and landing) is bounded at 30 s; Node relies on the puncher's own timers.
+- Local addresses go through `validate_local_addresses` on the client too (npm validates only on the server), and a holepunch payload also lists the puncher's validated local interfaces next to its NAT samples (npm sends only the samples).
+- The connection keep-alive timer samples the stream's write counter four times per interval instead of being refreshed by every write, so after a write the next keep-alive goes out between 1× and 1.25× the interval (Node: exactly 1×); an idle stream still sends one every interval. On an unsplit `SecretStream` the keep-alive is written by the task polling `read` or `write` (Protomux keeps a read pending); Node writes it from the timer.
+
 ### Project
 
 Part of the [peeroxide](https://github.com/Rightbracket/peeroxide) project.

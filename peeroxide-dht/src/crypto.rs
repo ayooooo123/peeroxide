@@ -76,6 +76,8 @@ pub static NS_PEER_HANDSHAKE: LazyLock<[u8; 32]> =
 /// Precomputed namespace hash for peer holepunch operations.
 pub static NS_PEER_HOLEPUNCH: LazyLock<[u8; 32]> =
     LazyLock::new(|| namespace("hyperswarm/dht", &[1])[0]);
+/// Precomputed namespace hash for plugin requests (hyperdht 6.36.0 `NS.PLUGIN`).
+pub static NS_PLUGIN: LazyLock<[u8; 32]> = LazyLock::new(|| namespace("hyperswarm/dht", &[10])[0]);
 
 // ── Ed25519 sign / verify ───────────────────────────────────────────────────
 

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -7,7 +8,6 @@ use rand::Rng;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::connection_set::{ConnectionInfo, ConnectionSet};
 use crate::error::SwarmError;
 use crate::peer_discovery::{DiscoveryEvent, PeerDiscoveryConfig, run_discovery};
 use crate::peer_info::{PeerInfo, Priority};
@@ -19,10 +19,7 @@ use peeroxide_dht::hyperdht::{
 };
 use peeroxide_dht::hyperdht_messages::FIREWALL_RANDOM;
 use peeroxide_dht::messages::Ipv4Peer;
-#[cfg(test)]
-use peeroxide_dht::noise::Keypair as NoiseKeypair;
-#[cfg(test)]
-use peeroxide_dht::secret_stream::SecretStream;
+use peeroxide_dht::secret_stream::{SecretStreamKeepAlive, SecretStreamStats};
 
 /// Node keeps `_allConnections` and drops a connection on `'close'`; the
 /// handle of a dead stream still pins its buffers, so prune on every push.
@@ -33,31 +30,61 @@ fn track_abort(aborts: &Mutex<Vec<libudx::UdxStreamAbort>>, handle: libudx::UdxS
     }
 }
 
-type ConnectionAbortMap = HashMap<[u8; 32], (u64, libudx::UdxStreamAbort)>;
+enum ConnectionState {
+    Dialing {
+        task: JoinHandle<()>,
+    },
+    Open {
+        is_initiator: bool,
+        abort: libudx::UdxStreamAbort,
+        stats: SecretStreamStats,
+        keep_alive: KeepAliveProbe,
+    },
+}
 
-/// Remember the abort handle of the connection registered under
-/// `generation`, so a duplicate handshake can destroy the connection it
-/// replaces (Node's `_handleServerConnectionSwap`). Same pruning as
-/// [`track_abort`]: dead handles still pin their stream's buffers.
-fn track_conn_abort(
-    aborts: &Mutex<ConnectionAbortMap>,
-    pk: [u8; 32],
-    generation: u64,
-    handle: libudx::UdxStreamAbort,
-) {
-    if let Ok(mut aborts) = aborts.lock() {
-        aborts.retain(|_, (_, h)| h.is_alive());
-        aborts.insert(pk, (generation, handle));
+/// `existing.sendKeepAlive()` for a kept connection, at most one in flight.
+/// The swarm hands connections out unsplit, so a probe resolves only when
+/// the owner next polls the stream (Protomux keeps a read pending) or the
+/// stream is dropped; until then later duplicates add no task.
+struct KeepAliveProbe {
+    handle: SecretStreamKeepAlive<libudx::UdxAsyncStream>,
+    in_flight: Arc<AtomicBool>,
+}
+
+impl KeepAliveProbe {
+    fn new(handle: SecretStreamKeepAlive<libudx::UdxAsyncStream>) -> Self {
+        Self {
+            handle,
+            in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn send(&self) {
+        if self.in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let handle = self.handle.clone();
+        let in_flight = Arc::clone(&self.in_flight);
+        tokio::spawn(async move {
+            let _ = handle.send_keep_alive().await;
+            in_flight.store(false, Ordering::Release);
+        });
     }
 }
 
+struct ConnectionEntry {
+    generation: u64,
+    state: ConnectionState,
+}
+
+type ConnectionMap = HashMap<[u8; 32], ConnectionEntry>;
+
 /// Everything a spawned connection task needs to register its connection with
-/// the actor before handing it out: the abort handles (for suspend, destroy and
-/// duplicate swaps) and the close notification that frees the peer's slot.
+/// the actor before handing it out: the abort handles (for suspend and destroy)
+/// and the close notification that frees the peer's slot.
 #[derive(Clone)]
 struct ConnectionWatch {
     aborts: Arc<Mutex<Vec<libudx::UdxStreamAbort>>>,
-    conn_aborts: Arc<Mutex<ConnectionAbortMap>>,
     closed_tx: Option<mpsc::UnboundedSender<([u8; 32], u64)>>,
 }
 
@@ -65,12 +92,6 @@ impl ConnectionWatch {
     /// Register `conn` for close/abort and give it back, ready to hand out.
     fn watch(&self, mut conn: PeerConnection, pk: [u8; 32], generation: u64) -> PeerConnection {
         track_abort(&self.aborts, conn.stream.abort_handle());
-        track_conn_abort(
-            &self.conn_aborts,
-            pk,
-            generation,
-            conn.stream.abort_handle(),
-        );
         if let (Some(closed), Some(sender)) = (
             conn.stream.take_close_notification(),
             self.closed_tx.clone(),
@@ -89,17 +110,27 @@ fn relay_for_dial(cfg: Option<[u8; 32]>, force: bool, randomized: bool) -> Optio
     cfg.filter(|_| force || randomized)
 }
 
-/// Node's connect `onerror`: a holepunch failure with a relay configured pins
-/// the peer to the relay and resets the attempts, so the relay retry is fast.
+/// Node's connect `onerror` (`shouldForceRelaying`): a holepunch failure with a relay
+/// configured pins the peer to the relay and resets the attempts, so the relay retry is fast.
+/// A probe timeout does not pin the peer, as in Node.
 fn note_connect_error(info: &mut PeerInfo, relay_configured: bool, err: &SwarmError) {
     let holepunch_failure = matches!(
         err,
-        SwarmError::Dht(HyperDhtError::HolepunchAborted | HyperDhtError::HolepunchFailed)
+        SwarmError::Dht(
+            HyperDhtError::HolepunchAborted
+                | HyperDhtError::HolepunchFailed
+                | HyperDhtError::HolepunchDoubleRandomizedNats
+                | HyperDhtError::RemoteNotHolepunchable
+        )
     );
     if relay_configured && holepunch_failure {
         info.force_relaying = true;
         info.attempts = 0;
     }
+}
+
+fn existing_is_outdated(stats: &SecretStreamStats) -> bool {
+    stats.raw_bytes_read() > 0 && stats.raw_bytes_written() > 0
 }
 
 const DEFAULT_MAX_PEERS: usize = 64;
@@ -349,8 +380,8 @@ impl SwarmHandle {
     /// aborted instead of awaited. Destroying an already-destroyed swarm is a
     /// no-op, as in Node.
     ///
-    /// Connections already handed out through the connection channel are
-    /// owned by the caller and are dropped by the caller, not here.
+    /// The swarm aborts every connection it handed out through the connection
+    /// channel, as Node `swarm.destroy()` does.
     pub async fn destroy_with_force(&self, force: bool) -> Result<(), SwarmError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -372,7 +403,7 @@ impl SwarmHandle {
     /// Mirrors Node `swarm.listen()`: registers the DHT server on
     /// `hash(public_key)` and announces that key so peers that only know the
     /// key (see [`SwarmHandle::join_peer`]) can find us. Resolves once the
-    /// first announce has completed. Calling it again is a no-op.
+    /// server route is installed. Calling it again is a no-op.
     pub async fn listen(&self) -> Result<(), SwarmError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
@@ -421,10 +452,8 @@ impl SwarmHandle {
     /// pending dials, and forget every tracked connection, so no further
     /// connection attempts are made until [`SwarmHandle::resume`].
     ///
-    /// Mirrors Node `swarm.suspend()`. Node also destroys the established
-    /// connections it holds; here each connection has already been moved to
-    /// the caller through the connection channel, so callers that want them
-    /// closed must drop their [`SwarmConnection`]s.
+    /// Mirrors Node `swarm.suspend()` and aborts every connection it handed
+    /// out through the connection channel.
     pub async fn suspend(&self) -> Result<(), SwarmError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
@@ -527,17 +556,13 @@ struct SwarmActor {
     discovery_event_tx: mpsc::UnboundedSender<DiscoveryEvent>,
 
     peers: HashMap<[u8; 32], PeerInfo>,
-    connections: ConnectionSet,
-    /// Abort handles for every connection this swarm has produced, including
-    /// the ones already handed to the caller through `conn_tx`. Node keeps
-    /// `_allConnections` and destroys them on suspend/destroy.
+    /// Node's `_allConnections`: one entry owns each peer's current dial or
+    /// open stream, so duplicate arbitration always sees in-flight dials.
+    all_connections: ConnectionMap,
+    /// Abort handles for streams already handed to the caller. Dials are
+    /// cancelled through `all_connections`.
     aborts: Arc<Mutex<Vec<libudx::UdxStreamAbort>>>,
     queue: Vec<[u8; 32]>,
-
-    /// In-flight dials, so a suspend or destroy can abort them. The attempt's
-    /// result arrives through `connect_result_tx`; an aborted one never does.
-    connect_tasks: HashMap<[u8; 32], (u64, JoinHandle<()>)>,
-    dial_generations: HashMap<[u8; 32], u64>,
     connect_result_tx: mpsc::UnboundedSender<ConnectAttemptResult>,
     /// Fires when a failed peer's retry backoff elapses (`lib/retry-timer.js`).
     retry_tx: mpsc::UnboundedSender<[u8; 32]>,
@@ -555,17 +580,10 @@ struct SwarmActor {
     server_registered: bool,
     relay_address: Option<Ipv4Peer>,
 
-    active_connects: usize,
     flush_waiters: Vec<oneshot::Sender<Result<(), SwarmError>>>,
     /// Fires `(pk, generation)` when a connection's stream closes, whichever
     /// side opened it (Node's `conn.on('close')`).
     closed_tx: Option<mpsc::UnboundedSender<([u8; 32], u64)>>,
-    /// Generation of the connection registered in `connections` per peer, so
-    /// a late close notification only retires the connection it belongs to.
-    generations: HashMap<[u8; 32], u64>,
-    /// Abort handle of that connection, so a duplicate handshake can destroy
-    /// the connection it replaces.
-    conn_aborts: Arc<Mutex<ConnectionAbortMap>>,
     next_generation: u64,
 }
 struct ConnectAttemptResult {
@@ -655,11 +673,9 @@ pub async fn spawn(
         topics: HashMap::new(),
         discovery_event_tx,
         peers: HashMap::new(),
-        connections: ConnectionSet::new(),
+        all_connections: HashMap::new(),
         aborts: Arc::new(Mutex::new(Vec::new())),
         queue: Vec::new(),
-        connect_tasks: HashMap::new(),
-        dial_generations: HashMap::new(),
         connect_result_tx,
         retry_tx,
         suspended: false,
@@ -670,11 +686,8 @@ pub async fn spawn(
             host: addr.ip().to_string(),
             port: addr.port(),
         }),
-        active_connects: 0,
         flush_waiters: Vec::new(),
         closed_tx: None,
-        generations: HashMap::new(),
-        conn_aborts: Arc::new(Mutex::new(HashMap::new())),
         next_generation: 0,
         conn_tx,
     };
@@ -827,7 +840,12 @@ impl SwarmActor {
                 false
             }
             SwarmCommand::Flush { reply_tx } => {
-                if self.suspended || self.all_topics_refreshed() {
+                if self.suspended
+                    || (self.all_topics_refreshed()
+                        && (self.queue.is_empty()
+                            || self.open_connections() >= self.config.max_peers)
+                        && self.active_dials() == 0)
+                {
                     let _ = reply_tx.send(Ok(()));
                 } else {
                     self.flush_waiters.push(reply_tx);
@@ -859,17 +877,43 @@ impl SwarmActor {
         server: bool,
         client: bool,
     ) -> Result<(), SwarmError> {
-        if self.topics.contains_key(&topic) {
+        if let Some(state) = self.topics.remove(&topic) {
+            let server = server || state.is_server;
+            let client = client || state.is_client;
+            if server == state.is_server && client == state.is_client {
+                self.topics.insert(topic, state);
+                return Ok(());
+            }
+            if let Some(cancel) = state.cancel_tx {
+                let _ = cancel.send(());
+            }
+            if let Some(task) = state.task {
+                task.abort();
+            }
+            if server {
+                self.ensure_server_listening().await?;
+            }
+            if self.suspended {
+                self.topics.insert(
+                    topic,
+                    TopicState {
+                        is_server: server,
+                        is_client: client,
+                        cancel_tx: None,
+                        refreshed: false,
+                        task: None,
+                    },
+                );
+            } else {
+                self.spawn_discovery(topic, server, client);
+            }
             return Ok(());
         }
 
         if server {
             self.ensure_server_listening().await?;
         }
-
         if self.suspended {
-            // Node creates the discovery in a suspended state and only starts
-            // it on resume; keep the join so resume can start it.
             self.topics.insert(
                 topic,
                 TopicState {
@@ -940,7 +984,7 @@ impl SwarmActor {
         }
         if !self.server.listening() {
             self.server
-                .listen(&self.key_pair)
+                .listen_in_background(&self.key_pair)
                 .await
                 .map_err(SwarmError::Dht)?;
             self.server_registered = true;
@@ -956,7 +1000,11 @@ impl SwarmActor {
                 "server re-registered"
             );
         }
-        self.server.resume().await.map_err(SwarmError::Dht)?;
+        // Handshakes are answered again before this returns; the announce runs in the server task.
+        self.server
+            .resume_in_background()
+            .await
+            .map_err(SwarmError::Dht)?;
         Ok(())
     }
 
@@ -966,16 +1014,13 @@ impl SwarmActor {
         if public_key == self.key_pair.public_key {
             return Ok(());
         }
-
-        // Node marks the peer explicit before the already-connected check, so
-        // it is still retried if that connection later closes.
         let enqueue = {
             let info = self
                 .peers
                 .entry(public_key)
                 .or_insert_with(|| PeerInfo::new(public_key, vec![]));
             info.explicit = true;
-            let enqueue = !self.connections.has(&public_key)
+            let enqueue = !self.all_connections.contains_key(&public_key)
                 && !info.banned
                 && !info.queued
                 && !info.connecting;
@@ -987,16 +1032,13 @@ impl SwarmActor {
         };
         if enqueue {
             self.queue.push(public_key);
-            // Node queues the peer and calls _attemptClientConnections, which
-            // does nothing while suspended; resume drains the queue.
             self.attempt_connections();
         }
         Ok(())
     }
 
     /// Node `swarm.leavePeer(publicKey)`: drop the explicit flag and garbage
-    /// collect the peer when it has no topics left. A connection is not
-    /// closed, as in Node.
+    /// collect the peer when it has no topics left. A connection is not closed.
     fn do_leave_peer(&mut self, public_key: &[u8; 32]) -> Result<(), SwarmError> {
         if let Some(info) = self.peers.get_mut(public_key) {
             info.explicit = false;
@@ -1010,7 +1052,7 @@ impl SwarmActor {
             .peers
             .get(public_key)
             .is_some_and(|info| info.should_gc());
-        if gc && !self.connections.has(public_key) {
+        if gc && !self.all_connections.contains_key(public_key) {
             self.peers.remove(public_key);
         }
     }
@@ -1041,11 +1083,12 @@ impl SwarmActor {
             state.refreshed = false;
         }
 
-        for (_, (_, task)) in self.connect_tasks.drain() {
-            task.abort();
+        for (_, entry) in self.all_connections.drain() {
+            match entry.state {
+                ConnectionState::Dialing { task } => task.abort(),
+                ConnectionState::Open { abort, .. } => abort.abort(),
+            }
         }
-        self.dial_generations.clear();
-        self.active_connects = 0;
         self.queue.clear();
         for info in self.peers.values_mut() {
             info.queued = false;
@@ -1058,11 +1101,6 @@ impl SwarmActor {
             for handle in std::mem::take(&mut *aborts) {
                 handle.abort();
             }
-        }
-        self.connections = ConnectionSet::new();
-        self.generations.clear();
-        if let Ok(mut aborts) = self.conn_aborts.lock() {
-            aborts.clear();
         }
 
         for waiter in self.flush_waiters.drain(..) {
@@ -1084,7 +1122,11 @@ impl SwarmActor {
         self.dht.resume().await?;
         self.suspended = false;
         if self.listening || self.topics.values().any(|topic| topic.is_server) {
-            self.ensure_server_listening().await?;
+            if let Err(error) = self.ensure_server_listening().await {
+                self.suspended = true;
+                let _ = self.dht.suspend().await;
+                return Err(error);
+            }
         }
 
         let topics: Vec<([u8; 32], bool, bool)> = self
@@ -1102,7 +1144,7 @@ impl SwarmActor {
             .filter(|(pk, info)| {
                 let still_joined =
                     info.explicit || info.topics.iter().any(|t| self.topics.contains_key(t));
-                !info.banned && !self.connections.has(pk) && still_joined
+                !info.banned && !self.all_connections.contains_key(*pk) && still_joined
             })
             .map(|(pk, _)| *pk)
             .collect();
@@ -1131,28 +1173,21 @@ impl SwarmActor {
             if let Some(cancel) = state.cancel_tx.take() {
                 let _ = cancel.send(());
             }
-            stop_task(state.task.take(), !force).await;
+            tokio::spawn(stop_task(state.task.take(), !force));
         }
 
-        for (_, (_, task)) in self.connect_tasks.drain() {
-            task.abort();
+        for (_, entry) in self.all_connections.drain() {
+            match entry.state {
+                ConnectionState::Dialing { task } => task.abort(),
+                ConnectionState::Open { abort, .. } => abort.abort(),
+            }
         }
-        self.dial_generations.clear();
-        self.active_connects = 0;
         self.queue.clear();
-
         if let Ok(mut aborts) = self.aborts.lock() {
             for handle in std::mem::take(&mut *aborts) {
                 handle.abort();
             }
         }
-        if let Ok(mut aborts) = self.conn_aborts.lock() {
-            for (_, (_, handle)) in aborts.drain() {
-                handle.abort();
-            }
-        }
-        self.connections = ConnectionSet::new();
-        self.generations.clear();
 
         if self.server_registered {
             let target = hash(&self.key_pair.public_key);
@@ -1175,12 +1210,16 @@ impl SwarmActor {
             if let Some(task) = state.task {
                 task.abort();
             }
+            if state.is_server {
+                let dht = self.dht.clone();
+                let key_pair = self.key_pair.clone();
+                tokio::spawn(async move {
+                    let _ = dht.unannounce(topic, &key_pair).await;
+                });
+            }
             for peer in self.peers.values_mut() {
                 peer.topics.retain(|t| *t != topic);
             }
-
-            // `listen()` owns the server independently of topics, as Node's
-            // `Server.listen()` does; only a join-registered server goes away.
             if state.is_server && self.server_registered && !self.listening {
                 let has_remaining_server_topics = self.topics.values().any(|t| t.is_server);
                 if !has_remaining_server_topics {
@@ -1188,13 +1227,10 @@ impl SwarmActor {
                     let target = hash(&self.key_pair.public_key);
                     self.dht.unregister_server(&target);
                     self.server_registered = false;
-                    tracing::debug!(
-                        pk = %short_hex(&self.key_pair.public_key),
-                        "server unregistered (no remaining server topics)"
-                    );
                 }
             }
         }
+        self.check_flush_waiters();
         Ok(())
     }
 
@@ -1212,10 +1248,10 @@ impl SwarmActor {
                     return;
                 }
                 self.retire_if_dead(&public_key);
-                if self.connections.has(&public_key) {
+                if self.all_connections.contains_key(&public_key) {
                     return;
                 }
-                if self.connections.len() >= self.config.max_peers {
+                if self.open_connections() >= self.config.max_peers {
                     return;
                 }
 
@@ -1257,38 +1293,54 @@ impl SwarmActor {
     }
 
     fn all_topics_refreshed(&self) -> bool {
-        !self.topics.is_empty() && self.topics.values().all(|topic| topic.refreshed)
+        self.topics.values().all(|topic| topic.refreshed)
+    }
+
+    fn active_dials(&self) -> usize {
+        self.all_connections
+            .values()
+            .filter(|entry| matches!(&entry.state, ConnectionState::Dialing { .. }))
+            .count()
+    }
+
+    fn open_connections(&self) -> usize {
+        self.all_connections
+            .values()
+            .filter(|entry| matches!(&entry.state, ConnectionState::Open { .. }))
+            .count()
     }
 
     fn check_flush_waiters(&mut self) {
-        if self.all_topics_refreshed() {
+        if self.all_topics_refreshed()
+            && (self.queue.is_empty() || self.open_connections() >= self.config.max_peers)
+            && self.active_dials() == 0
+        {
             for waiter in self.flush_waiters.drain(..) {
                 let _ = waiter.send(Ok(()));
             }
         }
     }
 
-    /// The registration handles a connect task needs for the connection it
-    /// just created (shared ownership, so it can be cloned into the task).
     fn connection_watch(&self) -> ConnectionWatch {
         ConnectionWatch {
             aborts: Arc::clone(&self.aborts),
-            conn_aborts: Arc::clone(&self.conn_aborts),
             closed_tx: self.closed_tx.clone(),
         }
     }
 
-    /// Destroy the connection we hold for `pk` (Node destroys the connection a
-    /// duplicate handshake replaces). Do nothing if it is already gone.
-    fn abort_connection(&mut self, pk: &[u8; 32]) {
-        let Ok(mut aborts) = self.conn_aborts.lock() else {
+    fn abort_entry(&mut self, pk: &[u8; 32]) {
+        let Some(entry) = self.all_connections.remove(pk) else {
             return;
         };
-        let Some((generation, handle)) = aborts.remove(pk) else {
-            return;
-        };
-        if self.generations.get(pk) == Some(&generation) {
-            handle.abort();
+        match entry.state {
+            ConnectionState::Dialing { task } => {
+                task.abort();
+                if let Some(info) = self.peers.get_mut(pk) {
+                    info.connecting = false;
+                    info.queued = false;
+                }
+            }
+            ConnectionState::Open { abort, .. } => abort.abort(),
         }
     }
 
@@ -1297,59 +1349,50 @@ impl SwarmActor {
         if let Ok(mut aborts) = self.aborts.lock() {
             aborts.retain(|h| h.is_alive());
         }
-        if let Ok(mut conn_aborts) = self.conn_aborts.lock() {
-            conn_aborts.retain(|_, (_, h)| h.is_alive());
-        }
-
-        // A stale generation belongs to a connection we have
-        // already replaced; only the current one is retired.
-        if self.generations.get(&pk) == Some(&generation) {
+        if self
+            .all_connections
+            .get(&pk)
+            .is_some_and(|entry| entry.generation == generation)
+        {
             self.retire_connection(&pk);
         }
     }
 
-    /// Retire the active connection for `pk`: remove from registrations,
-    /// notify peer info, and reschedule retry if we initiated it.
+    /// Retire the active connection for `pk`, then retry if we dialled it.
     fn retire_connection(&mut self, pk: &[u8; 32]) {
-        self.generations.remove(pk);
-        if let Ok(mut aborts) = self.conn_aborts.lock() {
-            aborts.remove(pk);
+        let was_initiator = self.all_connections.remove(pk).is_some_and(|entry| {
+            matches!(
+                entry.state,
+                ConnectionState::Open {
+                    is_initiator: true,
+                    ..
+                }
+            )
+        });
+        if let Some(info) = self.peers.get_mut(pk) {
+            info.disconnected();
         }
-        let was_initiator = self
-            .connections
-            .get(pk)
-            .is_some_and(|info| info.is_initiator);
-        if self.connections.remove(pk) {
-            if let Some(info) = self.peers.get_mut(pk) {
-                info.disconnected();
-            }
-            if was_initiator {
-                self.schedule_retry(*pk);
-            }
+        if was_initiator {
+            self.schedule_retry(*pk);
         }
+        self.maybe_delete_peer(pk);
+        self.attempt_connections();
+        self.check_flush_waiters();
     }
 
     /// If an existing current stream is already dead, retire it before
     /// duplicate tie-break even when its close notification is queued.
     fn retire_if_dead(&mut self, pk: &[u8; 32]) -> bool {
-        let is_dead = if let Ok(aborts) = self.conn_aborts.lock() {
-            if let Some((generation, handle)) = aborts.get(pk) {
-                self.generations.get(pk) == Some(generation) && !handle.is_alive()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if is_dead {
-            if let Ok(mut aborts) = self.aborts.lock() {
-                aborts.retain(|h| h.is_alive());
-            }
+        let dead = self.all_connections.get(pk).is_some_and(|entry| {
+            matches!(
+                &entry.state,
+                ConnectionState::Open { abort, .. } if !abort.is_alive()
+            )
+        });
+        if dead {
             self.retire_connection(pk);
-            true
-        } else {
-            false
         }
+        dead
     }
 
     fn handle_server_connection(&mut self, conn: PeerConnection) {
@@ -1360,45 +1403,67 @@ impl SwarmActor {
         }
 
         self.retire_if_dead(&pk);
-
-        // Dedup: compare public keys to decide tie-break
-        if self.connections.has(&pk) {
-            let we_are_dominant = self.key_pair.public_key > pk;
-            if we_are_dominant {
-                tracing::debug!(pk = %short_hex(&pk), "server: keeping dominant existing connection");
-                conn.stream.abort_handle().abort();
-                return;
+        let replace_existing = if let Some(entry) = self.all_connections.get(&pk) {
+            match &entry.state {
+                ConnectionState::Dialing { .. } if self.key_pair.public_key > pk => {
+                    // The dominant side keeps its in-flight dial, just as
+                    // hyperswarm's `_allConnections` does.
+                    conn.stream.abort_handle().abort();
+                    return;
+                }
+                ConnectionState::Dialing { .. } => true,
+                ConnectionState::Open {
+                    stats, keep_alive, ..
+                } => {
+                    // Hyperswarm replaces a stream that has carried data:
+                    // the remote peer is reconnecting after losing it.
+                    let existing_is_outdated = existing_is_outdated(stats);
+                    if !existing_is_outdated
+                        && conn.is_initiator() != (self.key_pair.public_key > pk)
+                    {
+                        // `existing.sendKeepAlive()`: probe the kept
+                        // connection so a dead one is found soon.
+                        keep_alive.send();
+                        conn.stream.abort_handle().abort();
+                        return;
+                    }
+                    true
+                }
             }
-            tracing::debug!(
-                pk = %short_hex(&pk),
-                "server: duplicate incoming connection replaces existing connection"
-            );
-            self.abort_connection(&pk);
-            self.connections.remove(&pk);
+        } else {
+            false
+        };
+        if replace_existing {
+            self.abort_entry(&pk);
         }
 
-        if self.connections.len() >= self.config.max_peers {
+        if self.open_connections() >= self.config.max_peers {
             tracing::debug!(pk = %short_hex(&pk), "server: at max connections");
             conn.stream.abort_handle().abort();
             return;
         }
-        if self.dial_generations.remove(&pk).is_some() {
-            self.active_connects = self.active_connects.saturating_sub(1);
-            if let Some((_, task)) = self.connect_tasks.remove(&pk) {
-                task.abort();
-            }
-        }
         self.queue.retain(|queued| queued != &pk);
+        if let Some(info) = self.peers.get_mut(&pk) {
+            info.queued = false;
+            info.connecting = false;
+        }
 
         self.next_generation = self.next_generation.wrapping_add(1);
         let generation = self.next_generation;
-        self.generations.insert(pk, generation);
+        let abort = conn.stream.abort_handle();
+        let stats = conn.stream.stats_handle();
+        let keep_alive = KeepAliveProbe::new(conn.stream.keep_alive_handle());
         let conn = self.connection_watch().watch(conn, pk, generation);
-
-        self.connections.add(
+        self.all_connections.insert(
             pk,
-            ConnectionInfo {
-                is_initiator: false,
+            ConnectionEntry {
+                generation,
+                state: ConnectionState::Open {
+                    is_initiator: false,
+                    abort,
+                    stats,
+                    keep_alive,
+                },
             },
         );
 
@@ -1418,14 +1483,18 @@ impl SwarmActor {
         if self.conn_tx.try_send(swarm_conn).is_err() {
             tracing::warn!("connection channel full or closed, dropping connection");
         }
+        self.attempt_connections();
+        self.check_flush_waiters();
     }
 
     fn attempt_connections(&mut self) {
         if self.suspended {
             return;
         }
-        while self.active_connects < self.config.max_parallel && !self.queue.is_empty() {
-            // Sort by priority descending
+        while self.active_dials() < self.config.max_parallel
+            && self.open_connections() < self.config.max_peers
+            && !self.queue.is_empty()
+        {
             self.queue.sort_by(|a, b| {
                 let pa = self.peers.get(a).map_or(Priority::VeryLow, |i| i.priority);
                 let pb = self.peers.get(b).map_or(Priority::VeryLow, |i| i.priority);
@@ -1433,20 +1502,20 @@ impl SwarmActor {
             });
 
             let pk = self.queue.remove(0);
+            if self.all_connections.contains_key(&pk) {
+                continue;
+            }
             let (relay_addrs, force_relaying) = if let Some(info) = self.peers.get_mut(&pk) {
                 info.queued = false;
                 info.connecting = true;
                 info.attempts += 1;
                 (info.relay_addresses.clone(), info.force_relaying)
             } else {
-                (vec![], false)
+                continue;
             };
 
-            self.active_connects += 1;
             self.next_generation = self.next_generation.wrapping_add(1);
             let generation = self.next_generation;
-            self.dial_generations.insert(pk, generation);
-
             let dht = self.dht.clone();
             let key_pair = self.key_pair.clone();
             let result_tx = self.connect_result_tx.clone();
@@ -1457,22 +1526,13 @@ impl SwarmActor {
 
             let task = tokio::spawn(async move {
                 let conn_runtime = UdxRuntime::shared(rh);
-                // Node `_maybeRelayConnection(peerInfo.forceRelaying)`; the
-                // NAT lookup lives here because the actor loop is sync.
                 let randomized = dht.firewalled().await.ok() == Some(FIREWALL_RANDOM);
                 connect_opts.relay_through = relay_for_dial(relay_cfg, force_relaying, randomized);
-                tracing::debug!(pk = %short_hex(&pk), generation, "connecting to peer");
                 match dht
                     .connect_with_options(&key_pair, pk, &relay_addrs, &conn_runtime, connect_opts)
                     .await
                 {
                     Ok(conn) => {
-                        tracing::info!(
-                            target: "peeroxide::_events::peer::connected",
-                            pk = %short_hex(&pk),
-                            generation,
-                            "peer connected"
-                        );
                         let _ = result_tx.send(ConnectAttemptResult {
                             public_key: pk,
                             generation,
@@ -1480,13 +1540,6 @@ impl SwarmActor {
                         });
                     }
                     Err(e) => {
-                        tracing::info!(
-                            target: "peeroxide::_events::peer::connect_failed",
-                            pk = %short_hex(&pk),
-                            generation,
-                            err = %e,
-                            "peer connect failed"
-                        );
                         let _ = result_tx.send(ConnectAttemptResult {
                             public_key: pk,
                             generation,
@@ -1495,42 +1548,37 @@ impl SwarmActor {
                     }
                 }
             });
-            self.connect_tasks.insert(pk, (generation, task));
+            self.all_connections.insert(
+                pk,
+                ConnectionEntry {
+                    generation,
+                    state: ConnectionState::Dialing { task },
+                },
+            );
         }
+        self.check_flush_waiters();
     }
 
     fn handle_connect_result(&mut self, result: ConnectAttemptResult) {
         let pk = result.public_key;
         let generation = result.generation;
-        let is_current_dial = self.dial_generations.get(&pk) == Some(&generation);
-
-        if !is_current_dial {
-            tracing::debug!(
-                pk = %short_hex(&pk),
-                generation,
-                "stale dial result ignored"
-            );
+        let current = self.all_connections.get(&pk).is_some_and(|entry| {
+            entry.generation == generation
+                && matches!(&entry.state, ConnectionState::Dialing { .. })
+        });
+        if !current {
             if let Ok((conn, _)) = result.result {
                 conn.stream.abort_handle().abort();
             }
             return;
         }
-
-        self.dial_generations.remove(&pk);
-        self.connect_tasks.remove(&pk);
-        self.active_connects = self.active_connects.saturating_sub(1);
-
+        self.all_connections.remove(&pk);
         if let Some(info) = self.peers.get_mut(&pk) {
             info.connecting = false;
         }
 
         if self.suspended {
-            // Node destroys a connection that lands after suspend.
             if let Ok((conn, _)) = result.result {
-                tracing::debug!(
-                    pk = %short_hex(&pk),
-                    "swarm suspended: dropping dial connection that landed during suspend"
-                );
                 conn.stream.abort_handle().abort();
             }
             return;
@@ -1538,81 +1586,67 @@ impl SwarmActor {
 
         match result.result {
             Ok((conn, runtime)) => {
-                self.retire_if_dead(&pk);
-
-                // Dedup: compare public keys to decide tie-break
-                if self.connections.has(&pk) {
-                    let we_are_dominant = self.key_pair.public_key > pk;
-                    if let Some(existing) = self.connections.get(&pk) {
-                        if existing.is_initiator == we_are_dominant {
-                            tracing::debug!(pk = %short_hex(&pk), "dedup: keeping existing");
-                            conn.stream.abort_handle().abort();
-                            self.attempt_connections();
-                            return;
-                        }
-                    }
-                    self.abort_connection(&pk);
-                    self.connections.remove(&pk);
-                }
-
-                if self.connections.len() >= self.config.max_peers {
-                    tracing::debug!(pk = %short_hex(&pk), "dial: at max connections");
+                if self.open_connections() >= self.config.max_peers {
                     conn.stream.abort_handle().abort();
-                    self.attempt_connections();
-                    return;
-                }
-
-                self.next_generation = self.next_generation.wrapping_add(1);
-                let conn_gen = self.next_generation;
-                self.generations.insert(pk, conn_gen);
-                let conn = self.connection_watch().watch(conn, pk, conn_gen);
-
-                self.connections
-                    .add(pk, ConnectionInfo { is_initiator: true });
-
-                let topics = if let Some(info) = self.peers.get_mut(&pk) {
-                    info.connected();
-                    info.topics.clone()
                 } else {
-                    vec![]
-                };
-
-                let swarm_conn = SwarmConnection {
-                    peer: conn,
-                    is_initiator: true,
-                    topics,
-                    _runtime: runtime,
-                };
-                if self.conn_tx.try_send(swarm_conn).is_err() {
-                    tracing::warn!("connection channel full, dropping connection");
+                    self.next_generation = self.next_generation.wrapping_add(1);
+                    let generation = self.next_generation;
+                    let abort = conn.stream.abort_handle();
+                    let stats = conn.stream.stats_handle();
+                    let keep_alive = KeepAliveProbe::new(conn.stream.keep_alive_handle());
+                    let conn = self.connection_watch().watch(conn, pk, generation);
+                    self.all_connections.insert(
+                        pk,
+                        ConnectionEntry {
+                            generation,
+                            state: ConnectionState::Open {
+                                is_initiator: true,
+                                abort,
+                                stats,
+                                keep_alive,
+                            },
+                        },
+                    );
+                    let topics = if let Some(info) = self.peers.get_mut(&pk) {
+                        info.connected();
+                        info.topics.clone()
+                    } else {
+                        vec![]
+                    };
+                    let swarm_conn = SwarmConnection {
+                        peer: conn,
+                        is_initiator: true,
+                        topics,
+                        _runtime: runtime,
+                    };
+                    if self.conn_tx.try_send(swarm_conn).is_err() {
+                        tracing::warn!("connection channel full, dropping connection");
+                    }
                 }
             }
             Err(e) => {
-                tracing::debug!(pk = %short_hex(&pk), err = %e, "connect failed");
                 if let Some(info) = self.peers.get_mut(&pk) {
                     note_connect_error(info, self.config.relay_through.is_some(), &e);
                 }
                 self.schedule_retry(pk);
             }
         }
-
         self.attempt_connections();
+        self.check_flush_waiters();
     }
 
-    /// Node `swarm._requeue`: a failed peer comes back after its backoff. Runs
-    /// for topic-discovered peers and, unlike the previous topic-only retry,
-    /// for explicit peers that have no topic at all.
+    /// Node `swarm._requeue`: a failed peer comes back after its backoff.
     fn handle_retry(&mut self, pk: [u8; 32]) {
         if self.suspended {
             return;
         }
-        let connected = self.connections.has(&pk);
+        let active = self.all_connections.contains_key(&pk);
         let should_requeue = self.should_requeue(&pk);
         let Some(info) = self.peers.get_mut(&pk) else {
             return;
         };
         info.set_waiting(false);
-        if !connected && should_requeue && !info.banned && !info.queued && !info.connecting {
+        if !active && should_requeue && !info.banned && !info.queued && !info.connecting {
             info.priority = info.get_priority();
             info.queued = true;
             self.queue.push(pk);
@@ -1627,12 +1661,9 @@ impl SwarmActor {
         if info.banned || (!info.explicit && (info.topics.is_empty() || info.attempts > 3)) {
             return;
         }
-
         let delay = retry_delay(info);
         info.set_waiting(true);
-
         let retry_tx = self.retry_tx.clone();
-
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
             let _ = retry_tx.send(pk);
@@ -1646,695 +1677,47 @@ mod tests {
 
     #[test]
     fn retry_delay_first_attempt_unproven() {
-        let mut info = PeerInfo::new([0u8; 32], vec![]);
-        info.attempts = 0;
+        let info = PeerInfo::new([0u8; 32], vec![]);
         let d = retry_delay(&info);
         assert!(d.as_millis() >= 1000);
         assert!(d.as_millis() <= 2000);
-    }
-
-    #[test]
-    fn retry_delay_first_attempt_proven() {
-        let mut info = PeerInfo::new([0u8; 32], vec![]);
-        info.attempts = 0;
-        info.proven = true;
-        let d = retry_delay(&info);
-        assert!(d.as_millis() >= 1000);
-        assert!(d.as_millis() <= 2000);
-    }
-
-    #[test]
-    fn retry_delay_many_attempts() {
-        let mut info = PeerInfo::new([0u8; 32], vec![]);
-        info.attempts = 10;
-        let d = retry_delay(&info);
-        assert!(d.as_millis() >= 600_000);
-        assert!(d.as_millis() <= 720_500);
-    }
-
-    #[test]
-    fn short_hex_format() {
-        let bytes = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33];
-        assert_eq!(short_hex(&bytes), "deadbeef");
-    }
-
-    #[test]
-    fn default_config() {
-        let c = SwarmConfig::default();
-        assert!(c.key_pair.is_none());
-        assert_eq!(c.max_peers, 64);
-        assert_eq!(c.max_parallel, 3);
-        assert_eq!(c.firewall, 0);
-    }
-
-    #[test]
-    fn default_join_opts() {
-        let j = JoinOpts::default();
-        assert!(j.server);
-        assert!(j.client);
-    }
-
-    #[tokio::test]
-    async fn abort_registries_prune_closed_streams() {
-        let runtime = UdxRuntime::new().expect("runtime");
-        let first = runtime.create_stream(1).await.expect("first");
-        let second = runtime.create_stream(2).await.expect("second");
-        let aborts = Mutex::new(Vec::new());
-        let connections = Mutex::new(HashMap::new());
-        track_abort(&aborts, first.abort_handle());
-        track_conn_abort(&connections, [1; 32], 1, first.abort_handle());
-        first.abort_handle().abort();
-        track_abort(&aborts, second.abort_handle());
-        track_conn_abort(&connections, [2; 32], 2, second.abort_handle());
-        assert_eq!(aborts.lock().unwrap().len(), 1);
-        let connections = connections.lock().unwrap();
-        assert_eq!(connections.len(), 1);
-        assert!(connections.contains_key(&[2; 32]));
     }
 
     #[test]
     fn relay_dial_follows_node_relay_function() {
         let cfg = Some([9u8; 32]);
-        assert_eq!(
-            relay_for_dial(cfg, false, false),
-            None,
-            "neither forced nor randomized"
-        );
-        assert_eq!(
-            relay_for_dial(cfg, true, false),
-            cfg,
-            "a holepunch failure forces the relay"
-        );
-        assert_eq!(
-            relay_for_dial(cfg, false, true),
-            cfg,
-            "a randomized NAT dials via the relay"
-        );
-        assert_eq!(
-            relay_for_dial(None, true, true),
-            None,
-            "no relay configured"
+        assert_eq!(relay_for_dial(cfg, false, false), None);
+        assert_eq!(relay_for_dial(cfg, true, false), cfg);
+        assert_eq!(relay_for_dial(cfg, false, true), cfg);
+    }
+
+    #[test]
+    fn holepunch_failures_pin_the_peer_to_the_relay() {
+        for error in [
+            HyperDhtError::HolepunchAborted,
+            HyperDhtError::HolepunchFailed,
+            HyperDhtError::HolepunchDoubleRandomizedNats,
+            HyperDhtError::RemoteNotHolepunchable,
+        ] {
+            let mut info = PeerInfo::new([1u8; 32], vec![]);
+            note_connect_error(&mut info, true, &SwarmError::Dht(error));
+            assert!(info.force_relaying);
+            assert_eq!(info.attempts, 0);
+        }
+    }
+
+    #[test]
+    fn empty_topic_set_is_flushed() {
+        assert!(
+            HashMap::<[u8; 32], TopicState>::new()
+                .values()
+                .all(|topic| topic.refreshed)
         );
     }
 
     #[test]
-    fn holepunch_failure_pins_the_peer_to_the_relay() {
-        let mut info = PeerInfo::new([1u8; 32], vec![]);
-        info.attempts = 2;
-        note_connect_error(
-            &mut info,
-            true,
-            &SwarmError::Dht(HyperDhtError::HolepunchAborted),
-        );
-        assert!(info.force_relaying);
-        assert_eq!(info.attempts, 0, "the relay retry is fast");
-
-        let mut aborted = PeerInfo::new([2u8; 32], vec![]);
-        note_connect_error(
-            &mut aborted,
-            true,
-            &SwarmError::Dht(HyperDhtError::HolepunchFailed),
-        );
-        assert!(aborted.force_relaying);
-
-        let mut other = PeerInfo::new([3u8; 32], vec![]);
-        note_connect_error(
-            &mut other,
-            true,
-            &SwarmError::Dht(HyperDhtError::HandshakeFailed("x".into())),
-        );
-        assert!(
-            !other.force_relaying,
-            "only a holepunch failure forces the relay"
-        );
-
-        let mut no_relay = PeerInfo::new([4u8; 32], vec![]);
-        note_connect_error(
-            &mut no_relay,
-            false,
-            &SwarmError::Dht(HyperDhtError::HolepunchAborted),
-        );
-        assert!(!no_relay.force_relaying, "no relay configured");
-    }
-
-    #[tokio::test]
-    async fn server_unregistered_on_leave_last_topic() {
-        let config = SwarmConfig::default();
-
-        let (_task, handle, _conn_rx) = crate::spawn(config).await.unwrap();
-        let target = hash(&handle.key_pair().public_key);
-        let topic = [0xAA; 32];
-
-        handle
-            .join(
-                topic,
-                JoinOpts {
-                    server: true,
-                    client: false,
-                },
-            )
-            .await
-            .unwrap();
-
-        {
-            let router = handle.dht().router().lock().unwrap();
-            assert!(
-                router.get(&target).is_some(),
-                "server must be registered after join"
-            );
-        }
-
-        handle.leave(topic).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        {
-            let router = handle.dht().router().lock().unwrap();
-            assert!(
-                router.get(&target).is_none(),
-                "server must be unregistered after leaving last server topic"
-            );
-        }
-
-        handle.destroy().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn server_unregistered_on_destroy() {
-        let config = SwarmConfig::default();
-
-        let (_task, handle, _conn_rx) = crate::spawn(config).await.unwrap();
-        let target = hash(&handle.key_pair().public_key);
-        let topic = [0xBB; 32];
-
-        handle
-            .join(
-                topic,
-                JoinOpts {
-                    server: true,
-                    client: false,
-                },
-            )
-            .await
-            .unwrap();
-
-        {
-            let router = handle.dht().router().lock().unwrap();
-            assert!(
-                router.get(&target).is_some(),
-                "server must be registered after join"
-            );
-        }
-
-        handle.destroy().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        {
-            let router = handle.dht().router().lock().unwrap();
-            assert!(
-                router.get(&target).is_none(),
-                "server must be unregistered after destroy"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn server_unregistered_on_handle_drop() {
-        let config = SwarmConfig::default();
-
-        let (task, handle, _conn_rx) = crate::spawn(config).await.unwrap();
-        let dht_handle = handle.dht().clone();
-        let target = hash(&handle.key_pair().public_key);
-        let topic = [0xCC; 32];
-
-        handle
-            .join(
-                topic,
-                JoinOpts {
-                    server: true,
-                    client: false,
-                },
-            )
-            .await
-            .unwrap();
-
-        {
-            let router = dht_handle.router().lock().unwrap();
-            assert!(
-                router.get(&target).is_some(),
-                "server must be registered after join"
-            );
-        }
-
-        drop(handle);
-        drop(_conn_rx);
-        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
-
-        {
-            let router = dht_handle.router().lock().unwrap();
-            assert!(
-                router.get(&target).is_none(),
-                "server must be unregistered after implicit shutdown (handle drop)"
-            );
-        }
-    }
-
-    async fn create_test_connection_pair(rt: &UdxRuntime) -> (PeerConnection, PeerConnection) {
-        let socket_a = rt.create_socket().await.expect("socket_a");
-        socket_a
-            .bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .expect("bind_a");
-        let addr_a = socket_a.local_addr().await.expect("addr_a");
-
-        let socket_b = rt.create_socket().await.expect("socket_b");
-        socket_b
-            .bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .expect("bind_b");
-        let addr_b = socket_b.local_addr().await.expect("addr_b");
-
-        let (id_a, stream_a) = rt.create_random_stream().await.expect("stream_a");
-        let (id_b, stream_b) = rt.create_random_stream().await.expect("stream_b");
-        stream_a
-            .connect(&socket_a, id_b, addr_b)
-            .await
-            .expect("connect_a");
-        stream_b
-            .connect(&socket_b, id_a, addr_a)
-            .await
-            .expect("connect_b");
-
-        let kp_a = KeyPair::from_seed([1; 32]);
-        let kp_b = KeyPair::from_seed([2; 32]);
-
-        let noise_a = NoiseKeypair {
-            public_key: kp_a.public_key,
-            secret_key: kp_a.secret_key,
-        };
-        let noise_b = NoiseKeypair {
-            public_key: kp_b.public_key,
-            secret_key: kp_b.secret_key,
-        };
-
-        let (ss_a, ss_b) = tokio::try_join!(
-            SecretStream::new(true, stream_a.into_async_stream(), noise_a),
-            SecretStream::new(false, stream_b.into_async_stream(), noise_b)
-        )
-        .expect("handshake");
-
-        (
-            PeerConnection::new(ss_a, kp_b.public_key, socket_a, None),
-            PeerConnection::new(ss_b, kp_a.public_key, socket_b, None),
-        )
-    }
-
-    async fn make_test_actor(
-        runtime: &UdxRuntime,
-    ) -> (SwarmActor, mpsc::Receiver<SwarmConnection>) {
-        let key_pair = KeyPair::generate();
-        let (_dht_join, dht, _server_rx) = hyperdht::spawn(runtime, HyperDhtConfig::default())
-            .await
-            .expect("dht");
-
-        let (conn_tx, conn_rx) = mpsc::channel(64);
-        let (discovery_event_tx, _discovery_event_rx) = mpsc::unbounded_channel();
-        let (connect_result_tx, _connect_result_rx) = mpsc::unbounded_channel();
-        let (retry_tx, _retry_rx) = mpsc::unbounded_channel();
-        let (closed_tx, _closed_rx) = mpsc::unbounded_channel();
-
-        let mut server = dht.create_shared_server(
-            runtime,
-            ServerConfig::for_swarm(key_pair.clone(), 0, None, None),
-        );
-        let _server_conns = server.take_connections();
-
-        let actor = SwarmActor {
-            key_pair,
-            dht,
-            config: ActorConfig {
-                max_peers: 64,
-                max_parallel: 3,
-                relay_through: None,
-                local_connection: true,
-                eager: false,
-            },
-            runtime_handle: runtime.handle(),
-            topics: HashMap::new(),
-            discovery_event_tx,
-            peers: HashMap::new(),
-            connections: ConnectionSet::new(),
-            aborts: Arc::new(Mutex::new(Vec::new())),
-            queue: Vec::new(),
-            connect_tasks: HashMap::new(),
-            dial_generations: HashMap::new(),
-            connect_result_tx,
-            retry_tx,
-            suspended: false,
-            listening: false,
-            server,
-            server_registered: true,
-            relay_address: None,
-            active_connects: 0,
-            flush_waiters: Vec::new(),
-            closed_tx: Some(closed_tx),
-            generations: HashMap::new(),
-            conn_aborts: Arc::new(Mutex::new(HashMap::new())),
-            next_generation: 0,
-            conn_tx,
-        };
-        (actor, conn_rx)
-    }
-
-    #[tokio::test]
-    async fn ready_server_connection_invalidates_an_older_dial_completion() {
-        let runtime = UdxRuntime::new().unwrap();
-        let (mut actor, mut published) = make_test_actor(&runtime).await;
-        let (incoming, _peer) = create_test_connection_pair(&runtime).await;
-        let pk = incoming.remote_public_key;
-        actor.dial_generations.insert(pk, 10);
-        actor.active_connects = 1;
-        actor.queue.push(pk);
-        actor.handle_server_connection(incoming);
-        let _current = published.try_recv().unwrap();
-        let current_generation = *actor.generations.get(&pk).unwrap();
-        assert!(!actor.dial_generations.contains_key(&pk));
-        assert_eq!(actor.active_connects, 0);
-        assert!(!actor.queue.contains(&pk));
-        let (stale, _other) = create_test_connection_pair(&runtime).await;
-        let stale_abort = stale.stream.abort_handle();
-        actor.handle_connect_result(ConnectAttemptResult {
-            public_key: pk,
-            generation: 10,
-            result: Ok((stale, UdxRuntime::shared(runtime.handle()))),
-        });
-        assert!(!stale_abort.is_alive());
-        assert_eq!(actor.generations.get(&pk), Some(&current_generation));
-        assert!(published.try_recv().is_err());
-        assert_eq!(actor.active_connects, 0);
-    }
-
-    #[tokio::test]
-    async fn ready_server_connections_are_rejected_when_closed_stopped_or_at_capacity() {
-        let runtime = UdxRuntime::new().unwrap();
-        for (registered, suspended, capacity, closed) in [
-            (false, false, 1, false),
-            (true, true, 1, false),
-            (true, false, 0, false),
-            (true, false, 1, true),
-        ] {
-            let (mut actor, mut published) = make_test_actor(&runtime).await;
-            actor.server_registered = registered;
-            actor.suspended = suspended;
-            actor.config.max_peers = capacity;
-            let (conn, _peer) = create_test_connection_pair(&runtime).await;
-            let pk = conn.remote_public_key;
-            let abort = conn.stream.abort_handle();
-            if closed {
-                abort.abort();
-            }
-            actor.handle_server_connection(conn);
-            assert!(!abort.is_alive());
-            assert!(!actor.connections.has(&pk));
-            assert!(!actor.generations.contains_key(&pk));
-            assert!(published.try_recv().is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn stale_dial_success_is_dropped_and_does_not_overwrite_newer_generation() {
-        let runtime = UdxRuntime::new().expect("runtime");
-        let (mut actor, mut conn_rx) = make_test_actor(&runtime).await;
-
-        let pk = [42u8; 32];
-        actor.active_connects = 1;
-        actor.dial_generations.insert(pk, 1);
-
-        // A newer dial generation replaces generation 1 before it finishes.
-        actor.dial_generations.insert(pk, 2);
-
-        // Generation 1 dial finishes late with Ok.
-        let (conn1, _peer1) = create_test_connection_pair(&runtime).await;
-        let handle1 = conn1.stream.abort_handle();
-        actor.handle_connect_result(ConnectAttemptResult {
-            public_key: pk,
-            generation: 1,
-            result: Ok((conn1, UdxRuntime::shared(runtime.handle()))),
-        });
-
-        // Stale success must not be published.
-        assert!(
-            conn_rx.try_recv().is_err(),
-            "stale generation 1 connection must not be published"
-        );
-        // Stale stream must be aborted.
-        assert!(
-            !handle1.is_alive(),
-            "stale connection stream must be aborted"
-        );
-        // Generation 2 must still be current dial generation.
-        assert_eq!(actor.dial_generations.get(&pk), Some(&2));
-        // active_connects must NOT be decremented by stale attempt.
-        assert_eq!(
-            actor.active_connects, 1,
-            "stale attempt must not decrement active_connects"
-        );
-
-        // When generation 2 finishes, it is accepted and published.
-        let (conn2, _peer2) = create_test_connection_pair(&runtime).await;
-        let peer_pk = conn2.remote_public_key;
-        actor.handle_connect_result(ConnectAttemptResult {
-            public_key: pk,
-            generation: 2,
-            result: Ok((conn2, UdxRuntime::shared(runtime.handle()))),
-        });
-
-        let published = conn_rx
-            .try_recv()
-            .expect("generation 2 connection must be published");
-        assert_eq!(published.peer.remote_public_key, peer_pk);
-        let aborts = actor.conn_aborts.lock().unwrap();
-        assert!(aborts.contains_key(&pk));
-        assert_eq!(actor.active_connects, 0);
-    }
-
-    #[tokio::test]
-    async fn stale_dial_failure_does_not_remove_replacement_connection_or_decrement_attempts() {
-        let runtime = UdxRuntime::new().expect("runtime");
-        let (mut actor, _conn_rx) = make_test_actor(&runtime).await;
-
-        let pk = [43u8; 32];
-        actor.connections.add(
-            pk,
-            ConnectionInfo {
-                is_initiator: false,
-            },
-        );
-        actor.generations.insert(pk, 10);
-        actor.active_connects = 1;
-        actor.dial_generations.insert(pk, 2);
-
-        // A stale generation 1 dial fails late.
-        actor.handle_connect_result(ConnectAttemptResult {
-            public_key: pk,
-            generation: 1,
-            result: Err(SwarmError::ChannelClosed),
-        });
-
-        // Replacement connection and current dial attempt must NOT be touched.
-        assert!(
-            actor.connections.has(&pk),
-            "stale failure must not remove replacement connection from ConnectionSet"
-        );
-        assert_eq!(
-            actor.generations.get(&pk),
-            Some(&10),
-            "stale failure must not remove replacement generation"
-        );
-        assert_eq!(
-            actor.dial_generations.get(&pk),
-            Some(&2),
-            "stale failure must not remove current dial generation"
-        );
-        assert_eq!(
-            actor.active_connects, 1,
-            "stale failure must not decrement active_connects of another attempt"
-        );
-
-        // Current dial generation 2 failure does clean up the dial.
-        actor.handle_connect_result(ConnectAttemptResult {
-            public_key: pk,
-            generation: 2,
-            result: Err(SwarmError::ChannelClosed),
-        });
-        assert_eq!(actor.dial_generations.get(&pk), None);
-        assert_eq!(actor.active_connects, 0);
-        // And replacement connection is still intact.
-        assert!(actor.connections.has(&pk));
-    }
-
-    #[tokio::test]
-    async fn server_connection_retires_dead_stream_and_publishes_ready_connection() {
-        let runtime = UdxRuntime::new().expect("runtime");
-        let (mut actor, mut conn_rx) = make_test_actor(&runtime).await;
-
-        let (conn1, _peer1) = create_test_connection_pair(&runtime).await;
-        let pk = conn1.remote_public_key;
-        actor.handle_server_connection(conn1);
-        let published1 = conn_rx.try_recv().expect("published1");
-        assert_eq!(published1.peer.remote_public_key, pk);
-        assert_eq!(actor.generations.get(&pk), Some(&1));
-
-        // Stream dies
-        published1.peer.stream.abort_handle().abort();
-
-        // New server connection arrives for pk
-        let (conn2, _peer2) = create_test_connection_pair(&runtime).await;
-        actor.handle_server_connection(conn2);
-
-        let published2 = conn_rx.try_recv().expect("published2");
-        assert_eq!(published2.peer.remote_public_key, pk);
-        assert_eq!(actor.generations.get(&pk), Some(&2));
-    }
-
-    #[tokio::test]
-    async fn stale_close_does_not_remove_replacement_connection() {
-        let runtime = UdxRuntime::new().expect("runtime");
-        let (mut actor, _conn_rx) = make_test_actor(&runtime).await;
-
-        let pk = [44u8; 32];
-        let (conn1, _peer1) = create_test_connection_pair(&runtime).await;
-        let (conn2, _peer2) = create_test_connection_pair(&runtime).await;
-
-        actor.connections.add(
-            pk,
-            ConnectionInfo {
-                is_initiator: false,
-            },
-        );
-        actor.generations.insert(pk, 1);
-        track_conn_abort(&actor.conn_aborts, pk, 1, conn1.stream.abort_handle());
-
-        // Generation 2 replaces generation 1.
-        actor.generations.insert(pk, 2);
-        track_conn_abort(&actor.conn_aborts, pk, 2, conn2.stream.abort_handle());
-
-        // Late close notification for generation 1 arrives.
-        actor.handle_close(pk, 1);
-
-        // Generation 2 must still be present.
-        assert!(
-            actor.connections.has(&pk),
-            "stale close must not remove replacement connection from ConnectionSet"
-        );
-        assert_eq!(
-            actor.generations.get(&pk),
-            Some(&2),
-            "stale close must not remove replacement generation"
-        );
-        let aborts = actor.conn_aborts.lock().unwrap();
-        assert_eq!(aborts.get(&pk).map(|(generation, _)| *generation), Some(2));
-    }
-
-    #[tokio::test]
-    async fn close_queued_behind_redial_retires_dead_stream_before_tie_break() {
-        let runtime = UdxRuntime::new().expect("runtime");
-        let (mut actor, _conn_rx) = make_test_actor(&runtime).await;
-
-        let (conn1, _peer1) = create_test_connection_pair(&runtime).await;
-        let abort_handle = conn1.stream.abort_handle();
-
-        // Make actor dominant over pk:
-        let pk = [0u8; 32];
-        actor.key_pair = KeyPair {
-            public_key: [0xff; 32],
-            secret_key: [0xff; 64],
-        };
-        assert!(actor.key_pair.public_key > pk);
-
-        actor.connections.add(
-            pk,
-            ConnectionInfo {
-                is_initiator: false,
-            },
-        );
-        actor.generations.insert(pk, 1);
-        track_conn_abort(&actor.conn_aborts, pk, 1, abort_handle.clone());
-
-        // Stream dies, but close notification has not been processed yet:
-        abort_handle.abort();
-        assert!(!abort_handle.is_alive());
-
-        // A redial arrives. retire_if_dead runs before tie-break:
-        assert!(actor.connections.has(&pk));
-        assert!(
-            actor.retire_if_dead(&pk),
-            "retire_if_dead must retire the dead stream"
-        );
-        assert!(
-            !actor.connections.has(&pk),
-            "connections must be cleared so redial is not rejected by duplicate tie-break"
-        );
-        assert_eq!(actor.generations.get(&pk), None);
-
-        // New handshake accepted as generation 2:
-        actor.connections.add(
-            pk,
-            ConnectionInfo {
-                is_initiator: false,
-            },
-        );
-        actor.generations.insert(pk, 2);
-
-        // Later, queued close notification for generation 1 finally arrives:
-        actor.handle_close(pk, 1);
-
-        // Generation 2 must not be removed by the queued stale close:
-        assert!(actor.connections.has(&pk));
-        assert_eq!(actor.generations.get(&pk), Some(&2));
-    }
-
-    #[tokio::test]
-    async fn abort_registries_prune_on_close() {
-        let runtime = UdxRuntime::new().expect("runtime");
-        let (mut actor, _conn_rx) = make_test_actor(&runtime).await;
-
-        let (conn1, _peer1) = create_test_connection_pair(&runtime).await;
-        let (conn2, _peer2) = create_test_connection_pair(&runtime).await;
-
-        track_abort(&actor.aborts, conn1.stream.abort_handle());
-        track_abort(&actor.aborts, conn2.stream.abort_handle());
-        track_conn_abort(
-            &actor.conn_aborts,
-            [1u8; 32],
-            1,
-            conn1.stream.abort_handle(),
-        );
-        track_conn_abort(
-            &actor.conn_aborts,
-            [2u8; 32],
-            2,
-            conn2.stream.abort_handle(),
-        );
-
-        // Abort first stream
-        conn1.stream.abort_handle().abort();
-
-        // handle_close prunes abort registries
-        actor.handle_close([1u8; 32], 999);
-
-        let aborts = actor.aborts.lock().unwrap();
-        assert_eq!(
-            aborts.len(),
-            1,
-            "dead abort handle must be pruned from aborts on close"
-        );
-
-        let conn_aborts = actor.conn_aborts.lock().unwrap();
-        assert_eq!(
-            conn_aborts.len(),
-            1,
-            "dead abort handle must be pruned from conn_aborts on close"
-        );
-        assert!(conn_aborts.contains_key(&[2u8; 32]));
+    fn peer_without_pending_work_is_collectable() {
+        let info = PeerInfo::new([0; 32], vec![]);
+        assert!(info.should_gc());
     }
 }

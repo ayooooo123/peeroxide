@@ -1,6 +1,6 @@
 {
   "generator": "generate-dht-golden.js",
-  "dht_rpc_version": "6.26.4",
+  "dht_rpc_version": "6.28.0",
   "fixtures": [
     {
       "type": "request",

@@ -324,7 +324,8 @@ async fn mtu_probing_discovers_path_mtu() {
 
     with_timeout(LONG_TIMEOUT, async {
         let runtime = create_runtime();
-        // Path MTU of 1400: probes step 1232→1264→…→1392 (pass), 1424 (dropped 3x) → MTU=1392
+        // Datagrams up to 1400 bytes (IP 1428): probes step 1200→1232→…→1424
+        // (pass), 1456 (dropped 3x) → MTU=1424, an IP packet size as in C.
         let config = ProxyConfig::symmetric(DirectionConfig {
             max_packet_size: Some(1400),
             ..Default::default()
@@ -361,8 +362,8 @@ async fn mtu_probing_discovers_path_mtu() {
 
         let mtu = stream_a.effective_mtu();
         assert!(
-            mtu > 1200 && mtu <= 1400,
-            "effective_mtu should settle between 1200 and 1400, got {mtu}"
+            mtu > 1200 && mtu <= 1400 + 28,
+            "effective_mtu should settle between 1200 and 1428, got {mtu}"
         );
     })
     .await;

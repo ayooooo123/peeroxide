@@ -1,27 +1,32 @@
 //! Rate sampling for BBR congestion control.
 //!
-//! Port of [`udx_rate.c`](https://github.com/holepunchto/libudx/blob/main/src/udx_rate.c).
-//! Tracks delivery rate by storing per-packet metadata at send time and
-//! computing intervals at ACK time.
+//! Port of `udx_rate.c` (the version udx-native 1.22.1 pins). Each packet
+//! carries the delivery state at its (re)transmission; when packets are
+//! delivered, the most recently sent one gives the sample's interval.
+//! Times are whole milliseconds on the stream's clock, like C's `uv_now`.
 
-use std::time::{Duration, Instant};
-
-/// Per-packet metadata stored at send time.
-/// Matches C: pkt->first_sent_ts, pkt->delivered_ts, pkt->delivered, pkt->is_app_limited.
+/// Per-packet delivery state taken at each (re)transmission (C
+/// `pkt->first_sent_ts`, `delivered_ts`, `delivered`, `is_app_limited`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PacketRateInfo {
-    /// Timestamp when the first packet in this send batch was sent.
-    pub(crate) first_sent_ts: Instant,
-    /// Timestamp when the last ACK was received before this packet was sent.
-    pub(crate) delivered_ts: Instant,
-    /// Total delivered count at the time this packet was sent.
+    pub(crate) first_sent_ts: u64,
+    pub(crate) delivered_ts: u64,
     pub(crate) delivered: u32,
-    /// Whether the app was limiting the send rate when this packet was sent.
     pub(crate) is_app_limited: bool,
 }
 
-/// Rate sample computed from ACK processing.
-/// Default: all zeros/false/None.
+/// A packet the peer delivered, as `udx__rate_pkt_delivered` reads it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Delivered {
+    pub(crate) seq: u32,
+    /// Last (re)transmission time (C `pkt->time_sent`).
+    pub(crate) time_sent: u64,
+    pub(crate) info: PacketRateInfo,
+}
+
+/// One ACK's rate sample (C `udx_rate_sample_t`, fresh per ACK). C's `-1`
+/// ("none") is 0 for `delivered`, `interval_ms` and `rtt_ms`: a real
+/// delivery count or RTT is never 0 there.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RateSample {
     pub(crate) delivered: u32,
@@ -30,235 +35,224 @@ pub(crate) struct RateSample {
     pub(crate) losses: u32,
     pub(crate) acked_sacked: u32,
     pub(crate) is_app_limited: bool,
-    /// Prior delivered count (from the ACKed packet with highest delivered).
     pub(crate) prior_delivered: u32,
-    /// The ACKed packet's delivered_ts (when last ACK was received before that packet was sent).
-    pub(crate) prior_timestamp: Option<Instant>,
-    /// The ACKed packet's first_sent_ts (when the send batch started for that packet).
-    prior_first_sent_ts: Option<Instant>,
+    pub(crate) prior_timestamp: Option<u64>,
+    /// Seq of the packet the sample is taken from.
+    seq: u32,
 }
 
-/// Rate sampling state tracked at the stream level.
+impl RateSample {
+    /// A sample for one ACK; `rtt_ms` is the RACK RTT of the ACK's newest
+    /// delivered packet (C `rs->rtt_ms`), 0 for none.
+    pub(crate) fn new(rtt_ms: u32) -> Self {
+        Self {
+            rtt_ms,
+            ..Self::default()
+        }
+    }
+}
+
+/// Stream-level delivery state (C `stream->delivered`, `delivered_ts`,
+/// `first_sent_ts`, `app_limited`, `rate_*`).
 #[derive(Debug, Clone)]
 pub(crate) struct RateState {
-    /// Current rate sample being built.
-    pub(crate) current: RateSample,
-    pub(crate) rate_delivered: u32,
-    pub(crate) rate_interval_ms: u32,
+    /// Packets delivered so far.
+    pub(crate) delivered: u32,
+    /// When `delivered` last grew, or a flight started from nothing outstanding.
+    pub(crate) delivered_ts: u64,
+    /// Send time of the newest delivered packet, or the start of a flight.
+    first_sent_ts: u64,
+    /// `delivered` mark until which the sender is app-limited; 0 = not.
+    pub(crate) app_limited: u32,
+    rate_delivered: u32,
+    rate_interval_ms: u32,
+}
+
+/// C `rack_sent_after`: `(t1, seq1)` was sent after `(t2, seq2)`.
+fn sent_after(t1: u64, seq1: u32, t2: u64, seq2: u32) -> bool {
+    t1 > t2 || (t1 == t2 && (seq1.wrapping_sub(seq2) as i32) > 0)
+}
+
+/// C `stamp_ms_delta`: `t1 - t0`, at least 0.
+fn ms_delta(t1: u64, t0: u64) -> u32 {
+    t1.saturating_sub(t0).min(u64::from(u32::MAX)) as u32
 }
 
 impl RateState {
-    /// Create a new rate sampling state.
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(now_ms: u64) -> Self {
         Self {
-            current: RateSample::default(),
+            delivered: 0,
+            delivered_ts: now_ms,
+            first_sent_ts: now_ms,
+            // Initially app-limited, as C `udx_stream_init` (`~0`).
+            app_limited: u32::MAX,
             rate_delivered: 0,
             rate_interval_ms: 0,
         }
     }
 
-    /// Create PacketRateInfo snapshot for a packet about to be sent.
-    /// C reference: udx__rate_pkt_send()
-    /// This is a static method — it just captures the current delivery state.
-    pub(crate) fn on_packet_sent(
-        delivered: u32,
-        delivered_ts: Instant,
-        first_sent_ts: Instant,
-        is_app_limited: bool,
-    ) -> PacketRateInfo {
+    /// C `udx__rate_pkt_sent`: the delivery state for a packet about to be
+    /// (re)sent. With nothing outstanding, a new flight starts now.
+    pub(crate) fn pkt_sent(&mut self, nothing_outstanding: bool, now_ms: u64) -> PacketRateInfo {
+        if nothing_outstanding {
+            self.first_sent_ts = now_ms;
+            self.delivered_ts = now_ms;
+        }
         PacketRateInfo {
-            first_sent_ts,
-            delivered_ts,
-            delivered,
-            is_app_limited,
+            first_sent_ts: self.first_sent_ts,
+            delivered_ts: self.delivered_ts,
+            delivered: self.delivered,
+            is_app_limited: self.app_limited != 0,
         }
     }
 
-    /// Process an ACKed packet's rate info.
-    /// Among all ACKed packets in a batch, pick the one with highest pkt_info.delivered
-    /// (most recently sent). Set current.prior_delivered, prior_timestamp, is_app_limited.
-    /// C reference: udx__rate_pkt_delivered()
-    pub(crate) fn on_packet_delivered(
-        &mut self,
-        pkt_info: &PacketRateInfo,
-        time_sent: Instant,
-        rtt_ms: u32,
-    ) -> Option<Instant> {
-        if pkt_info.delivered >= self.current.prior_delivered {
-            self.current.prior_delivered = pkt_info.delivered;
-            self.current.prior_timestamp = Some(pkt_info.delivered_ts);
-            self.current.prior_first_sent_ts = Some(pkt_info.first_sent_ts);
-            self.current.is_app_limited = pkt_info.is_app_limited;
-            self.current.rtt_ms = rtt_ms;
-            return Some(time_sent);
+    /// C `udx__rate_pkt_delivered`: the most recently sent delivered packet
+    /// gives the sample's prior state and its send interval.
+    pub(crate) fn pkt_delivered(&mut self, pkt: &Delivered, rs: &mut RateSample) {
+        if rs.prior_delivered == 0 || sent_after(pkt.time_sent, pkt.seq, self.first_sent_ts, rs.seq)
+        {
+            rs.prior_delivered = pkt.info.delivered;
+            rs.prior_timestamp = Some(pkt.info.delivered_ts);
+            rs.is_app_limited = pkt.info.is_app_limited;
+            rs.seq = pkt.seq;
+            self.first_sent_ts = pkt.time_sent;
+            rs.interval_ms = ms_delta(self.first_sent_ts, pkt.info.first_sent_ts);
         }
-        None
     }
 
-    /// Generate rate sample after all ACKs in batch processed.
-    /// C reference: udx__rate_gen()
-    ///
-    /// delivered = stream_delivered - prior_delivered
-    /// snd_ms = stream_first_sent_ts - acked_pkt_first_sent_ts
-    /// ack_ms = stream_delivered_ts - acked_pkt_delivered_ts
-    /// interval_ms = max(snd_ms, ack_ms)
-    /// Discards if interval < min_rtt_ms (sets delivered = 0).
+    /// C `udx__rate_gen`, after `delivered` packets were counted into
+    /// `self.delivered` and `lost` declared lost: completes `rs`. An
+    /// interval shorter than the stream's minimum RTT (`rtt_min`, C
+    /// `udx_rtt_min`) is discarded (`interval_ms` 0).
     pub(crate) fn generate(
         &mut self,
-        stream_delivered: u32,
-        stream_first_sent_ts: Instant,
-        stream_delivered_ts: Instant,
-        min_rtt_ms: u32,
-        lost_count: u32,
-        delivered_count: u32,
-    ) -> &RateSample {
-        self.current.losses = lost_count;
-        self.current.acked_sacked = delivered_count;
-
-        let (prior_ts, prior_first_sent) = match (
-            self.current.prior_timestamp,
-            self.current.prior_first_sent_ts,
-        ) {
-            (Some(ts), Some(fst)) => (ts, fst),
-            _ => {
-                self.current.delivered = 0;
-                self.current.interval_ms = 0;
-                return &self.current;
-            }
-        };
-
-        self.current.delivered = stream_delivered.saturating_sub(self.current.prior_delivered);
-
-        // snd_ms = stream.first_sent_ts - acked_pkt.first_sent_ts
-        let snd_dur = stream_first_sent_ts
-            .checked_duration_since(prior_first_sent)
-            .unwrap_or(Duration::ZERO);
-        let snd_ms = if snd_dur.is_zero() {
-            0
-        } else {
-            (snd_dur.as_millis() as u32).max(1)
-        };
-
-        // ack_ms = stream.delivered_ts - acked_pkt.delivered_ts
-        let ack_dur = stream_delivered_ts
-            .checked_duration_since(prior_ts)
-            .unwrap_or(Duration::ZERO);
-        let ack_ms = if ack_dur.is_zero() {
-            0
-        } else {
-            (ack_dur.as_millis() as u32).max(1)
-        };
-
-        self.current.interval_ms = snd_ms.max(ack_ms);
-
-        // Discard if interval < min_rtt (too small to be meaningful)
-        if self.current.interval_ms < min_rtt_ms {
-            self.current.delivered = 0;
-            self.current.interval_ms = 0;
-            return &self.current;
+        delivered: u32,
+        lost: u32,
+        rtt_min: u32,
+        now_ms: u64,
+        rs: &mut RateSample,
+    ) {
+        // The app-limited bubble is ACKed and gone.
+        if self.app_limited != 0 && (self.delivered.wrapping_sub(self.app_limited) as i32) > 0 {
+            self.app_limited = 0;
         }
-
-        let rate_delivered = self.rate_delivered;
-        let rate_interval_ms = self.rate_interval_ms;
-        if !self.current.is_app_limited
-            || (self.current.delivered as u64 * rate_interval_ms as u64
-                >= rate_delivered as u64 * self.current.interval_ms as u64)
+        if delivered > 0 {
+            self.delivered_ts = now_ms;
+        }
+        rs.acked_sacked = delivered;
+        rs.losses = lost;
+        let Some(prior_timestamp) = rs.prior_timestamp else {
+            rs.delivered = 0;
+            rs.interval_ms = 0;
+            return;
+        };
+        rs.delivered = self.delivered.wrapping_sub(rs.prior_delivered);
+        let snd_ms = rs.interval_ms;
+        let ack_ms = ms_delta(now_ms, prior_timestamp);
+        rs.interval_ms = snd_ms.max(ack_ms);
+        if rs.interval_ms < rtt_min {
+            rs.interval_ms = 0;
+            return;
+        }
+        if !rs.is_app_limited
+            || u64::from(rs.delivered) * u64::from(self.rate_interval_ms)
+                >= u64::from(self.rate_delivered) * u64::from(rs.interval_ms)
         {
-            self.rate_delivered = self.current.delivered;
-            self.rate_interval_ms = self.current.interval_ms;
+            self.rate_delivered = rs.delivered;
+            self.rate_interval_ms = rs.interval_ms;
         }
-
-        &self.current
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
-    #[test]
-    fn test_on_packet_sent_captures_state() {
-        let now = Instant::now();
-        let info = RateState::on_packet_sent(5, now, now, false);
-        assert_eq!(info.delivered, 5);
-        assert!(!info.is_app_limited);
-    }
-
-    #[test]
-    fn test_on_packet_delivered_picks_highest() {
-        let now = Instant::now();
-        let mut rs = RateState::new();
-
-        let info1 = PacketRateInfo {
-            first_sent_ts: now,
-            delivered_ts: now,
-            delivered: 3,
+    fn info(first_sent_ts: u64, delivered_ts: u64, delivered: u32) -> PacketRateInfo {
+        PacketRateInfo {
+            first_sent_ts,
+            delivered_ts,
+            delivered,
             is_app_limited: false,
-        };
-        let info2 = PacketRateInfo {
-            first_sent_ts: now,
-            delivered_ts: now,
-            delivered: 7,
-            is_app_limited: true,
-        };
-
-        rs.on_packet_delivered(&info1, now, 0);
-        rs.on_packet_delivered(&info2, now, 0);
-        assert_eq!(rs.current.prior_delivered, 7);
-        assert!(rs.current.is_app_limited);
+        }
     }
 
     #[test]
-    fn test_generate_correct_interval() {
-        let t0 = Instant::now();
-        let t10 = t0 + Duration::from_millis(10);
+    fn pkt_sent_starts_a_flight_only_from_nothing_outstanding() {
+        let mut rate = RateState::new(0);
+        rate.delivered = 5;
+        let first = rate.pkt_sent(true, 10);
+        assert_eq!(
+            (first.first_sent_ts, first.delivered_ts, first.delivered),
+            (10, 10, 5)
+        );
+        let next = rate.pkt_sent(false, 12);
+        assert_eq!((next.first_sent_ts, next.delivered_ts), (10, 10));
+    }
 
-        let mut rs = RateState::new();
-
-        // Packet sent at t0 with delivered=0
-        let pkt_info = PacketRateInfo {
-            first_sent_ts: t0,
-            delivered_ts: t0,
-            delivered: 0,
-            is_app_limited: false,
+    /// C `udx__rate_pkt_delivered`: the most recently *sent* packet wins,
+    /// and the send interval runs from its flight's start to its send time.
+    #[test]
+    fn newest_sent_packet_gives_the_sample() {
+        let mut rate = RateState::new(0);
+        let mut rs = RateSample::new(5);
+        let late = Delivered {
+            seq: 4,
+            time_sent: 30,
+            info: info(10, 10, 7),
         };
-        rs.on_packet_delivered(&pkt_info, t0, 0);
-
-        // At t10: stream has delivered=1
-        let sample = rs.generate(1, t10, t10, 5, 0, 1);
-
-        assert_eq!(sample.delivered, 1);
-        assert_eq!(sample.interval_ms, 10);
+        let early = Delivered {
+            seq: 3,
+            time_sent: 20,
+            info: info(10, 10, 6),
+        };
+        rate.pkt_delivered(&late, &mut rs);
+        rate.pkt_delivered(&early, &mut rs);
+        assert_eq!((rs.prior_delivered, rs.interval_ms), (7, 20));
     }
 
     #[test]
-    fn test_generate_discards_sub_rtt() {
-        let t0 = Instant::now();
-        let t2 = t0 + Duration::from_millis(2);
+    fn gen_takes_the_longer_of_send_and_ack_intervals() {
+        let mut rate = RateState::new(0);
+        let mut rs = RateSample::new(5);
+        rate.pkt_delivered(
+            &Delivered {
+                seq: 0,
+                time_sent: 2,
+                info: info(0, 0, 0),
+            },
+            &mut rs,
+        );
+        rate.delivered = 1;
+        rate.generate(1, 0, 5, 10, &mut rs);
+        assert_eq!((rs.delivered, rs.interval_ms), (1, 10));
+        assert_eq!(rate.delivered_ts, 10);
+    }
 
-        let mut rs = RateState::new();
-
-        let pkt_info = PacketRateInfo {
-            first_sent_ts: t0,
-            delivered_ts: t0,
-            delivered: 0,
-            is_app_limited: false,
-        };
-        rs.on_packet_delivered(&pkt_info, t0, 0);
-
-        // interval=2ms < min_rtt=5ms → discard
-        let sample = rs.generate(1, t2, t2, 5, 0, 1);
-        assert_eq!(sample.delivered, 0);
+    /// A short interval is discarded, but the sample keeps its delivered
+    /// count (C clears only `interval_ms`), which ends BBR's idle restart.
+    #[test]
+    fn short_interval_is_discarded_but_keeps_delivered() {
+        let mut rate = RateState::new(0);
+        let mut rs = RateSample::new(1);
+        rate.pkt_delivered(
+            &Delivered {
+                seq: 0,
+                time_sent: 0,
+                info: info(0, 0, 0),
+            },
+            &mut rs,
+        );
+        rate.delivered = 1;
+        rate.generate(1, 0, 5, 2, &mut rs);
+        assert_eq!((rs.delivered, rs.interval_ms), (1, 0));
     }
 
     #[test]
-    fn test_generate_no_prior() {
-        let now = Instant::now();
-        let mut rs = RateState::new();
-        // No on_packet_delivered called → no prior timestamps
-        let sample = rs.generate(10, now, now, 5, 0, 10);
-        assert_eq!(sample.delivered, 0);
-        assert_eq!(sample.interval_ms, 0);
+    fn no_delivered_packet_means_no_sample() {
+        let mut rate = RateState::new(0);
+        let mut rs = RateSample::new(0);
+        rate.generate(0, 1, 5, 10, &mut rs);
+        assert_eq!((rs.delivered, rs.interval_ms, rs.losses), (0, 0, 1));
     }
 }

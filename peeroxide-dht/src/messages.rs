@@ -137,7 +137,8 @@ fn encode_ipv4_array(state: &mut State, peers: &[Ipv4Peer]) -> Result<(), Encodi
 
 fn decode_ipv4_array(state: &mut State) -> Result<Vec<Ipv4Peer>, EncodingError> {
     let len = compact_encoding::decode_uint(state)? as usize;
-    if len > 1048576 {
+    let max_from_bytes = state.end.saturating_sub(state.start) / 6;
+    if len > max_from_bytes {
         return Err(EncodingError::ArrayTooLarge(len));
     }
     let mut peers = Vec::with_capacity(len);
@@ -286,8 +287,7 @@ pub fn decode_message(buf: &[u8]) -> Result<Message, EncodingError> {
     }
 
     let type_version = buf[0];
-    let version = type_version & 0x0F;
-    if version != VERSION {
+    if type_version != REQUEST_ID && type_version != RESPONSE_ID {
         return Err(EncodingError::InvalidIpFamily(type_version));
     }
 
@@ -568,6 +568,22 @@ mod tests {
     #[test]
     fn decode_wrong_version_fails() {
         assert!(decode_message(&[0x01]).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_non_response_type() {
+        let mut bytes = encode_response_to_bytes(&make_test_response()).unwrap();
+        bytes[0] = 0x23;
+        assert!(decode_message(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_closer_nodes_larger_than_packet() {
+        let mut bytes = encode_response_to_bytes(&make_test_response()).unwrap();
+        bytes[1] |= FLAG_INTERNAL_OR_CLOSER;
+        bytes.push(0xfe);
+        bytes.extend_from_slice(&1_048_576u32.to_le_bytes());
+        assert!(decode_message(&bytes).is_err());
     }
 
     #[test]

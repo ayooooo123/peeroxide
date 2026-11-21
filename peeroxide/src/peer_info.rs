@@ -125,10 +125,7 @@ impl PeerInfo {
 
     /// Returns `true` if this peer is eligible for garbage collection.
     pub fn should_gc(&self) -> bool {
-        if self.banned || self.queued || self.explicit || self.waiting {
-            return false;
-        }
-        self.topics.is_empty()
+        !self.banned && !self.queued && !self.connecting && !self.explicit && !self.waiting
     }
 
     /// Returns `true` if this peer is in a retry-backoff waiting period.
@@ -212,10 +209,10 @@ mod tests {
     }
 
     #[test]
-    fn should_gc_with_topics() {
+    fn should_gc_with_topics_after_connection_close() {
         let mut info = PeerInfo::new([0u8; 32], vec![]);
         info.topics.push([1u8; 32]);
-        assert!(!info.should_gc());
+        assert!(info.should_gc());
     }
 
     #[test]

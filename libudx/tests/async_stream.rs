@@ -238,3 +238,31 @@ async fn async_stream_tokio_copy() {
     })
     .await;
 }
+
+/// S4: dropping a connected async stream sends DESTROY like C
+/// `udx_stream_destroy`, so the peer's read ends with an error at once
+/// instead of waiting for its own timeouts.
+#[tokio::test]
+async fn dropping_async_stream_resets_the_peer() {
+    let runtime = common::create_runtime();
+    let (stream_a, mut stream_b, _socket_a, _socket_b) =
+        common::create_connected_pair(&runtime).await;
+    let mut async_a = stream_a.into_async_stream();
+    async_a.write_all(b"last words").await.expect("write");
+    drop(async_a);
+
+    let read = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        loop {
+            match stream_b.read().await {
+                Ok(Some(_)) => continue,
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("peer read did not end promptly");
+    match read {
+        Err(libudx::UdxError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+        other => panic!("expected a reset, got {other:?}"),
+    }
+}

@@ -15,12 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SecretStream::remote_handle` exposes libudx's `UdxStreamRemote` for the connection's UDX stream.
 - `ConnectOpts::relay_through` and `ServerConfig::relay_through` race blind relay pairing with a direct path and migrate the same encrypted stream when the punch lands.
 - `HyperDhtServer::take_connections` lets an actor own server controls and connection publication; `ServerConfig::for_swarm` applies hyperswarm's randomized-NAT relay policy.
+- `AnnounceMessage::lookup` (flag bit 16). `announce` sets it when the node's lookup reply had no peers, as hyperdht does. **Breaking** for struct literals: the struct is not `#[non_exhaustive]`, so they must set the new field.
+- `DhtHandle::reachable()` and `DhtHandle::randomized()`: dht-rpc's `!firewalled` and `randomized`.
+- `HyperDhtError::TooFewNodesResponded` and `HyperDhtError::RemoteNotHolepunchable`.
+- `HyperDhtServer::listen_in_background` and `HyperDhtServer::resume_in_background`: like `listen` and `resume`, but the first announce runs in the server's announce task, so the call returns without a DHT round trip.
+- `HyperDhtError::HolepunchProbeTimeout` and `HyperDhtError::HolepunchDoubleRandomizedNats` (hyperdht `HOLEPUNCH_PROBE_TIMEOUT`, `HOLEPUNCH_DOUBLE_RANDOMIZED_NATS`).
+- `HyperDhtError::RemoteAborted` and `HyperDhtError::RemoteNotHolepunching` (hyperdht `REMOTE_ABORTED`, `REMOTE_NOT_HOLEPUNCHING`).
+- `HyperDhtHandle::validate_local_addresses` (hyperdht `validateLocalAddresses`).
+- Secret-stream keep-alive (Node `setKeepAlive` / `sendKeepAlive`): `SecretStream::keep_alive_handle` and `SecretStreamWriteHalf::keep_alive_handle` return a cloneable `SecretStreamKeepAlive` whose `send_keep_alive()` writes one empty encrypted message through the stream's encryptor and write side, serialized with normal writes; a handle taken before `into_split` keeps working on the write half, and it holds the stream only weakly. `SecretStream::set_keep_alive(interval)` sends one whenever `interval` passes without a write. `SecretStreamError::Closed` reports a dropped or failed stream.
+- `HyperDhtConfig::connection_keep_alive` (default `DEFAULT_CONNECTION_KEEP_ALIVE`, 5000 ms; `None` = Node `connectionKeepAlive: false`).
 
 ### Changed
 
 - **Breaking:** `HyperDhtHandle::register_server` takes the server's public key instead of its target and also serves the server's own record to `FIND_PEER`/`LOOKUP` (Node `server.listen()` → `dht._router.set(target, { record })`). Previously a node that was itself the closest to its server — or the only DHT node, as a relay in a local testnet is — answered `PEER_NOT_FOUND` for its own key.
 - Secretstream encrypts directly into its final wire buffer instead of allocating and copying an intermediate ciphertext.
 - Secretstream's Poly1305 MAC hashes the message in place with the multi-block (AVX2) path instead of copying it into a padded buffer and hashing one block at a time.
+- A reachable client whose address the DHT knows says `FIREWALL_OPEN` in its handshake (hyperdht `connect.js:441`) and, when a relayed server can punch, waits up to 10 s for the server to dial it instead of punching (`connect.js:243-245`); no dial fails with `HolepunchAborted`.
+- Every connection made by `connect` (and `establish_stream`) or accepted by a server now sends an empty keep-alive message after 5000 ms without a write, as hyperdht does (`keepAlive: dht.connectionKeepAlive`), so a dead peer is found by the UDX retransmit timeout. `HyperDhtConfig` implements `Default` by hand to set it.
+- `SecretStream::read` is cancel-safe: a partly read frame survives a dropped `read` future (Protomux drops it whenever it writes). A pending `read` also writes requested keep-alives.
+
+### Deprecated
+
+- `run_server` and `ServerSession`: use `HyperDhtServer` (`HyperDhtHandle::create_server`). `run_server` now only answers handshakes with a Noise reply; it advertises no addresses, answers no holepunch round and keeps no per-peer state. The legacy holepunch path behind it is gone.
 
 ### Fixed
 
@@ -35,6 +51,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dropping a holepuncher now aborts its receive adapters and releases every unclaimed birthday socket, including on a successful connection's early return; a connected stream retains only its chosen socket.
 - Connected punch events carry the winning socket, so a probe on a non-primary birthday socket keeps and uses that exact UDP port.
 - Socket holders abort their datagram routers on drop. Busy passive punches without a relay immediately close their socket; rejected legacy punches cannot restart after the budget becomes available.
+- Replies that arrive on a puncher socket no longer feed the main node's NAT sampler, and the puncher samples `reply.to` (our own mapping) instead of the server's address. Both made consistent NATs report `firewall = 3`.
+- Handshake payloads say only `FIREWALL_OPEN` or `FIREWALL_UNKNOWN`; punch replies report the puncher's own NAT class; a reachable node's puncher starts `OPEN`.
+- A LOOKUP reply, peer array or relay array whose count the remaining bytes cannot hold is a decode error before any allocation. Payload varints are sized correctly, so an abort with `round >= 253` no longer panics the server loop.
+- A low-TTL holepunch probe restores the socket TTL, so a stream that lands on that socket keeps the normal TTL.
+- `Router` forwards are capped at 65536 entries and expired entries are collected every 800 s.
+- A non-relayed handshake dials the exact address it was sent to; public picks use `isBogon`.
+- Behind the same public host the client pings the server's LAN address (non-reserved, best subnet match) while it punches, and takes whichever path answers first (hyperdht 6.36 `connect.js:248-276`). Before, the LAN address replaced the punch, so a silent LAN address failed the connect.
+- A punch with no strategy fails at once with `RemoteNotHolepunchable` instead of waiting 30 s. Probe rounds carry `remote_address`; the punch round does not. Payloads advertise `reusable_socket: false`.
+- `announce`, `immutable_put` and `mutable_put` do not re-send the LOOKUP/GET as a commit; they send the writes concurrently, fail with `TooFewNodesResponded` when none succeeds, and announce relays only nodes whose ANNOUNCE succeeded.
+- Requests parked behind the congestion window have no timer and are sent once. A query request timeout removes the node from the routing table; liveness pings walk the whole table; DOWN_HINT checks are capped at 10.
+- Secret-stream session setup after a handshake is bounded at 15 s.
+- `connect` sends one Noise handshake to its candidate nodes concurrently (3 at once for relay hints, 2 afterwards), keeps the first valid reply and punches once, instead of a full handshake and punch per candidate in series.
+- Holepunch rounds leave the puncher socket, and a low-TTL packet opens our NAT toward the server before the first probe. The puncher binds to the DHT host, and a loopback-bound puncher advertises only loopback.
+- NAT auto-sampling makes one more pass over unvisited nodes when fewer than four samples land, pings with a 2 s budget, and settles `analyze` when it ends; `analyze(true)` rerolls the puncher socket up to three times as hyperdht `_reopen` does.
+- A request sent from a puncher socket keeps dht-rpc's normal retries and resends from that same socket; it carries no node `id` (dht-rpc sends `id` only from the server socket). NAT sample pings still send once.
+- A firewalled client no longer advertises its reflexive address in the handshake, and advertises local interfaces only with `local_connection`, as hyperdht `connectThroughNode` does. The reflexive 127.0.0.1 address made a hyperdht server take its LAN shortcut, which stages no puncher and answers no holepunch round.
+- `connect` checks Noise inside each candidate attempt; a reply that fails Noise no longer wins the race.
+- The client's punch follows hyperdht `probeRound`/`roundPunch`: one probe through the server's relay pair, a second only when the server's NAT is still unknown or it sent no token, and the whole probe again after a socket reroll. Probes no longer carry a random token; the punch round carries `token(serverAddress)` and the server's token. A class that stays unknown fails with `HolepunchProbeTimeout`, two random NATs with `HolepunchDoubleRandomizedNats`; only these two exits send the server an ABORTED payload, as in npm.
+- An error in any round's reply fails with `RemoteAborted` (TRY_LATER retries only during a punch round with a relay); a punch reply that does not say `punching` fails with `RemoteNotHolepunching`. Neither sends ABORTED.
+- Holepunch rounds name the server address (`peerAddress`) for the relay, and probe through the server's announce relay we came through, else its first one (hyperdht `pickServerRelay`), so a server that sends its token only through its own relays still gets its token echoed.
+- Puncher sockets hand DHT requests to the node, as hyperdht's socket pool does, so a round forwarded to a server's puncher socket is answered.
+- Local addresses in handshakes and holepunch payloads are advertised only after a socket bound to that host hears its own packet within 500 ms; the verdict per host is cached.
+- A DHT request that reaches a puncher socket is answered from that socket, as dht-rpc answers on `req.socket`, and a server's holepunch answer to a round that came in there leaves it too.
+- A server that accepts a direct (non-relayed) handshake waits for the client's dial on both of its DHT sockets instead of dialling from one of them; the client dials the exact socket its handshake went to, as in npm, so the two sides no longer disagree on the server's port.
+- A client punch that fails at the probe (`HolepunchProbeTimeout`, `HolepunchDoubleRandomizedNats`) sends the server an ABORTED holepunch payload first (hyperdht `connect.js` `abort`), so the server drops its staged puncher at once.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-dht-v1.7.3...peeroxide-dht-v1.7.4) - 2026-11-02
 

@@ -7,12 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (review 2026-11-15)
+
+- A stream closes by itself once both sides have ended and everything it sent is ACKed (C `close_stream` on `UDX_STREAM_ALL_ENDED`): `closed()`, `is_alive()` and the close notification report it while the owner still holds the stream. By then every write has completed and the peer's data and EOF are queued for the reader, which may not have read them yet; they stay readable after the close. DATA arriving after the peer's END is dropped (C `SHOULD_READ`). The side that ended first answers the peer's ACK of its END with one more ACK and then keeps a TIMEWAIT entry for its id for 5 s (C `stream_timewait`): a late DATA or END gets the final ACK from the stream's last socket to its last remote, other packets are ignored, and nothing reaches whatever had the id. A new stream may take an id in TIMEWAIT, as in C. Dropping or destroying a closed stream sends no DESTROY.
+- Writes are cut into packets at send time (C `send_new_packet`): the payload size is that of the MTU when the packet leaves, so data queued before an MTU probe succeeds or before `change_remote` goes out at the new size (the new path's base MTU after `change_remote`, C udx.c:2634), for the current peer, with the current ACK. Small writes queued together share a packet, and the FIN rides on the last data packet when they leave together (DATA|END, as C sends). Sequence numbers are taken at send time; each write still completes in order once its last packet is cumulatively ACKed. An empty `UdxStream::write` completes with the next packet sent, as in C; an empty `poll_write` queues nothing.
+- BBR, rate sampling and pacing now follow `udx_bbr.c` / `udx_rate.c` without the differences the previous release listed: the first flight is paced (25000-byte bucket, rate seeded from the initial window); `on_rto` keeps `full_bw_reached`; a transmit start after idle re-paces ProbeBW at gain 1 and ends a finished ProbeRTT dwell, and it runs when a packet leaves with nothing in flight; the rate sample takes the RACK RTT of the newest delivered packet, its interval from that packet's send time, and is discarded against the stream's RACK minimum RTT; ProbeRTT dwells 200 ms from the first ACK with at most 4 in flight plus a round, then restores `prior_cwnd` and returns to Startup unless the pipe was full; cycle phase and ACK-aggregation epochs run on `delivered_ts`; recovery and loss end when the cumulative ACK passes the first seq unsent at their start. Also as C: BBR runs on every ACK that finds data in flight, an isolated MTU-probe loss opens no recovery, the app-limited check reads bytes written and not yet ACKed, and an MTU change no longer rescales `cwnd`.
+- As C: packets found lost by an ACK are retransmitted under the window before that ACK's BBR update (C `rack_detect_loss` ends with `send_packets`), so recovery starts with every lost packet resent; MTU probes are counted when sent and only while probing the current path, so an old-path probe lost after `change_remote` costs the new path nothing; a write landing on an idle stream behind a zero window sends a zero-window probe at once instead of after one RTO.
+
 ### Added
 
+- `UdxStream::set_keepalive` / `UdxAsyncStream::set_keepalive` (C `udx_stream_set_keepalive`): idle heartbeat interval, default 5 s (the hyperdht value; was a fixed 1 s); `None` turns it off. With keepalive on, a stream that hears nothing from its peer for six intervals ends with `TimedOut`.
+- Tail loss probe (C `udx_tlp_timeout`, RACK §7): a lost last packet is resent after about two RTTs instead of the ≥1 s RTO.
+- Zero-window probe (C `udx_zwp_timeout`): a peer advertising a zero window is probed with a heartbeat at the RTO, then every two RTOs.
 - `UdxRuntime::create_random_stream`: atomically selects and reserves a collision-free nonzero ID across shared runtimes.
 - `UdxStreamAbort::closed` / `UdxAsyncStream::closed`: race-free close notification supporting multiple observers both before and after stream closure.
 - `UdxStream::local_id`: accessor for the local stream identifier.
 - `UdxStreamRemote` (`UdxStream::remote_handle` / `UdxAsyncStream::remote_handle`): `change_remote` moves a connected stream to another peer and socket with C libudx semantics (in-flight packets keep their destination, completion once they are ACKed, MTU search restarted, no MTU probes while changing); `remote_observed` resolves when the peer reaches us on the new path; `try_send` sends an unreliable message (Node `rawStream.trySend`).
+- `UdxStreamRemote::recv_message`: receives the peer's unreliable messages (C `on_recv`, Node `rawStream.on('message')`); up to 64 unread ones are kept.
+- RACK reorder window and reorder timer (C `rack_update_reo_wnd`, `udx_rack_reo_timeout`): a packet the peer receives out of order within a quarter of the minimum RTT is no longer resent nor counted as a loss; a real loss is found when the window ends, without waiting for another ACK.
+
+### Changed (review 2026-11-14, second pass)
+
+- RTT is sampled on every delivered packet, SACKed ones included (C `ack_packet`), and a sample longer than 5 s and than `srtt + 5 × rttvar` (a suspend) counts as that bound (C `clamp_rtt`).
+- An RTO no longer doubles `rto`: the timer re-arms at twice `rto` and the stream gives up on the seventh firing without progress (C `udx_rto_timeout`); it used to give up on the sixth with `rto` doubling each time. RTO loss marking uses the RACK RTT and reorder window, as C.
+- BBR follows `udx_bbr.c` more closely: the bandwidth filter ages its runners-up like `win_filter_f64.c`, discarded rate samples start no round, startup growth stops at the target once ten packets are delivered, the pacing rate is at least 1 byte/ms, seeded from the window at the first RTT sample and only grows until the pipe is full, and a sender with a retransmit waiting is not app-limited. The remaining differences are listed in `congestion/bbr.rs`.
+
+### Fixed (review 2026-11-14, second pass)
+
+- A packet SACKed and then cumulatively ACKed counted as delivered twice for BBR.
+- A BBR pacing rate below 1 byte/ms rounded to 0, which meant "unpaced".
+
+### Changed (review 2026-11-14)
+
+- MTU values are IP packet sizes as in C (`effective_mtu` included): at the 1200 base an IPv4 packet carries 1152 payload bytes (IPv6 1132), probes are IP sizes starting with a 1200 confirmation probe, the search starts at the first ACK and tops out at a 1500-byte IP packet.
+- Retransmissions (RTO and fast retransmit) leave through the paced send path under the congestion window, lost packets first; an RTO sets `cwnd` to the packets still in flight plus one (C `udx_rto_timeout`). The per-packet retransmit tasks are gone.
+- A window-limited sender waits for an ACK, the RTO or a zero-window probe instead of polling every millisecond; a non-zero peer window always allows one packet (C `send_rwnd_in_packets`).
+- ACKs and heartbeats carry the stream's next sequence number (C `udx_write_header`).
+- Dropping a connected, non-relay `UdxAsyncStream` sends what is queued, then DESTROY (C `udx_stream_destroy`).
+- A stream destroyed by its peer or ended by a timeout reports `ConnectionReset` / `TimedOut` to its reader once (`UdxStream::read` returns `Err`, `UdxAsyncStream::poll_read` an `io::Error`), as C closes it with that error; a clean FIN still reads as EOF.
+- On Linux/Android a GSO send refused with `EMSGSIZE` is resent one datagram at a time and steps the MTU back below that size.
+
+### Fixed (review 2026-11-14)
+
+- Relay legs forwarding to each other no longer lock each other's stream (deadlock on a multi-thread runtime); a leg reads its target's published endpoint.
+- A cumulative ACK beyond the first unsent sequence number is ignored (C udx.c:1738) instead of clearing the send buffer and completing writes.
+- Out-of-order receive buffer bounded by the advertised window; SACK blocks kept incrementally (O(ranges) per packet); receive-side sequence comparisons wrap (a packet with `seq = u32::MAX` panicked debug builds).
+- The socket receive loop continues after a recoverable receive error (C udx.c:1950).
+- A panicking stream processor still terminates its stream.
+- Per-stream incoming packet queue bounded (1024 packets, dropped when full).
+- A stream holds the socket it sends on, so the socket keeps receiving after the caller drops its last handle (a holepunch socket after a relay-to-direct `change_remote`); C streams hold their `udx_socket_t`.
 
 ### Changed
 

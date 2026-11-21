@@ -13,6 +13,7 @@
 #![allow(missing_docs)]
 #![deny(clippy::all)]
 
+use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -66,7 +67,7 @@ impl Default for PersistentConfig {
         Self {
             max_records: 65536,
             max_record_age: Duration::from_secs(20 * 60),
-            max_per_key: 20,
+            max_per_key: usize::MAX,
             max_lru_size: 65536,
             max_lru_age: Duration::from_secs(20 * 60),
         }
@@ -108,139 +109,112 @@ struct RecordEntry {
 
 // ── RecordCache ───────────────────────────────────────────────────────────────
 
-/// LRU-style cache for peer announcement records, keyed by topic hex.
+/// Two-generation cache for peer announcement records, keyed by topic hex.
 pub struct RecordCache {
-    entries: HashMap<String, Vec<RecordEntry>>,
+    fresh: HashMap<String, Vec<RecordEntry>>,
+    stale: HashMap<String, Vec<RecordEntry>>,
+    fresh_count: usize,
+    stale_count: usize,
     max_size: usize,
     max_age: Duration,
-    max_per_key: usize,
-    total: usize,
 }
 
 impl RecordCache {
-    pub fn new(max_size: usize, max_age: Duration, max_per_key: usize) -> Self {
+    pub fn new(max_size: usize, max_age: Duration, _max_per_key: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            fresh: HashMap::new(),
+            stale: HashMap::new(),
+            fresh_count: 0,
+            stale_count: 0,
             max_size,
             max_age,
-            max_per_key,
-            total: 0,
         }
     }
 
     pub fn add(&mut self, key: &str, public_key: [u8; 32], record: Vec<u8>) {
-        let key_str = key.to_string();
-
-        if let Some(existing) = self
-            .entries
-            .get_mut(&key_str)
-            .and_then(|b| b.iter_mut().find(|e| e.public_key == public_key))
-        {
-            existing.record = record;
-            existing.inserted_at = Instant::now();
-            return;
+        self.stale_count -= Self::remove_from(&mut self.stale, key, &public_key);
+        self.fresh_count -= Self::remove_from(&mut self.fresh, key, &public_key);
+        if self.fresh_count + self.stale_count >= self.max_size {
+            self.stale = std::mem::take(&mut self.fresh);
+            self.stale_count = self.fresh_count;
+            self.fresh_count = 0;
         }
-
-        let bucket_len = self.entries.get(&key_str).map_or(0, |b| b.len());
-        if bucket_len >= self.max_per_key {
-            if let Some(oldest_idx) = self.entries.get(&key_str).and_then(|b| {
-                b.iter()
-                    .enumerate()
-                    .min_by_key(|(_, e)| e.inserted_at)
-                    .map(|(i, _)| i)
-            }) {
-                self.entries.get_mut(&key_str).map(|b| b.remove(oldest_idx));
-                self.total = self.total.saturating_sub(1);
-            }
-        }
-
-        if self.total >= self.max_size {
-            self.evict_oldest();
-        }
-
-        self.entries.entry(key_str).or_default().push(RecordEntry {
-            public_key,
-            record,
-            inserted_at: Instant::now(),
-        });
-        self.total += 1;
+        self.fresh
+            .entry(key.to_owned())
+            .or_default()
+            .push(RecordEntry {
+                public_key,
+                record,
+                inserted_at: Instant::now(),
+            });
+        self.fresh_count += 1;
     }
 
     /// Remove the record for `(key, public_key)`.
     pub fn remove(&mut self, key: &str, public_key: &[u8; 32]) {
-        if let Some(bucket) = self.entries.get_mut(key) {
-            let before = bucket.len();
-            bucket.retain(|e| &e.public_key != public_key);
-            let removed = before - bucket.len();
-            self.total = self.total.saturating_sub(removed);
-            if bucket.is_empty() {
-                self.entries.remove(key);
-            }
-        }
+        self.fresh_count -= Self::remove_from(&mut self.fresh, key, public_key);
+        self.stale_count -= Self::remove_from(&mut self.stale, key, public_key);
     }
 
-    /// Get up to `max` live records for `key`.
+    /// Get a random sample of up to `max` live records for `key`.
     pub fn get(&mut self, key: &str, max: usize) -> Vec<Vec<u8>> {
         let now = Instant::now();
-        let max_age = self.max_age;
-
-        if let Some(bucket) = self.entries.get_mut(key) {
+        let mut records = Vec::new();
+        if let Some(bucket) = self.fresh.get_mut(key) {
             let before = bucket.len();
-            bucket.retain(|e| now.duration_since(e.inserted_at) < max_age);
-            let removed = before - bucket.len();
-            self.total = self.total.saturating_sub(removed);
-
-            bucket.iter().take(max).map(|e| e.record.clone()).collect()
-        } else {
-            vec![]
+            bucket.retain(|entry| now.duration_since(entry.inserted_at) < self.max_age);
+            self.fresh_count -= before - bucket.len();
+            records.extend(bucket.iter().map(|entry| entry.record.clone()));
         }
+        if let Some(bucket) = self.stale.get_mut(key) {
+            let before = bucket.len();
+            bucket.retain(|entry| now.duration_since(entry.inserted_at) < self.max_age);
+            self.stale_count -= before - bucket.len();
+            records.extend(bucket.iter().map(|entry| entry.record.clone()));
+        }
+        records.shuffle(&mut rand::rng());
+        records.truncate(max);
+        records
     }
 
     /// Evict all entries.
     pub fn destroy(&mut self) {
-        self.entries.clear();
-        self.total = 0;
+        self.fresh.clear();
+        self.stale.clear();
+        self.fresh_count = 0;
+        self.stale_count = 0;
     }
 
     pub fn record_count(&self) -> usize {
-        self.total
+        self.fresh_count + self.stale_count
     }
 
     pub fn topic_count(&self) -> usize {
-        self.entries.len()
+        self.fresh
+            .keys()
+            .chain(self.stale.keys())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
     }
 
-    fn evict_oldest(&mut self) {
-        // Find the globally oldest entry.
-        let oldest_key = self
-            .entries
-            .iter()
-            .filter_map(|(k, bucket)| {
-                bucket
-                    .iter()
-                    .map(|e| e.inserted_at)
-                    .min()
-                    .map(|t| (k.clone(), t))
-            })
-            .min_by_key(|(_, t)| *t)
-            .map(|(k, _)| k);
-
-        if let Some(k) = oldest_key {
-            if let Some(bucket) = self.entries.get_mut(&k) {
-                if let Some(oldest_idx) = bucket
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, e)| e.inserted_at)
-                    .map(|(i, _)| i)
-                {
-                    bucket.remove(oldest_idx);
-                    self.total = self.total.saturating_sub(1);
-                }
-                if bucket.is_empty() {
-                    self.entries.remove(&k);
-                }
-            }
+    fn remove_from(
+        entries: &mut HashMap<String, Vec<RecordEntry>>,
+        key: &str,
+        public_key: &[u8; 32],
+    ) -> usize {
+        let mut removed = 0;
+        let empty = if let Some(bucket) = entries.get_mut(key) {
+            let before = bucket.len();
+            bucket.retain(|entry| &entry.public_key != public_key);
+            removed = before - bucket.len();
+            bucket.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            entries.remove(key);
         }
+        removed
     }
 }
 
@@ -251,9 +225,11 @@ struct CacheEntry {
     inserted_at: Instant,
 }
 
-/// Simple TTL cache for mutable/immutable data and bump timestamps.
+/// Two-generation TTL cache for mutable data, immutable data, and router state.
 pub struct LruCache {
-    entries: HashMap<String, CacheEntry>,
+    latest: HashMap<String, CacheEntry>,
+    oldest: HashMap<String, CacheEntry>,
+    retained: HashMap<String, CacheEntry>,
     max_size: usize,
     max_age: Duration,
 }
@@ -261,7 +237,9 @@ pub struct LruCache {
 impl LruCache {
     pub fn new(max_size: usize, max_age: Duration) -> Self {
         Self {
-            entries: HashMap::new(),
+            latest: HashMap::new(),
+            oldest: HashMap::new(),
+            retained: HashMap::new(),
             max_size,
             max_age,
         }
@@ -269,28 +247,73 @@ impl LruCache {
 
     /// Get a live value, returning `None` if absent or expired.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let entry = self.entries.get(key)?;
-        if Instant::now().duration_since(entry.inserted_at) >= self.max_age {
-            return None;
+        if let Some(entry) = self.retained.get(key) {
+            return Some(entry.value.clone());
         }
-        Some(entry.value.clone())
+        let entry = self.latest.get(key).or_else(|| self.oldest.get(key))?;
+        (self.max_age.is_zero() || Instant::now().duration_since(entry.inserted_at) < self.max_age)
+            .then(|| entry.value.clone())
     }
 
-    /// Insert or replace a value.
-    pub fn set(&mut self, key: impl Into<String>, value: Vec<u8>) {
-        // Evict oldest if at capacity (simple: drop a random entry).
-        if self.entries.len() >= self.max_size {
-            if let Some(oldest_key) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.inserted_at)
-                .map(|(k, _)| k.clone())
-            {
-                self.entries.remove(&oldest_key);
-            }
+    /// Get a live value and promote an old-generation hit.
+    pub fn get_promoting(&mut self, key: &str) -> Option<Vec<u8>> {
+        if let Some(entry) = self.retained.get(key) {
+            return Some(entry.value.clone());
         }
-        self.entries.insert(
-            key.into(),
+        if let Some(entry) = self.oldest.remove(key) {
+            if self.max_age.is_zero()
+                || Instant::now().duration_since(entry.inserted_at) < self.max_age
+            {
+                let value = entry.value.clone();
+                self.latest.insert(
+                    key.to_owned(),
+                    CacheEntry {
+                        value: entry.value,
+                        inserted_at: Instant::now(),
+                    },
+                );
+                return Some(value);
+            }
+            return None;
+        }
+        let entry = self.latest.get_mut(key)?;
+        if self.max_age.is_zero() || Instant::now().duration_since(entry.inserted_at) < self.max_age
+        {
+            entry.inserted_at = Instant::now();
+            return Some(entry.value.clone());
+        }
+        None
+    }
+
+    /// Insert or replace an evictable value.
+    pub fn set(&mut self, key: impl Into<String>, value: Vec<u8>) {
+        let key = key.into();
+        if self.retained.contains_key(&key) {
+            return;
+        }
+        self.latest.remove(&key);
+        self.oldest.remove(&key);
+        if self.max_size == 0 {
+            return;
+        }
+        if self.latest.len() + self.oldest.len() >= self.max_size {
+            self.oldest = std::mem::take(&mut self.latest);
+        }
+        self.latest.insert(
+            key,
+            CacheEntry {
+                value,
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Insert or replace a local value that cache eviction must not remove.
+    pub fn retain(&mut self, key: impl Into<String>, value: Vec<u8>) {
+        let key = key.into();
+        self.delete(&key);
+        self.retained.insert(
+            key,
             CacheEntry {
                 value,
                 inserted_at: Instant::now(),
@@ -299,19 +322,23 @@ impl LruCache {
     }
 
     pub fn delete(&mut self, key: &str) {
-        self.entries.remove(key);
+        self.latest.remove(key);
+        self.oldest.remove(key);
+        self.retained.remove(key);
     }
 
     pub fn destroy(&mut self) {
-        self.entries.clear();
+        self.latest.clear();
+        self.oldest.clear();
+        self.retained.clear();
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.latest.len() + self.oldest.len() + self.retained.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 }
 
@@ -337,7 +364,7 @@ pub struct Persistent {
     mutables: LruCache,
     immutables: LruCache,
     /// Self-announce records keyed by hex target (Node `dht._router` records).
-    router: HashMap<String, Vec<u8>>,
+    router: LruCache,
 }
 
 impl Persistent {
@@ -352,7 +379,7 @@ impl Persistent {
             refreshes: LruCache::new(config.max_lru_size, config.max_lru_age),
             mutables: LruCache::new(config.max_lru_size, config.max_lru_age),
             immutables: LruCache::new(config.max_lru_size, config.max_lru_age),
-            router: HashMap::new(),
+            router: LruCache::new(config.max_lru_size, config.max_lru_age),
         }
     }
 
@@ -361,21 +388,21 @@ impl Persistent {
     pub fn set_local_record(&mut self, target: &[u8; 32], record: Option<Vec<u8>>) {
         let key = to_hex(target);
         match record {
-            Some(record) => self.router.insert(key, record),
-            None => self.router.remove(&key),
+            Some(record) => self.router.retain(key, record),
+            None => self.router.delete(&key),
         };
     }
 
     // ── FIND_PEER ─────────────────────────────────────────────────────────────
 
     /// Handle an incoming FIND_PEER request.
-    pub fn on_find_peer(&self, req: &IncomingHyperRequest) -> HandlerReply {
+    pub fn on_find_peer(&mut self, req: &IncomingHyperRequest) -> HandlerReply {
         let target = match &req.target {
             Some(t) => t,
             None => return HandlerReply::Silent,
         };
 
-        HandlerReply::Value(self.router.get(&to_hex(target)).cloned())
+        HandlerReply::Value(self.router.get_promoting(&to_hex(target)))
     }
 
     // ── LOOKUP ────────────────────────────────────────────────────────────────
@@ -397,14 +424,14 @@ impl Persistent {
 
         // Append self-announce from router if we haven't hit the max.
         if peers.len() < MAX_RECORDS_PER_LOOKUP {
-            if let Some(record) = self.router.get(&key) {
-                if let Ok(peer) = crate::hyperdht_messages::decode_hyper_peer_from_bytes(record) {
+            if let Some(record) = self.router.get_promoting(&key) {
+                if let Ok(peer) = crate::hyperdht_messages::decode_hyper_peer_from_bytes(&record) {
                     peers.push(peer);
                 }
             }
         }
 
-        let bump_bytes = self.bumps.get(&key);
+        let bump_bytes = self.bumps.get_promoting(&key);
         let bump: u64 = bump_bytes
             .as_deref()
             .and_then(|b| {
@@ -442,19 +469,51 @@ impl Persistent {
             None => return HandlerReply::Silent,
         };
 
-        let mut msg = match decode_announce_from_bytes(&value) {
+        let msg = match decode_announce_from_bytes(&value) {
             Ok(m) => m,
             Err(_) => return HandlerReply::Silent,
         };
 
-        // Handle refresh: if no peer but refresh token exists, restore peer from cache.
+        // Refresh announces restore a saved record and are not signed.
         if msg.peer.is_none() {
-            if let Some(refresh) = &msg.refresh {
-                let refresh_key = to_hex(refresh);
-                if let Some(stored) = self.refreshes.get(&refresh_key) {
-                    msg.peer = crate::hyperdht_messages::decode_hyper_peer_from_bytes(&stored).ok();
-                }
+            let refresh = match &msg.refresh {
+                Some(refresh) => refresh,
+                None => return HandlerReply::Silent,
+            };
+            let refresh_key = to_hex(hash(refresh));
+            let stored = match self.refreshes.get_promoting(&refresh_key) {
+                Some(stored) => stored,
+                None => return HandlerReply::Silent,
+            };
+            let target_bytes = match stored.get(..32) {
+                Some(target_bytes) => target_bytes,
+                None => return HandlerReply::Silent,
+            };
+            let announce_self = match stored.get(32) {
+                Some(announce_self) => *announce_self != 0,
+                None => return HandlerReply::Silent,
+            };
+            let record = match stored.get(33..) {
+                Some(record) => record,
+                None => return HandlerReply::Silent,
+            };
+            let peer = match crate::hyperdht_messages::decode_hyper_peer_from_bytes(record) {
+                Ok(peer) => peer,
+                Err(_) => return HandlerReply::Silent,
+            };
+            let mut original_target = [0u8; 32];
+            original_target.copy_from_slice(target_bytes);
+            let target_key = to_hex(original_target);
+            if announce_self {
+                self.router.set(target_key.clone(), record.to_vec());
+                self.records.remove(&target_key, &peer.public_key);
+            } else {
+                self.records
+                    .add(&target_key, peer.public_key, record.to_vec());
             }
+            self.refreshes.delete(&refresh_key);
+            self.refreshes.set(to_hex(refresh), stored);
+            return HandlerReply::ValueNoToken(None);
         }
 
         let peer = match &msg.peer {
@@ -500,7 +559,7 @@ impl Persistent {
                 Ok(b) => b,
                 Err(_) => return HandlerReply::Silent,
             };
-            self.router.insert(target_key.clone(), encoded);
+            self.router.set(target_key.clone(), encoded);
             self.records.remove(&target_key, &stored_peer.public_key);
         } else {
             let encoded = match encode_hyper_peer_to_bytes(&stored_peer) {
@@ -510,21 +569,43 @@ impl Persistent {
             self.records
                 .add(&target_key, stored_peer.public_key, encoded);
 
-            // Update bump if message has a bump.
+            // Update bump only when it advances and is close to the local clock.
             if msg.bump != 0 {
-                let mut bump_state = crate::compact_encoding::State::new();
-                crate::compact_encoding::preencode_uint(&mut bump_state, msg.bump);
-                bump_state.alloc();
-                crate::compact_encoding::encode_uint(&mut bump_state, msg.bump);
-                self.bumps.set(target_key.clone(), bump_state.buffer);
+                let current_bump = self
+                    .bumps
+                    .get_promoting(&target_key)
+                    .and_then(|b| decode_uint(&mut State::from_buffer(&b)).ok())
+                    .unwrap_or(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_millis() as u64);
+                if msg.bump > current_bump && msg.bump <= now.saturating_add(60_000) {
+                    let mut bump_state = crate::compact_encoding::State::new();
+                    crate::compact_encoding::preencode_uint(&mut bump_state, msg.bump);
+                    bump_state.alloc();
+                    crate::compact_encoding::encode_uint(&mut bump_state, msg.bump);
+                    self.bumps.set(target_key.clone(), bump_state.buffer);
+                }
             }
         }
 
-        // Store refresh token if present.
+        // Store refresh state under the raw refresh token. Refresh requests
+        // hash their token to find this entry and then re-key it raw.
         if let Some(refresh) = &msg.refresh {
-            let refresh_key = to_hex(refresh);
             let peer_bytes = encode_hyper_peer_to_bytes(&stored_peer).unwrap_or_default();
-            self.refreshes.set(refresh_key, peer_bytes);
+            let mut refresh_record = Vec::with_capacity(33 + peer_bytes.len());
+            refresh_record.extend_from_slice(&target);
+            refresh_record.push(u8::from(announce_self));
+            refresh_record.extend_from_slice(&peer_bytes);
+            self.refreshes.set(to_hex(refresh), refresh_record);
+        }
+
+        if msg.lookup {
+            return match self.on_lookup(req) {
+                HandlerReply::Value(value) => HandlerReply::ValueNoToken(value),
+                HandlerReply::Silent => HandlerReply::ValueNoToken(None),
+                _ => HandlerReply::ValueNoToken(None),
+            };
         }
 
         HandlerReply::ValueNoToken(None)
@@ -589,7 +670,9 @@ impl Persistent {
 
         let target_key = to_hex(target);
         self.records.remove(&target_key, &peer.public_key);
-        self.router.remove(&target_key);
+        if hash(&peer.public_key) == target {
+            self.router.delete(&target_key);
+        }
 
         HandlerReply::ValueNoToken(None)
     }
@@ -630,9 +713,9 @@ impl Persistent {
         let target_key = to_hex(target);
 
         // Check seq against existing stored value.
-        if let Some(existing_bytes) = self.mutables.get(&target_key) {
+        if let Some(existing_bytes) = self.mutables.get_promoting(&target_key) {
             if let Ok(existing) = decode_mutable_get_response_from_bytes(&existing_bytes) {
-                if existing.seq == put.seq {
+                if existing.seq == put.seq && existing.value != put.value {
                     return HandlerReply::Error(SEQ_REUSED);
                 }
                 if existing.seq > put.seq {
@@ -659,7 +742,7 @@ impl Persistent {
     // ── MUTABLE_GET ───────────────────────────────────────────────────────────
 
     /// Handle an incoming MUTABLE_GET request.
-    pub fn on_mutable_get(&self, req: &IncomingHyperRequest) -> HandlerReply {
+    pub fn on_mutable_get(&mut self, req: &IncomingHyperRequest) -> HandlerReply {
         let target = match &req.target {
             Some(t) => t,
             None => return HandlerReply::Silent,
@@ -677,7 +760,7 @@ impl Persistent {
         };
 
         let target_key = to_hex(target);
-        if let Some(stored_bytes) = self.mutables.get(&target_key) {
+        if let Some(stored_bytes) = self.mutables.get_promoting(&target_key) {
             if let Ok(stored) = decode_mutable_get_response_from_bytes(&stored_bytes) {
                 if stored.seq >= requested_seq {
                     return HandlerReply::Value(Some(stored_bytes));
@@ -719,14 +802,14 @@ impl Persistent {
     // ── IMMUTABLE_GET ────────────────────────────────────────────────────────
 
     /// Handle an incoming IMMUTABLE_GET request.
-    pub fn on_immutable_get(&self, req: &IncomingHyperRequest) -> HandlerReply {
+    pub fn on_immutable_get(&mut self, req: &IncomingHyperRequest) -> HandlerReply {
         let target = match &req.target {
             Some(t) => t,
             None => return HandlerReply::Silent,
         };
 
         let target_key = to_hex(target);
-        HandlerReply::Value(self.immutables.get(&target_key))
+        HandlerReply::Value(self.immutables.get_promoting(&target_key))
     }
 
     pub fn stats(&self) -> PersistentStats {
@@ -745,7 +828,7 @@ impl Persistent {
         self.refreshes.destroy();
         self.mutables.destroy();
         self.immutables.destroy();
-        self.router.clear();
+        self.router.destroy();
     }
 }
 
@@ -818,13 +901,31 @@ mod tests {
     }
 
     #[test]
-    fn record_cache_max_per_key() {
+    fn record_cache_has_no_per_topic_limit() {
         let mut cache = RecordCache::new(1000, Duration::from_secs(60), 3);
         for i in 0u8..5 {
             cache.add("topic1", [i; 32], vec![i]);
         }
-        let records = cache.get("topic1", 10);
-        assert!(records.len() <= 3);
+        assert_eq!(cache.get("topic1", 10).len(), 5);
+    }
+
+    #[test]
+    fn record_cache_returns_twenty_of_thirty_records() {
+        let mut cache = RecordCache::new(100, Duration::from_secs(60), 20);
+        for i in 0u8..30 {
+            cache.add("topic", [i; 32], vec![i]);
+        }
+        assert_eq!(cache.record_count(), 30);
+        assert_eq!(cache.get("topic", MAX_RECORDS_PER_LOOKUP).len(), 20);
+    }
+
+    #[test]
+    fn router_cache_stays_bounded() {
+        let mut persistent = make_persistent();
+        for i in 0u64..70_000 {
+            persistent.router.set(format!("{i:064x}"), vec![0]);
+        }
+        assert!(persistent.stats().router_entries <= 65_536);
     }
 
     #[test]
@@ -866,6 +967,43 @@ mod tests {
         assert_eq!(cache.get("k1"), None);
     }
 
+    #[test]
+    fn retained_record_does_not_expire_and_cannot_be_replaced() {
+        let mut cache = LruCache::new(100, Duration::from_nanos(1));
+        cache.retain("local", b"retained".to_vec());
+        cache.set("local", b"remote".to_vec());
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(cache.get("local"), Some(b"retained".to_vec()));
+        assert_eq!(cache.get_promoting("local"), Some(b"retained".to_vec()));
+        cache.set("remote", b"evictable".to_vec());
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(cache.get("remote"), None);
+    }
+
+    #[test]
+    fn lru_cache_promotes_old_generation_hits() {
+        let mut cache = LruCache::new(1, Duration::from_secs(60));
+        cache.set("old", b"old".to_vec());
+        cache.set("new", b"new".to_vec());
+        assert!(cache.oldest.contains_key("old"));
+        assert_eq!(cache.get_promoting("old"), Some(b"old".to_vec()));
+        assert!(cache.latest.contains_key("old"));
+        assert!(!cache.oldest.contains_key("old"));
+    }
+
+    #[test]
+    fn lru_cache_hot_reads_refresh_age() {
+        // 150 ms reads against a 400 ms age: a busy machine has 250 ms of slack per read.
+        let mut cache = LruCache::new(100, Duration::from_millis(400));
+        cache.set("hot", b"hot".to_vec());
+        cache.set("cold", b"cold".to_vec());
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(150));
+            assert_eq!(cache.get_promoting("hot"), Some(b"hot".to_vec()));
+        }
+        assert_eq!(cache.get_promoting("cold"), None);
+    }
+
     // ── on_lookup tests ───────────────────────────────────────────────────────
 
     #[test]
@@ -894,6 +1032,161 @@ mod tests {
             id: None,
         };
         matches!(p.on_lookup(&req), HandlerReply::Value(None));
+    }
+
+    #[test]
+    fn announce_lookup_returns_existing_peer() {
+        let mut persistent = make_persistent();
+        let target = [9u8; 32];
+        let (existing_key, _) = make_keypair();
+        let existing = HyperPeer {
+            public_key: existing_key,
+            relay_addresses: vec![],
+        };
+        persistent.records.add(
+            &to_hex(target),
+            existing_key,
+            encode_hyper_peer_to_bytes(&existing).unwrap(),
+        );
+
+        let seed = [0x43u8; 32];
+        let signing_key = SigningKey::from_bytes(&seed);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let mut secret = [0u8; 64];
+        secret[..32].copy_from_slice(&seed);
+        secret[32..].copy_from_slice(&public_key);
+        let peer = HyperPeer {
+            public_key,
+            relay_addresses: vec![],
+        };
+        let token = [4u8; 32];
+        let peer_bytes = encode_hyper_peer_to_bytes(&peer).unwrap();
+        let signature = crate::crypto::sign_detached(
+            &ann_signable(&target, &token, &[0u8; 32], &peer_bytes, &[], &NS_ANNOUNCE),
+            &secret,
+        );
+        let value = crate::hyperdht_messages::encode_announce_to_bytes(
+            &crate::hyperdht_messages::AnnounceMessage {
+                peer: Some(peer),
+                refresh: None,
+                signature: Some(signature),
+                bump: 0,
+                lookup: true,
+            },
+        )
+        .unwrap();
+        let request = IncomingHyperRequest {
+            command: crate::hyperdht_messages::ANNOUNCE,
+            target: Some(target),
+            token: Some(token),
+            value: Some(value),
+            from: dummy_peer(),
+            id: None,
+        };
+        assert!(matches!(
+            persistent.on_announce(&request, &[0u8; 32]),
+            HandlerReply::ValueNoToken(Some(_))
+        ));
+    }
+
+    #[test]
+    fn refresh_chain_restores_original_target_only() {
+        let mut persistent = make_persistent();
+        let original_target = [1u8; 32];
+        let other_target = [2u8; 32];
+        let t2 = [4u8; 32];
+        let t1 = hash(&t2);
+        let r0 = hash(&t1);
+
+        let seed = [0x43u8; 32];
+        let signing_key = SigningKey::from_bytes(&seed);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let mut secret = [0u8; 64];
+        secret[..32].copy_from_slice(&seed);
+        secret[32..].copy_from_slice(&public_key);
+        let peer = HyperPeer {
+            public_key,
+            relay_addresses: vec![],
+        };
+        let token = [5u8; 32];
+        let peer_bytes = encode_hyper_peer_to_bytes(&peer).unwrap();
+        let signature = crate::crypto::sign_detached(
+            &ann_signable(
+                &original_target,
+                &token,
+                &[0u8; 32],
+                &peer_bytes,
+                &r0,
+                &NS_ANNOUNCE,
+            ),
+            &secret,
+        );
+        let initial = IncomingHyperRequest {
+            command: crate::hyperdht_messages::ANNOUNCE,
+            target: Some(original_target),
+            token: Some(token),
+            value: Some(
+                crate::hyperdht_messages::encode_announce_to_bytes(
+                    &crate::hyperdht_messages::AnnounceMessage {
+                        peer: Some(peer.clone()),
+                        refresh: Some(r0),
+                        signature: Some(signature),
+                        bump: 0,
+                        lookup: false,
+                    },
+                )
+                .unwrap(),
+            ),
+            from: dummy_peer(),
+            id: None,
+        };
+        assert!(matches!(
+            persistent.on_announce(&initial, &[0u8; 32]),
+            HandlerReply::ValueNoToken(None)
+        ));
+        persistent
+            .records
+            .remove(&to_hex(original_target), &public_key);
+
+        let refresh = |target, token| IncomingHyperRequest {
+            command: crate::hyperdht_messages::ANNOUNCE,
+            target: Some(target),
+            token: Some([6u8; 32]),
+            value: Some(
+                crate::hyperdht_messages::encode_announce_to_bytes(
+                    &crate::hyperdht_messages::AnnounceMessage {
+                        peer: None,
+                        refresh: Some(token),
+                        signature: None,
+                        bump: 0,
+                        lookup: false,
+                    },
+                )
+                .unwrap(),
+            ),
+            from: dummy_peer(),
+            id: None,
+        };
+        assert!(matches!(
+            persistent.on_announce(&refresh(other_target, t1), &[0u8; 32]),
+            HandlerReply::ValueNoToken(None)
+        ));
+        assert_eq!(
+            persistent.records.get(&to_hex(original_target), 10).len(),
+            1
+        );
+        assert!(persistent.records.get(&to_hex(other_target), 10).is_empty());
+        persistent
+            .records
+            .remove(&to_hex(original_target), &public_key);
+        assert!(matches!(
+            persistent.on_announce(&refresh(other_target, t2), &[0u8; 32]),
+            HandlerReply::ValueNoToken(None)
+        ));
+        assert!(matches!(
+            persistent.on_announce(&refresh(other_target, [8u8; 32]), &[0u8; 32]),
+            HandlerReply::Silent
+        ));
     }
 
     // ── on_immutable_put/get round-trip ───────────────────────────────────────
@@ -1072,7 +1365,7 @@ mod tests {
         p.on_mutable_put(&req(put_with_seq(5)));
         assert!(matches!(
             p.on_mutable_put(&req(put_with_seq(5))),
-            HandlerReply::Error(16)
+            HandlerReply::Value(None)
         ));
     }
 
@@ -1094,6 +1387,7 @@ mod tests {
             refresh: None,
             signature: Some([0xffu8; 64]),
             bump: 0,
+            lookup: false,
         };
         let ann_bytes = crate::hyperdht_messages::encode_announce_to_bytes(&ann).unwrap();
 
@@ -1109,6 +1403,72 @@ mod tests {
         assert!(matches!(
             p.on_announce(&req, &node_id),
             HandlerReply::Silent
+        ));
+    }
+
+    #[test]
+    fn unannounce_for_other_key_keeps_router_record() {
+        let mut persistent = make_persistent();
+        let (owner, _) = make_keypair();
+        let target = hash(&owner);
+        persistent.set_local_record(&target, Some(b"local".to_vec()));
+
+        let seed = [0x43u8; 32];
+        let signing_key = SigningKey::from_bytes(&seed);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let mut secret = [0u8; 64];
+        secret[..32].copy_from_slice(&seed);
+        secret[32..].copy_from_slice(&public_key);
+        let peer = HyperPeer {
+            public_key,
+            relay_addresses: vec![],
+        };
+        let token = [7u8; 32];
+        let peer_bytes = encode_hyper_peer_to_bytes(&peer).unwrap();
+        let signature = crate::crypto::sign_detached(
+            &ann_signable(
+                &target,
+                &token,
+                &[0u8; 32],
+                &peer_bytes,
+                &[],
+                &NS_UNANNOUNCE,
+            ),
+            &secret,
+        );
+        let value = crate::hyperdht_messages::encode_announce_to_bytes(
+            &crate::hyperdht_messages::AnnounceMessage {
+                peer: Some(peer),
+                refresh: None,
+                signature: Some(signature),
+                bump: 0,
+                lookup: false,
+            },
+        )
+        .unwrap();
+        let request = IncomingHyperRequest {
+            command: crate::hyperdht_messages::UNANNOUNCE,
+            target: Some(target),
+            token: Some(token),
+            value: Some(value),
+            from: dummy_peer(),
+            id: None,
+        };
+        assert!(matches!(
+            persistent.on_unannounce(&request, &[0u8; 32]),
+            HandlerReply::ValueNoToken(None)
+        ));
+        let find = IncomingHyperRequest {
+            command: crate::hyperdht_messages::FIND_PEER,
+            target: Some(target),
+            token: None,
+            value: None,
+            from: dummy_peer(),
+            id: None,
+        };
+        assert!(matches!(
+            persistent.on_find_peer(&find),
+            HandlerReply::Value(Some(value)) if value == b"local"
         ));
     }
 

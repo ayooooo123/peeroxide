@@ -198,14 +198,28 @@ pub struct TimeoutEvent {
 
 // ── Private types ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ReplyContext {
     pub(crate) socket_kind: SocketKind,
+    /// The socket the request arrived on when it is none of ours (a
+    /// puncher socket); the reply leaves it, as dht-rpc replies on
+    /// `req.socket`.
+    pub(crate) via: Option<UdxSocket>,
+}
+
+impl std::fmt::Debug for ReplyContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplyContext")
+            .field("socket_kind", &self.socket_kind)
+            .field("via", &self.via.is_some())
+            .finish()
+    }
 }
 
 /// Bundled parameters for `send_reply_internal` to stay under clippy's argument limit.
 struct ReplyInternalParams {
     socket_kind: SocketKind,
+    via: Option<UdxSocket>,
     tid: u16,
     target: Option<NodeId>,
     error: u64,
@@ -222,6 +236,8 @@ struct InflightEntry {
     target: Option<NodeId>,
     buffer: Vec<u8>,
     socket_kind: SocketKind,
+    /// Socket other than ours the request (and every retry) leaves from.
+    socket: Option<UdxSocket>,
     sent: u32,
     retries: u32,
     deadline: Instant,
@@ -476,7 +492,7 @@ impl Io {
                 ?socket_kind,
                 "IO::recv raw datagram"
             );
-            if let Some(event) = self.process_datagram(datagram, socket_kind) {
+            if let Some(event) = self.process_datagram(datagram, socket_kind, None) {
                 return Some(event);
             }
         }
@@ -515,9 +531,12 @@ impl Io {
 
     /// Return the earliest deadline across all inflight requests.
     /// Returns a far-future instant if there are no inflight requests.
+    /// Requests parked behind the congestion window (`sent == 0`) have no
+    /// timer until `drain` sends them (dht-rpc `io.js` `send`/`_sendNow`).
     pub fn next_timeout_deadline(&self) -> Instant {
         self.inflight
             .iter()
+            .filter(|e| e.sent > 0)
             .map(|e| e.deadline)
             .min()
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600))
@@ -531,7 +550,7 @@ impl Io {
         let mut retry_indices: Vec<usize> = Vec::new();
 
         for (i, entry) in self.inflight.iter().enumerate() {
-            if entry.deadline <= now {
+            if entry.sent > 0 && entry.deadline <= now {
                 if entry.sent > entry.retries {
                     timeout_indices.push(i);
                 } else {
@@ -569,6 +588,18 @@ impl Io {
     /// Returns the assigned TID, or `None` if the IO is destroying or the
     /// destination address is invalid.
     pub fn create_request(&mut self, params: RequestParams) -> Option<u16> {
+        self.create_request_on(params, None)
+    }
+
+    /// `create_request`, optionally leaving from `socket` (dht-rpc
+    /// `request(..., { socket })`). The entry keeps that socket, so retries
+    /// leave from it too. `id` is sent only from our server socket, as
+    /// dht-rpc `_encodeRequest` does.
+    fn create_request_on(
+        &mut self,
+        params: RequestParams,
+        socket: Option<UdxSocket>,
+    ) -> Option<u16> {
         if self.destroying || self.suspended {
             return None;
         }
@@ -585,7 +616,7 @@ impl Io {
             SocketKind::Server
         };
 
-        let include_id = !self.ephemeral && socket_kind == SocketKind::Server;
+        let include_id = !self.ephemeral && socket_kind == SocketKind::Server && socket.is_none();
         let id = if include_id {
             self.table.lock().ok().map(|t| *t.id())
         } else {
@@ -627,6 +658,7 @@ impl Io {
             target: params.target,
             buffer,
             socket_kind,
+            socket,
             sent: 0,
             retries: params.retries.unwrap_or(DEFAULT_RETRIES),
             deadline: now + timeout,
@@ -657,110 +689,46 @@ impl Io {
         Some(tid)
     }
 
-    /// Send a one-shot DHT request out an arbitrary UDP socket (typically a
-    /// puncher socket). The TID is allocated from the shared registry so the
-    /// reply still matches via the existing inflight machinery, but no
-    /// automatic retry will fire — we don't own the override socket beyond
-    /// this call. Replies must be forwarded back through
+    /// Send a DHT request out another UDP socket (a puncher socket). The
+    /// TID comes from the shared registry so the reply matches through the
+    /// normal inflight path; retries follow `params.retries` and leave from
+    /// the same socket, as dht-rpc does for `request(..., { socket })`.
+    /// Replies must be forwarded back through
     /// [`Self::handle_inbound_reply_bytes`].
     pub fn send_request_via_socket(
         &mut self,
         params: RequestParams,
         socket: &UdxSocket,
     ) -> Option<u16> {
-        if self.destroying || self.suspended {
-            return None;
-        }
-
-        let addr_str = format!("{}:{}", params.to.host, params.to.port);
-        let addr: SocketAddr = addr_str.parse().ok()?;
-
-        let tid = self.tid;
-        self.tid = self.tid.wrapping_add(1);
-
-        let include_id = !self.ephemeral;
-        let id = if include_id {
-            self.table.lock().ok().map(|t| *t.id())
-        } else {
-            None
-        };
-
-        let request = messages::Request {
-            tid,
-            to: params.to.clone(),
-            id,
-            token: params.token,
-            internal: params.internal,
-            command: params.command,
-            target: params.target,
-            value: params.value,
-        };
-
-        let buffer = match messages::encode_request_to_bytes(&request) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(err = %e, "send_request_via_socket: encode failed");
-                return None;
-            }
-        };
-
-        let buffer_len = buffer.len() as u64;
-        if let Err(e) = socket.send_to(&buffer, addr) {
-            tracing::warn!(err = %e, "send_request_via_socket: send_to failed");
-            return None;
-        }
-        self.wire
-            .bytes_sent
-            .fetch_add(buffer_len, Ordering::Relaxed);
-
-        self.stats.active += 1;
-        self.stats.total += 1;
-
-        let now = Instant::now();
-        let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-
-        self.inflight.push(InflightEntry {
-            tid,
-            to: params.to,
-            addr,
-            internal: params.internal,
-            command: params.command,
-            target: params.target,
-            buffer,
-            socket_kind: SocketKind::Client,
-            sent: 1,
-            retries: 0,
-            deadline: now + timeout,
-            timestamp: now,
-            timeout,
-        });
-
-        Some(tid)
+        self.create_request_on(params, Some(socket.clone()))
     }
 
-    /// Inject reply bytes received on a non-`Io`-owned socket (puncher
-    /// socket) into the response-matching path. The actor calls this when
-    /// a `DhtCommand::InboundReplyBytes` arrives from the puncher-socket
+    /// Inject bytes received on a non-`Io`-owned socket (puncher socket)
+    /// as if they arrived on the client socket: replies match their
+    /// request, and a request is answered from `socket` (dht-rpc replies
+    /// on `req.socket`). The actor calls this when a
+    /// `DhtCommand::InboundReplyBytes` arrives from the puncher-socket
     /// demux task.
     pub fn handle_inbound_reply_bytes(
         &mut self,
         addr: SocketAddr,
         data: Vec<u8>,
+        socket: UdxSocket,
     ) -> Option<IoEvent> {
         self.wire
             .bytes_received
             .fetch_add(data.len() as u64, Ordering::Relaxed);
-        self.process_datagram(Datagram { data, addr }, SocketKind::Client)
+        self.process_datagram(Datagram { data, addr }, SocketKind::Client, Some(socket))
     }
 
     /// Send a reply to an incoming request.
     pub fn send_reply(&mut self, req: &IncomingRequest, error: u64, value: Option<&[u8]>) {
-        let socket_kind = req.reply_ctx.socket_kind;
         let include_token = error == 0;
         self.send_reply_internal(
             &req.from,
             ReplyInternalParams {
-                socket_kind,
+                socket_kind: req.reply_ctx.socket_kind,
+                via: req.reply_ctx.via.clone(),
                 tid: req.tid,
                 target: req.target,
                 error,
@@ -786,6 +754,7 @@ impl Io {
             to,
             ReplyInternalParams {
                 socket_kind: ctx.socket_kind,
+                via: ctx.via,
                 tid,
                 target,
                 error,
@@ -944,6 +913,7 @@ impl Io {
             to,
             ReplyInternalParams {
                 socket_kind,
+                via: None,
                 tid,
                 target,
                 error: 0,
@@ -1038,9 +1008,10 @@ impl Io {
             }
         };
 
-        let socket = match params.socket_kind {
-            SocketKind::Client => &self.client_socket,
-            SocketKind::Server => &self.server_socket,
+        let socket = match (&params.via, params.socket_kind) {
+            (Some(via), _) => via,
+            (None, SocketKind::Client) => &self.client_socket,
+            (None, SocketKind::Server) => &self.server_socket,
         };
 
         let bytes_len = bytes.len() as u64;
@@ -1053,18 +1024,24 @@ impl Io {
 
     /// Actually send the inflight entry at index `idx`.
     fn send_inflight_at(&mut self, idx: usize) {
-        let (buffer, addr, socket_kind) = {
+        let (buffer, addr, socket_kind, other) = {
             let entry = &mut self.inflight[idx];
             entry.sent += 1;
             entry.deadline = Instant::now() + entry.timeout;
-            (entry.buffer.clone(), entry.addr, entry.socket_kind)
+            (
+                entry.buffer.clone(),
+                entry.addr,
+                entry.socket_kind,
+                entry.socket.clone(),
+            )
         };
 
         self.congestion.send();
 
-        let socket = match socket_kind {
-            SocketKind::Client => &self.client_socket,
-            SocketKind::Server => &self.server_socket,
+        let socket = match (&other, socket_kind) {
+            (Some(socket), _) => socket,
+            (None, SocketKind::Client) => &self.client_socket,
+            (None, SocketKind::Server) => &self.server_socket,
         };
 
         let buffer_len = buffer.len() as u64;
@@ -1078,7 +1055,12 @@ impl Io {
     }
 
     /// Decode and dispatch a datagram from either socket.
-    fn process_datagram(&mut self, datagram: Datagram, socket_kind: SocketKind) -> Option<IoEvent> {
+    fn process_datagram(
+        &mut self,
+        datagram: Datagram,
+        socket_kind: SocketKind,
+        via: Option<UdxSocket>,
+    ) -> Option<IoEvent> {
         if datagram.data.len() < 2 {
             return None;
         }
@@ -1120,6 +1102,7 @@ impl Io {
                             &from_clone,
                             ReplyInternalParams {
                                 socket_kind,
+                                via,
                                 tid,
                                 target,
                                 error: ERROR_INVALID_TOKEN,
@@ -1147,7 +1130,7 @@ impl Io {
                     command: req.command,
                     target: req.target,
                     value: req.value,
-                    reply_ctx: ReplyContext { socket_kind },
+                    reply_ctx: ReplyContext { socket_kind, via },
                 }))
             }
 
@@ -1367,5 +1350,117 @@ mod tests {
         };
 
         assert!(!validate_wrong(&token));
+    }
+}
+
+#[cfg(test)]
+mod parked_request_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn parked_request_is_not_sent_by_the_timeout_path() {
+        let runtime = UdxRuntime::new().expect("runtime");
+        let table = Arc::new(Mutex::new(RoutingTable::new([0u8; 32])));
+        let mut io = Io::bind(
+            &runtime,
+            table,
+            IoConfig {
+                max_window: 1,
+                host: "127.0.0.1".to_string(),
+                ..IoConfig::default()
+            },
+        )
+        .await
+        .expect("bind");
+
+        let params = || RequestParams {
+            // Discard port: nothing answers.
+            to: Ipv4Peer {
+                host: "127.0.0.1".into(),
+                port: 9,
+            },
+            token: None,
+            internal: true,
+            command: 0,
+            target: None,
+            value: None,
+            timeout_ms: Some(10),
+            retries: Some(3),
+        };
+        io.create_request(params()).expect("first");
+        let parked = io.create_request(params()).expect("parked");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        io.check_timeouts();
+        let entry = io.inflight.iter().find(|e| e.tid == parked).expect("entry");
+        assert_eq!(
+            entry.sent, 0,
+            "a parked request has no timer and is not sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_on_another_socket_retries_from_it_without_an_id() {
+        let runtime = UdxRuntime::new().expect("runtime");
+        let table = Arc::new(Mutex::new(RoutingTable::new([7u8; 32])));
+        let mut io = Io::bind(
+            &runtime,
+            table,
+            IoConfig {
+                host: "127.0.0.1".to_string(),
+                firewalled: false,
+                ephemeral: false,
+                ..IoConfig::default()
+            },
+        )
+        .await
+        .expect("bind");
+        let puncher = runtime.create_socket().await.expect("socket");
+        puncher
+            .bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind puncher");
+        let puncher_addr = puncher.local_addr().await.expect("addr");
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let to = relay.local_addr().unwrap();
+        io.send_request_via_socket(
+            RequestParams {
+                to: Ipv4Peer {
+                    host: "127.0.0.1".into(),
+                    port: to.port(),
+                },
+                token: None,
+                internal: false,
+                command: 1,
+                target: None,
+                value: None,
+                timeout_ms: Some(10),
+                retries: Some(1),
+            },
+            &puncher,
+        )
+        .expect("sent");
+        let mut buf = [0u8; 512];
+        let wait = Duration::from_secs(2);
+        let (n, from) = tokio::time::timeout(wait, relay.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(from, puncher_addr);
+        let Ok(messages::Message::Request(req)) = messages::decode_message(&buf[..n]) else {
+            panic!("not a request");
+        };
+        assert!(
+            req.id.is_none(),
+            "dht-rpc sends `id` only from the server socket"
+        );
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(io.check_timeouts().is_empty(), "one retry is left");
+        let (_, from) = tokio::time::timeout(wait, relay.recv_from(&mut buf))
+            .await
+            .expect("the retry arrives")
+            .unwrap();
+        assert_eq!(from, puncher_addr, "the retry leaves the same socket");
     }
 }

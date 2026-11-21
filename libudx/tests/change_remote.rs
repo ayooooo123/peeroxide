@@ -33,7 +33,7 @@ async fn relay(rt: &UdxRuntime) -> (UdxStream, UdxStream, UdxSocket, SocketAddr)
     (to_a, to_b, socket, addr)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn direct_observation_waits_for_in_order_data() {
     let runtime = create_runtime();
     let (socket, addr) = create_bound_socket(&runtime).await;
@@ -74,7 +74,7 @@ async fn direct_observation_waits_for_in_order_data() {
 /// A (the initiator) learns B's direct address out of band and moves first;
 /// B notices A's packets arriving on its direct socket through the firewall
 /// hook, exactly how hyperdht's server side triggers `changeRemote`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relayed_stream_moves_to_a_direct_path_mid_transfer() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -183,7 +183,7 @@ async fn relayed_stream_moves_to_a_direct_path_mid_transfer() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn change_remote_rejects_unconnected_and_bad_targets() {
     with_timeout(Duration::from_secs(10), async {
         let rt = create_runtime();
@@ -218,7 +218,7 @@ async fn change_remote_rejects_unconnected_and_bad_targets() {
 
 /// With data in flight on a slow path, the change completes only once that
 /// data is ACKed (C defers until `seq_on_remote_changed` is acked).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn change_remote_waits_for_in_flight_packets() {
     with_timeout(Duration::from_secs(30), async {
         let rt = create_runtime();

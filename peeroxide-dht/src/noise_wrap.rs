@@ -5,6 +5,8 @@
 //!
 //! Reference: `hyperdht/lib/noise-wrap.js`.
 
+use std::fmt;
+
 use blake2::Blake2bMac;
 use blake2::digest::consts::U32;
 use blake2::digest::{KeyInit, Mac};
@@ -15,6 +17,7 @@ use crate::hyperdht_messages::{
     NoisePayload, decode_noise_payload_from_bytes, encode_noise_payload_to_bytes,
 };
 use crate::noise::{HandshakeIK, Keypair};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type Blake2bMac256 = Blake2bMac<U32>;
 
@@ -40,7 +43,7 @@ pub enum NoiseWrapError {
 // ─── Result types ────────────────────────────────────────────────────────────
 
 /// Final output after a completed NoiseWrap handshake.
-#[derive(Clone, Debug)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 #[non_exhaustive]
 pub struct NoiseWrapResult {
     /// Whether this side initiated the handshake.
@@ -55,6 +58,12 @@ pub struct NoiseWrapResult {
     pub tx: [u8; 32],
     /// Session key for inbound encrypted messages.
     pub rx: [u8; 32],
+}
+
+impl fmt::Debug for NoiseWrapResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NoiseWrapResult { is_initiator: _, remote_public_key: [REDACTED], holepunch_secret: [REDACTED], handshake_hash: [REDACTED], tx: [REDACTED], rx: [REDACTED] }")
+    }
 }
 
 // ─── NoiseWrap ───────────────────────────────────────────────────────────────
@@ -80,6 +89,9 @@ pub struct NoiseWrapResult {
 /// let m2 = nw.send(&payload)?;
 /// let result = nw.finalize()?;
 /// ```
+/// `Clone` copies the handshake state, so one sent message can be checked against several
+/// candidate replies without one reply spoiling the state for the next.
+#[derive(Clone)]
 pub struct NoiseWrap {
     handshake: HandshakeIK,
     is_initiator: bool,
@@ -240,6 +252,23 @@ mod tests {
 
         assert_eq!(init_result.holepunch_secret, resp_result.holepunch_secret);
         assert_ne!(init_result.holepunch_secret, [0u8; 32]);
+    }
+
+    #[test]
+    fn noise_wrap_result_debug_redacts_key_material() {
+        let result = NoiseWrapResult {
+            is_initiator: true,
+            remote_public_key: [0xA5; 32],
+            holepunch_secret: [0xA5; 32],
+            handshake_hash: [0xA5; 64],
+            tx: [0xA5; 32],
+            rx: [0xA5; 32],
+        };
+
+        let debug = format!("{result:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("a5"));
+        assert!(!debug.contains("165"));
     }
 
     #[test]

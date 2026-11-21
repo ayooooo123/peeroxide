@@ -10,6 +10,8 @@
 //! - `noise-handshake/hmac.js`         — HMAC-BLAKE2b (standard ipad/opad)
 //! - `noise-curve-ed/index.js`         — Ed25519 DH via SHA-512 scalar extraction
 
+use std::fmt;
+
 use blake2::digest::consts::U64;
 use blake2::{Blake2b, Digest};
 use chacha20poly1305::aead::rand_core::RngCore;
@@ -17,9 +19,10 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use curve25519_dalek::{Scalar, edwards::CompressedEdwardsY};
+use curve25519_dalek::{Scalar, edwards::CompressedEdwardsY, traits::IsIdentity};
 use ed25519_dalek::SigningKey;
 use sha2::Sha512;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 type Blake2b512 = Blake2b<U64>;
 
@@ -123,22 +126,32 @@ fn hkdf(chaining_key: &[u8; 64], input_key_material: &[u8]) -> ([u8; 64], [u8; 6
 /// `secret_key` is in libsodium 64-byte format: `seed[32] || pubkey[32]`.
 pub fn ed25519_dh(secret_key: &[u8; 64], public_key: &[u8; 32]) -> Result<[u8; 32], NoiseError> {
     // Expand the 32-byte seed via SHA-512 to obtain the scalar
-    let mut hash = Sha512::digest(&secret_key[..32]);
+    let mut hash = Zeroizing::new(Sha512::digest(&secret_key[..32]));
     // Clamping — identical to libsodium's implementation
     hash[0] &= 248;
     hash[31] &= 127;
     hash[31] |= 64;
 
-    let mut scalar_bytes = [0u8; 32];
+    let mut scalar_bytes = Zeroizing::new([0u8; 32]);
     scalar_bytes.copy_from_slice(&hash[..32]);
-    let scalar = Scalar::from_bytes_mod_order(scalar_bytes);
+    let scalar = Scalar::from_bytes_mod_order(*scalar_bytes);
 
     let compressed = CompressedEdwardsY(*public_key);
     let point = compressed
         .decompress()
+        // libsodium also refuses a non-canonical encoding (`ge25519_is_canonical`)
+        .filter(|point| {
+            point.is_torsion_free()
+                && !point.is_identity()
+                && point.compress().to_bytes() == *public_key
+        })
         .ok_or(NoiseError::InvalidPublicKey)?;
+    let shared = point * scalar;
+    if shared.is_identity() {
+        return Err(NoiseError::InvalidPublicKey);
+    }
 
-    Ok((point * scalar).compress().to_bytes())
+    Ok(shared.compress().to_bytes())
 }
 
 // ─── CipherState ──────────────────────────────────────────────────────────────
@@ -147,6 +160,7 @@ pub fn ed25519_dh(secret_key: &[u8; 64], public_key: &[u8; 32]) -> Result<[u8; 3
 ///
 /// Nonce layout (12 bytes): `[0x00; 4] || nonce.to_le_bytes()`.
 /// When no key is set, encrypt/decrypt are identity operations.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct CipherState {
     key: Option<[u8; 32]>,
     nonce: u64,
@@ -234,6 +248,7 @@ impl CipherState {
 
 /// Noise SymmetricState: tracks `ck` (chaining key), `h` (running hash),
 /// and an embedded CipherState.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct SymmetricState {
     chaining_key: [u8; 64],
     digest: [u8; 64],
@@ -317,7 +332,7 @@ impl SymmetricState {
 // ─── Public types ─────────────────────────────────────────────────────────────
 
 /// Ed25519 keypair in libsodium 64-byte format: `seed[32] || pubkey[32]`.
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Keypair {
     /// Ed25519 public key (32-byte compressed Edwards Y point).
     pub public_key: [u8; 32],
@@ -326,8 +341,14 @@ pub struct Keypair {
     pub secret_key: [u8; 64],
 }
 
+impl fmt::Debug for Keypair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Keypair { public_key: [REDACTED], secret_key: [REDACTED] }")
+    }
+}
+
 /// Session keys and metadata produced after a completed Noise XX handshake.
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 #[non_exhaustive]
 pub struct HandshakeResult {
     /// Session key for outbound messages (encrypt with this).
@@ -340,6 +361,12 @@ pub struct HandshakeResult {
     pub remote_public_key: [u8; 32],
 }
 
+impl fmt::Debug for HandshakeResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HandshakeResult { tx: [REDACTED], rx: [REDACTED], handshake_hash: [REDACTED], remote_public_key: [REDACTED] }")
+    }
+}
+
 // ─── Handshake state machine ──────────────────────────────────────────────────
 
 /// Noise XX handshake.
@@ -348,6 +375,7 @@ pub struct HandshakeResult {
 /// Initiator: send() → recv() → send()   (completes after 3rd call)
 /// Responder: recv() → send() → recv()   (completes after 3rd call)
 /// ```
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Handshake {
     is_initiator: bool,
     /// Counts completed half-steps (0–2; 3 = complete).
@@ -649,6 +677,7 @@ impl Handshake {
 /// Initiator: send(payload) → recv(payload)   (completes after recv)
 /// Responder: recv(payload) → send(payload)   (completes after send)
 /// ```
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct HandshakeIK {
     is_initiator: bool,
     step: u8,

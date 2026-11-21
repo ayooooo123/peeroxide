@@ -77,7 +77,7 @@ impl State {
         }
     }
 
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.end.saturating_sub(self.start)
     }
 
@@ -753,7 +753,7 @@ pub fn decode_uint_array(state: &mut State) -> Result<Vec<u64>> {
     if len > MAX_ARRAY_LENGTH {
         return Err(EncodingError::ArrayTooLarge(len));
     }
-    let mut arr = Vec::with_capacity(len);
+    let mut arr = Vec::with_capacity(len.min(state.remaining()));
     for _ in 0..len {
         arr.push(decode_uint(state)?);
     }
@@ -782,7 +782,7 @@ pub fn decode_buffer_array(state: &mut State) -> Result<Vec<Option<Vec<u8>>>> {
     if len > MAX_ARRAY_LENGTH {
         return Err(EncodingError::ArrayTooLarge(len));
     }
-    let mut arr = Vec::with_capacity(len);
+    let mut arr = Vec::with_capacity(len.min(state.remaining()));
     for _ in 0..len {
         arr.push(decode_buffer(state)?);
     }
@@ -811,7 +811,7 @@ pub fn decode_string_array(state: &mut State) -> Result<Vec<String>> {
     if len > MAX_ARRAY_LENGTH {
         return Err(EncodingError::ArrayTooLarge(len));
     }
-    let mut arr = Vec::with_capacity(len);
+    let mut arr = Vec::with_capacity(len.min(state.remaining()));
     for _ in 0..len {
         arr.push(decode_string(state)?);
     }

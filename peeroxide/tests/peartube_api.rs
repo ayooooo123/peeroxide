@@ -44,6 +44,13 @@ fn local_dht(bootstrap: Vec<String>, firewalled: bool) -> HyperDhtConfig {
     config
 }
 
+fn join_opts(server: bool, client: bool) -> JoinOpts {
+    let mut opts = JoinOpts::default();
+    opts.server = server;
+    opts.client = client;
+    opts
+}
+
 type SwarmParts = (
     JoinHandle<()>,
     peeroxide::SwarmHandle,
@@ -111,6 +118,33 @@ async fn next_conn(rx: &mut mpsc::Receiver<SwarmConnection>, what: &str) -> Swar
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
         .unwrap_or_else(|| panic!("{what}: connection channel closed"))
+}
+
+/// The connection each side keeps once the duplicate tie-break has settled.
+///
+/// Two peers that dial each other at once may each open their own dial before the other's
+/// arrives; hyperswarm then replaces one of them, so a side can deliver a connection that
+/// it drops again. The pair is settled when both sides are quiet and both streams are alive.
+async fn settled_pair(
+    left: &mut mpsc::Receiver<SwarmConnection>,
+    right: &mut mpsc::Receiver<SwarmConnection>,
+    what: &str,
+) -> (SwarmConnection, SwarmConnection) {
+    let mut kept_left = next_conn(left, what).await;
+    let mut kept_right = next_conn(right, what).await;
+    loop {
+        tokio::select! {
+            Some(conn) = left.recv() => kept_left = conn,
+            Some(conn) = right.recv() => kept_right = conn,
+            () = tokio::time::sleep(Duration::from_millis(500)) => {
+                if kept_left.peer.stream.abort_handle().is_alive()
+                    && kept_right.peer.stream.abort_handle().is_alive()
+                {
+                    return (kept_left, kept_right);
+                }
+            }
+        }
+    }
 }
 
 async fn no_conn_within(rx: &mut mpsc::Receiver<SwarmConnection>, what: &str, wait: Duration) {
@@ -198,6 +232,33 @@ async fn eager_spawn_queues_topics_until_bootstrap_completes() {
         Ok(())
     })
     .await;
+}
+
+#[tokio::test]
+async fn server_join_returns_before_unreachable_bootstrap_announce() {
+    let bootstrap = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bootstrap socket");
+    let mut config = SwarmConfig::default();
+    config.eager = true;
+    config.dht = local_dht(
+        vec![
+            bootstrap
+                .local_addr()
+                .expect("bootstrap address")
+                .to_string(),
+        ],
+        false,
+    );
+    let (_task, swarm, _rx) = spawn_swarm(config).await.expect("eager swarm");
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        swarm.join([0x72; 32], join_opts(true, false)),
+    )
+    .await
+    .expect("server join waited for an announce")
+    .expect("server join failed");
+    swarm.destroy().await.expect("destroy");
 }
 
 #[tokio::test]
@@ -443,6 +504,122 @@ async fn destroy_with_force_stops_the_swarm() {
             swarm.join_peer([0x11; 32]).await,
             Err(SwarmError::Destroyed)
         ));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn flush_with_zero_topics_resolves_at_once() {
+    with_timeout("empty flush", async {
+        let net = Testnet::start().await?;
+        let (_task, swarm, _rx) = net.swarm().await?;
+        tokio::time::timeout(Duration::from_secs(1), swarm.flush()).await??;
+        swarm.destroy().await?;
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn flush_after_leaving_only_topic_resolves() {
+    with_timeout("flush after leave", async {
+        let net = Testnet::start().await?;
+        let (_task, swarm, _rx) = net.swarm().await?;
+        let topic = [0xD1; 32];
+        swarm.join(topic, join_opts(false, true)).await?;
+        swarm.leave(topic).await?;
+        tokio::time::timeout(Duration::from_secs(1), swarm.flush()).await??;
+        swarm.destroy().await?;
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rejoin_client_topic_with_server_announces() {
+    with_timeout("rejoin server", async {
+        let net = Testnet::start().await?;
+        let (_task, swarm, _rx) = net.swarm().await?;
+        let topic = [0xD2; 32];
+        swarm.join(topic, join_opts(false, true)).await?;
+        swarm.join(topic, join_opts(true, false)).await?;
+        let (_looker_task, looker, _looker_rx) = net.swarm().await?;
+        wait_for("rejoined topic announce", || async {
+            lookup_contains(looker.dht(), topic, swarm.key_pair().public_key)
+                .await
+                .then_some(())
+        })
+        .await?;
+        swarm.destroy().await?;
+        looker.destroy().await?;
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn simultaneous_join_keeps_one_connection_and_reconnects() {
+    with_timeout("simultaneous join", async {
+        let net = Testnet::start().await?;
+        let (_left_task, left, mut left_connections) = net.swarm().await?;
+        let (_right_task, right, mut right_connections) = net.swarm().await?;
+        let topic = [0xD3; 32];
+        tokio::try_join!(
+            left.join(topic, JoinOpts::default()),
+            right.join(topic, JoinOpts::default())
+        )?;
+
+        let (first_left, first_right) = settled_pair(
+            &mut left_connections,
+            &mut right_connections,
+            "simultaneous connection",
+        )
+        .await;
+        assert_eq!(first_left.remote_public_key(), &right.key_pair().public_key);
+        assert_eq!(first_right.remote_public_key(), &left.key_pair().public_key);
+        assert_ne!(first_left.is_initiator, first_right.is_initiator);
+        first_left.peer.stream.abort_handle().abort();
+        drop(first_left);
+        drop(first_right);
+
+        let (second_left, second_right) = settled_pair(
+            &mut left_connections,
+            &mut right_connections,
+            "reconnection",
+        )
+        .await;
+        assert_ne!(second_left.is_initiator, second_right.is_initiator);
+        left.destroy().await?;
+        right.destroy().await?;
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn max_peers_prevents_outgoing_dial() {
+    with_timeout("max peers", async {
+        let net = Testnet::start().await?;
+        let (_server_task, server, _server_connections) = net.swarm().await?;
+        let topic = [0xD4; 32];
+        server.join(topic, join_opts(true, false)).await?;
+        server.flush().await?;
+
+        let mut config = SwarmConfig::default();
+        config.dht = local_dht(net.addrs.clone(), false);
+        config.max_peers = 0;
+        let (_client_task, client, mut client_connections) = spawn_swarm(config).await?;
+        client.join(topic, join_opts(false, true)).await?;
+        client.flush().await?;
+        no_conn_within(
+            &mut client_connections,
+            "dial at max_peers",
+            Duration::from_secs(2),
+        )
+        .await;
+        client.destroy().await?;
+        server.destroy().await?;
         Ok(())
     })
     .await;

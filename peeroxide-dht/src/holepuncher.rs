@@ -32,6 +32,8 @@ use crate::socket_pool::{
 };
 
 const BIRTHDAY_SOCKETS: usize = 256;
+/// hyperdht `holepuncher.js` `MAX_REOPENS`.
+const MAX_REOPENS: usize = 3;
 
 /// hyperdht allows one randomized punch and waits 20 s after it finishes.
 #[derive(Default)]
@@ -112,6 +114,15 @@ pub struct Holepuncher {
     recv_tasks: Vec<JoinHandle<()>>,
     random_budget: Option<Arc<Mutex<RandomPunchBudget>>>,
     random_punch: Option<RandomPunch>,
+
+    /// What `reset()` needs to reroll the primary socket (`_reopen`).
+    pool: SocketPool,
+    runtime: libudx::UdxRuntime,
+    firewalled: bool,
+    dht: Option<crate::rpc::DhtHandle>,
+    /// Feeds DHT replies that land on the primary socket (NAT pings and
+    /// holepunch rounds) back to the DHT actor for TID matching.
+    reply_forwarder: Option<JoinHandle<()>>,
 }
 
 impl Holepuncher {
@@ -148,6 +159,11 @@ impl Holepuncher {
             recv_tasks: recv_task.into_iter().collect(),
             random_budget: None,
             random_punch: None,
+            pool: pool.clone(),
+            runtime: libudx::UdxRuntime::shared(runtime.handle()),
+            firewalled,
+            dht: None,
+            reply_forwarder: None,
         })
     }
 
@@ -232,7 +248,37 @@ impl Holepuncher {
     /// (which itself falls back to `[127.0.0.1:port]` if no usable
     /// interface is found).
     pub fn punch_addresses(&self, fallback_port: u16) -> Vec<Ipv4Peer> {
+        // `holepuncher.js:339-341`: a socket bound to loopback advertises
+        // only loopback, never the host's LAN interfaces.
+        if self.pool.host() == "127.0.0.1" {
+            let mut out = self.nat.addresses.clone().unwrap_or_default();
+            out.push(Ipv4Peer {
+                host: "127.0.0.1".to_string(),
+                port: fallback_port,
+            });
+            return out;
+        }
         Self::select_punch_addresses(self.nat.addresses.as_ref(), fallback_port)
+    }
+
+    /// [`Self::punch_addresses`] with the local part passed through the
+    /// DHT's `validateLocalAddresses` once [`Self::auto_sample`] has tied
+    /// the puncher to a DHT.
+    pub(crate) async fn advertised_addresses(&self, fallback_port: u16) -> Vec<Ipv4Peer> {
+        let mut out = self.nat.addresses.clone().unwrap_or_default();
+        let local = if self.pool.host() == "127.0.0.1" {
+            vec![Ipv4Peer {
+                host: "127.0.0.1".to_string(),
+                port: fallback_port,
+            }]
+        } else {
+            Self::local_addresses(fallback_port)
+        };
+        match &self.dht {
+            Some(dht) => out.extend(dht.validate_local_addresses(local).await),
+            None => out.extend(local),
+        }
+        out
     }
 
     pub(crate) fn select_punch_addresses(
@@ -251,27 +297,48 @@ impl Holepuncher {
     /// own NAT mapping by sending DHT pings via `dht.ping_via_socket(...)`.
     /// Mirrors Node `lib/holepuncher.js:13-20` + `lib/nat.js:25-79`. Must
     /// run BEFORE [`Self::punch`] or the NAT classification stays
-    /// `UNKNOWN` and no punch strategy fires (the
-    /// `coerce_firewall(UNKNOWN→CONSISTENT)` MVP lie that this method
-    /// replaces; see commit history).
+    /// `UNKNOWN` and no punch strategy fires.
     ///
-    /// Returns the number of new samples added. No-op (returns 0) if the
-    /// puncher has no primary socket or its `dht_reply_rx` has already
-    /// been consumed.
+    /// From here on every DHT reply that lands on the primary socket is
+    /// forwarded to the DHT actor, so holepunch rounds sent from this
+    /// socket get their replies too. Returns the number of new samples.
     pub async fn auto_sample(&mut self, dht: &crate::rpc::DhtHandle) -> usize {
         self.random_budget = Some(Arc::clone(&dht.random_punch_budget));
-        let (socket_clone, rx) = {
-            let Some(socket_ref) = self.sockets.first_mut() else {
-                return 0;
-            };
-            let Some(rx) = socket_ref.dht_reply_rx.take() else {
-                return 0;
-            };
-            (socket_ref.socket.clone(), rx)
+        self.dht = Some(dht.clone());
+        let Some(socket_ref) = self.sockets.first_mut() else {
+            return 0;
         };
+        let socket = socket_ref.socket.clone();
+        if let Some(mut rx) = socket_ref.dht_reply_rx.take() {
+            let forward = dht.clone();
+            let inbound = socket.clone();
+            if let Some(old) = self.reply_forwarder.replace(tokio::spawn(async move {
+                while let Some(dgram) = rx.recv().await {
+                    forward.forward_inbound_reply_bytes(dgram.addr, dgram.data, inbound.clone());
+                }
+            })) {
+                old.abort();
+            }
+        }
         self.nat
-            .auto_sample(dht, socket_clone, rx, crate::nat::NAT_MIN_SAMPLES as usize)
+            .auto_sample(dht, socket, crate::nat::NAT_MIN_SAMPLES as usize)
             .await
+    }
+
+    /// The socket every holepunch round and probe leaves from.
+    pub(crate) fn socket(&self) -> Option<UdxSocket> {
+        self.sockets.first().map(|s| s.socket.clone())
+    }
+
+    /// A low-TTL packet that opens our NAT toward `addr` without reaching
+    /// the remote's NAT (`holepuncher.js` `openSession`).
+    pub(crate) fn open_session(&self, addr: &Ipv4Peer) {
+        if let (Some(socket), Ok(target)) = (
+            self.sockets.first(),
+            format!("{}:{}", addr.host, addr.port).parse::<SocketAddr>(),
+        ) {
+            let _ = socket.send_holepunch(target, true);
+        }
     }
 
     fn unstable(&self) -> bool {
@@ -279,6 +346,10 @@ impl Holepuncher {
         (self.remote_firewall >= FIREWALL_RANDOM && fw >= FIREWALL_RANDOM) || fw == FIREWALL_UNKNOWN
     }
 
+    /// `holepuncher.js` `analyze`: wait for sampling, and with
+    /// `allow_reopen` reroll the socket up to three times while the NAT
+    /// looks unstable (`_reopen`). With reopen, true means our class is
+    /// consistent.
     pub async fn analyze(&mut self, allow_reopen: bool) -> bool {
         self.nat.analyzing().await;
         if !self.unstable() {
@@ -287,13 +358,40 @@ impl Holepuncher {
         if !allow_reopen {
             return false;
         }
-        // Phase 3 MVP divergence from Node `_reopen()`: we do not destroy
-        // the NAT and rebuild the socket pool. We give the sampler a
-        // brief grace window and re-check `unstable()`. The outer probe
-        // loop in `run_holepunch_rounds` provides retry coverage; full
-        // reopen is a future extension if real-world peers need it.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        !self.unstable()
+        for _ in 0..MAX_REOPENS {
+            if !self.unstable() || self.done() || self.punching || !self.reset().await {
+                break;
+            }
+            self.nat.analyzing().await;
+        }
+        coerce_firewall(self.nat.firewall) == FIREWALL_CONSISTENT
+    }
+
+    /// `holepuncher.js` `_reset`: swap the primary socket for a fresh one,
+    /// drop the old NAT view and sample again from the new socket.
+    async fn reset(&mut self) -> bool {
+        let Some(dht) = self.dht.clone() else {
+            return false;
+        };
+        let Ok(mut socket) = self.pool.acquire(&self.runtime).await else {
+            return false;
+        };
+        if let Some(task) = spawn_recv_adapter_for_socket(
+            &mut socket,
+            self.is_initiator,
+            self.event_tx.clone(),
+            Arc::clone(&self.connected_flag),
+        ) {
+            self.recv_tasks.push(task);
+        }
+        match self.sockets.first_mut() {
+            Some(primary) => *primary = socket,
+            None => self.sockets.push(socket),
+        }
+        self.nat.destroy();
+        self.nat = Nat::new(self.firewalled);
+        self.auto_sample(&dht).await;
+        true
     }
 
     pub(crate) fn reserve_random_punch(&mut self) -> bool {
@@ -306,6 +404,12 @@ impl Holepuncher {
             return true;
         };
         self.random_punch = RandomPunch::reserve(budget);
+        tracing::debug!(
+            nat = self.nat.firewall,
+            remote = self.remote_firewall,
+            granted = self.random_punch.is_some(),
+            "random punch reservation"
+        );
         self.random_punch.is_some()
     }
 
@@ -555,6 +659,9 @@ impl Holepuncher {
         self.sockets.clear();
         self.nat.destroy();
 
+        if let Some(forwarder) = self.reply_forwarder.take() {
+            forwarder.abort();
+        }
         for h in self.recv_tasks.drain(..) {
             h.abort();
         }

@@ -8,6 +8,8 @@ use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::congestion::CaState;
+use super::congestion::filter::WinFilter;
+use super::congestion::rate::Delivered;
 use super::header::{
     FLAG_DATA, FLAG_DESTROY, FLAG_END, FLAG_HEARTBEAT, FLAG_MESSAGE, FLAG_SACK, HEADER_SIZE,
     Header, SackRange, decode_sack, encode_sack,
@@ -19,13 +21,21 @@ use crate::error::{Result, UdxError};
 /// Default receive window size (4 MB, matches C libudx).
 pub(crate) const DEFAULT_RWND: u32 = 4_194_304;
 
-/// Maximum payload per UDP packet (1200 - 20 byte header).
-pub(crate) const MAX_PAYLOAD: usize = 1200 - HEADER_SIZE;
+/// IPv4 and UDP header bytes in front of a UDX packet (C
+/// `UDX_IPV4_HEADER_SIZE - UDX_HEADER_SIZE`).
+const IPV4_UDP_OVERHEAD: usize = 20 + 8;
 
-/// Starting MTU (bytes) — matches C libudx `UDX_MTU_BASE`.
+/// IPv6 and UDP header bytes in front of a UDX packet.
+const IPV6_UDP_OVERHEAD: usize = 40 + 8;
+
+/// Starting MTU — C libudx `UDX_MTU_BASE`. Like every MTU value here, an
+/// IP packet size (IP + UDP + UDX headers + payload), as in C.
 pub(crate) const MTU_BASE: usize = 1200;
 
-/// Maximum MTU (bytes) — matches C libudx `UDX_MTU_MAX`.
+/// Maximum payload per packet at `MTU_BASE` over IPv4 (C `udx__max_payload`).
+pub(crate) const MAX_PAYLOAD: usize = MTU_BASE - IPV4_UDP_OVERHEAD - HEADER_SIZE;
+
+/// Maximum MTU (IP packet bytes) — matches C libudx `UDX_MTU_MAX`.
 pub(crate) const MTU_MAX: usize = 1500;
 
 /// Probe size increment (bytes).
@@ -40,11 +50,33 @@ const INITIAL_RTO_MS: u32 = 1_000;
 /// Maximum retransmission timeout (ms) — matches C libudx `UDX_RTO_MAX_MS`.
 const MAX_RTO_MS: u32 = 30_000;
 
-/// Maximum consecutive RTO timeouts before stream failure.
+/// RTO firings without the cumulative ACK moving that a stream survives;
+/// the next one ends it (C `UDX_MAX_RTO_TIMEOUTS`, checked with `>`).
 const MAX_RTO_TIMEOUTS: u32 = 6;
 
-/// Heartbeat interval when stream is idle (ms).
-const HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+/// Default keepalive interval: the 5 s hyperdht sets on its UDX streams.
+const DEFAULT_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Keepalive intervals without any packet from the peer after which a
+/// stream with keepalive on ends with a timeout. Peers answer every
+/// heartbeat with an ACK (C `process_packet`), so silence means a dead path.
+const KEEPALIVE_DEAD_INTERVALS: u32 = 6;
+
+/// Out-of-order packets accepted ahead of the cumulative ACK: the window we
+/// advertise, in packets of the smallest payload a peer uses (`MTU_BASE`
+/// over IPv6). A sender honouring the window never goes further.
+const RECV_WINDOW_PACKETS: u32 = DEFAULT_RWND / (MTU_BASE - IPV6_UDP_OVERHEAD - HEADER_SIZE) as u32;
+
+/// Packets queued from the socket to one stream's processor; more are
+/// dropped like any UDP overflow and recovered by retransmission.
+pub(crate) const INCOMING_QUEUE: usize = 1024;
+
+/// MESSAGE payloads held for `UdxStreamRemote::recv_message`; more are
+/// dropped, like any unreliable datagram nobody reads.
+const MESSAGE_QUEUE: usize = 64;
+
+/// Added to a single-packet loss probe's timeout (C `UDX_TLP_MAX_ACK_DELAY`).
+const TLP_MAX_ACK_DELAY_MS: u32 = 2;
 
 /// Maximum number of SACK ranges to include in an ACK packet.
 const MAX_SACK_RANGES: usize = 50;
@@ -57,12 +89,29 @@ const ACK_EVERY: u32 = 8;
 /// Maximum accepted RTT sample (ms) — prevents outlier corruption.
 const MAX_RTT_MS: u32 = 30_000;
 
+/// Window of the minimum-RTT filter RACK's reorder window reads (C
+/// `UDX_RTT_MIN_WINDOW_MS`, the Linux default).
+const RTT_MIN_WINDOW_MS: u32 = 300_000;
+
 /// Far-future duration used to effectively disable a timer.
 const FAR_FUTURE: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+/// How long a stream that ended first keeps answering for its id after it
+/// closed (C `UDX_STREAM_TIMEWAIT_TIMEOUT_MS`).
+const TIMEWAIT: std::time::Duration = std::time::Duration::from_millis(5_000);
 
 /// Bytes one stream may hold queued plus sent-but-unacked before
 /// `UdxAsyncStream::poll_write` applies back-pressure.
 pub(crate) const SEND_BUFFER_MAX: usize = 1024 * 1024;
+
+/// IP and UDP header bytes in front of a packet to `addr` (C picks by family;
+/// no address yet means IPv4).
+fn ip_overhead(addr: Option<SocketAddr>) -> usize {
+    match addr {
+        Some(SocketAddr::V6(_)) => IPV6_UDP_OVERHEAD,
+        _ => IPV4_UDP_OVERHEAD,
+    }
+}
 
 // ── MTU Probing State ────────────────────────────────────────────────────────
 
@@ -97,7 +146,100 @@ pub(crate) struct IncomingPacket {
 pub(crate) enum StreamEvent {
     Data(Vec<u8>),
     End,
+    /// The stream died: the peer destroyed it or it timed out. Readers see
+    /// this error once; C libudx closes the stream with the same error.
+    Error(std::io::ErrorKind),
 }
+
+/// Why `take_send_batch` stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendStop {
+    /// Nothing left to send (or no peer yet).
+    Idle,
+    /// The congestion window or the peer's window is full: an ACK, the RTO or
+    /// a zero-window probe moves things on, not a timer poll.
+    Window,
+    /// The pacer is empty for this long.
+    Pacing(std::time::Duration),
+}
+/// Notification from the send path to the processor task.
+pub(crate) enum StreamNotify {
+    DataQueued,
+    Shutdown,
+    /// The owner dropped the stream: send what is queued, then DESTROY.
+    Dropped,
+    /// The keepalive interval changed.
+    Keepalive,
+}
+
+type WriteSenders = Vec<Option<oneshot::Sender<Result<()>>>>;
+type AckedRateInfo = Vec<Delivered>;
+
+/// Payload bytes of a built packet: after the header and any MTU-probe
+/// padding (`data_offset`).
+fn payload_len(packet: &[u8]) -> usize {
+    packet
+        .len()
+        .saturating_sub(HEADER_SIZE + packet.get(3).copied().unwrap_or(0) as usize)
+}
+
+/// What `on_ack_packet` did, for the processor's timers.
+#[derive(Default)]
+struct AckOutcome {
+    /// Writes the ACK completed.
+    completed: WriteSenders,
+    /// The cumulative ACK moved forward.
+    ack_advanced: bool,
+    /// The ACK delivered at least one packet (cumulatively or by SACK).
+    delivered: bool,
+    /// Arm the reorder timer for this long (C `UDX_TIMER_RACK_REO`).
+    reorder_timeout: Option<std::time::Duration>,
+    /// Packets the send pass after loss detection took; the processor
+    /// sends them.
+    batch: Vec<(Vec<u8>, SocketAddr)>,
+}
+
+/// What a socket's demux holds for a stream id (C `udx_stream_entry_t`).
+pub(crate) enum StreamEntry {
+    /// A live stream: packets go to its processor.
+    Stream(mpsc::Sender<IncomingPacket>),
+    /// A stream that closed after both sides ended, having ended first
+    /// (C `udx_timewait_t`): a late DATA or END is answered with the final
+    /// ACK, and nothing reaches whatever owned the id.
+    Timewait(Arc<Timewait>),
+}
+
+/// The final ACK of a closed stream and where to send it (C
+/// `stream_timewait`). The socket is held weakly: like C, which closes
+/// timewaits with their socket, a closed socket answers nothing.
+pub(crate) struct Timewait {
+    udp: Weak<super::udp::Udp>,
+    remote_addr: SocketAddr,
+    header: [u8; HEADER_SIZE],
+}
+
+impl Timewait {
+    /// Answer a packet that arrived for the closed stream (C
+    /// `process_timewait`): DATA and END get the final ACK, the rest nothing.
+    pub(crate) fn answer(&self, type_flags: u8) {
+        if type_flags & (FLAG_DATA | FLAG_END) == 0 {
+            return;
+        }
+        if let Some(udp) = self.udp.upgrade() {
+            send_now(Some((udp, self.remote_addr, self.header.to_vec())));
+        }
+    }
+}
+
+type StreamMap = Arc<Mutex<std::collections::HashMap<u32, StreamEntry>>>;
+/// Stream maps of the sockets a stream is registered on. Shared by the
+/// stream handle and its processor task.
+type Registrations = Arc<Mutex<Vec<StreamMap>>>;
+type FirewallHook = Box<dyn FnMut(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send>;
+/// Where a stream sends: `(remote_id, remote_addr, socket)`, published by
+/// the stream for relay legs that forward to it. The lock is a leaf: it is
+/// never held while taking another, so no `StreamInner` ever locks another.
+type Endpoint = Arc<Mutex<Option<(u32, SocketAddr, Arc<super::udp::Udp>)>>>;
 
 // ── Reliability types ────────────────────────────────────────────────────────
 
@@ -135,49 +277,42 @@ struct RecvdPacket {
     flags: u8,
 }
 
-struct QueuedPacket {
-    packet: Vec<u8>,
-    seq: u32,
-    remote_addr: SocketAddr,
+/// One write waiting to be cut into packets (C `udx_stream_write_buf_t`).
+/// Packets are built at send time at the MTU of that moment, so a write
+/// queued before an MTU change or `change_remote` goes out at the new size.
+struct WriteBuf {
+    data: Vec<u8>,
+    /// Bytes of `data` already put into packets.
+    sent: usize,
+    /// The FIN (C `is_write_end`): an empty buffer, last in the queue.
+    end: bool,
+    /// Resolved once the packet carrying the last byte is cumulatively ACKed.
+    done: Option<oneshot::Sender<Result<()>>>,
 }
 
-/// Tracks a pending write awaiting remote acknowledgement.
+/// A write whose last packet is sent, awaiting the remote's cumulative ACK.
 pub(crate) struct PendingWrite {
     pub(crate) ack_threshold: u32,
     pub(crate) tx: Option<oneshot::Sender<Result<()>>>,
 }
 
-/// Notification from the send path to the processor task.
-pub(crate) enum StreamNotify {
-    DataQueued,
-    Shutdown,
-}
-
-type WriteSenders = Vec<Option<oneshot::Sender<Result<()>>>>;
-type AckedRateInfo = Vec<(u32, super::congestion::rate::PacketRateInfo)>;
-type StreamMap = Arc<Mutex<std::collections::HashMap<u32, mpsc::UnboundedSender<IncomingPacket>>>>;
-/// Stream maps of the sockets a stream is registered on. Shared by the
-/// stream handle and its processor task.
-type Registrations = Arc<Mutex<Vec<StreamMap>>>;
-type FirewallHook = Box<dyn FnMut(&super::socket::UdxSocket, u16, std::net::IpAddr) -> bool + Send>;
-
-/// Remove `local_id` from every socket map in `registrations`.
+/// Remove `local_id` from every socket map in `registrations` where it is
+/// still this stream (`tx`; any live stream when `None`). A timewait entry
+/// stays until it expires or a new stream takes the id.
 fn deregister(
     local_id: u32,
     registrations: &Registrations,
-    tx: Option<&mpsc::UnboundedSender<IncomingPacket>>,
+    tx: Option<&mpsc::Sender<IncomingPacket>>,
 ) {
     let maps = std::mem::take(&mut *registrations.lock().unwrap_or_else(|e| e.into_inner()));
     for map in maps {
         let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = guard.get(&local_id) {
-            if let Some(tx) = tx {
-                if existing.same_channel(tx) {
-                    guard.remove(&local_id);
-                }
-            } else {
-                guard.remove(&local_id);
-            }
+        let ours = match guard.get(&local_id) {
+            Some(StreamEntry::Stream(existing)) => tx.is_none_or(|tx| existing.same_channel(tx)),
+            _ => false,
+        };
+        if ours {
+            guard.remove(&local_id);
         }
     }
 }
@@ -192,8 +327,16 @@ pub(crate) struct StreamInner {
     terminated: bool,
     /// True once `prepare_end()` has been called (FIN queued).
     ended: bool,
+    /// The peer's END was delivered in order (C `UDX_STREAM_ENDED_REMOTE`).
+    remote_ended: bool,
+    /// We ended before the peer did, so a clean close leaves a timewait
+    /// entry behind (C `UDX_STREAM_TIMEWAIT_WANTED`).
+    timewait_wanted: bool,
 
     // ── Send state ──
+    /// Seq of the next packet built (C `stream->seq`): everything below it
+    /// was sent, so it bounds a valid cumulative ACK, and control packets
+    /// carry it.
     pub(crate) next_seq: u32,
     pub(crate) pending_writes: Vec<PendingWrite>,
     /// Sent packets awaiting ACK, keyed by sequence number.
@@ -206,13 +349,20 @@ pub(crate) struct StreamInner {
     /// rule only looks at the front; entries whose packet was ACKed, SACKed,
     /// marked lost or sent again since are skipped when reached.
     send_order: VecDeque<(Instant, u32)>,
-    /// Seqs marked lost since the last fast retransmit (may hold stale seqs).
-    lost_queue: Vec<u32>,
+    /// Packets marked lost, in loss order, waiting for `take_send_batch` to
+    /// retransmit them under the congestion window and the pacer (C
+    /// `retransmit_queue`). May hold stale seqs; those are skipped.
+    lost_queue: VecDeque<u32>,
+    /// Packets in `outgoing` marked SACKed (C `stream->sacks`).
+    sacked_count: u32,
     /// Sorted, disjoint seq intervals some SACK block already covered (only
     /// seqs that had been sent), so `on_sack` skips what it has marked.
     sack_cover: Vec<(u32, u32)>,
-    /// Bytes staged in `send_queue`, not yet sent.
+    /// Bytes in `write_queue` not cut into packets yet.
     queued_bytes: usize,
+    /// Payload bytes written and not yet ACKed or SACKed (C
+    /// `writes_queued_bytes`), for the app-limited check.
+    unacked_written: usize,
     /// Bytes in `outgoing`, sent but not cumulatively ACKed.
     unacked_bytes: usize,
     /// Writer waiting for send-buffer room (see `SEND_BUFFER_MAX`).
@@ -225,11 +375,36 @@ pub(crate) struct StreamInner {
     /// Highest cumulative ACK received from remote.
     remote_acked: u32,
     /// Send time and seq of the most recently sent packet the peer has
-    /// delivered (RACK `rack.xmit_ts`/`rack.end_seq`). Retransmissions do
-    /// not count: their ACK could be for the original copy.
+    /// delivered (RACK `rack.xmit_ts`/`rack.end_seq`, C `rack_time_sent`,
+    /// `rack_next_seq - 1`). A retransmission counts only when its RTT is
+    /// at least the minimum RTT: its ACK could be for the original copy.
     rack: Option<(Instant, u32)>,
+    /// RTT (ms) of the delivery that last set `rack` (C `rack_rtt`).
+    rack_rtt: u32,
+    /// RACK RTT of the newest packet the current ACK delivered, for its
+    /// rate sample (C `rs->rtt_ms`); 0 for none.
+    rs_rtt: u32,
+    /// A write landed on an idle zero-window stream: probe at once.
+    zwp_wanted: bool,
+    /// One past the highest seq delivered so far (C `rack_fack`).
+    rack_fack: u32,
+    /// A never-retransmitted packet was delivered below `rack_fack`: the
+    /// path reorders, so the reorder window stays open (C `reordering_seen`).
+    reordering_seen: bool,
+    /// Minimum RTT over `RTT_MIN_WINDOW_MS`, on the `epoch` millisecond
+    /// clock (C `rtt_min`); `u32::MAX` before the first sample.
+    rtt_min: WinFilter<u32>,
+    /// Origin of the millisecond clock `rtt_min` runs on.
+    epoch: Instant,
+    /// Fake clock for state-machine tests (`now()`).
+    #[cfg(test)]
+    clock: Option<Instant>,
     /// Out-of-order receive buffer, keyed by sequence number.
     recv_buf: BTreeMap<u32, RecvdPacket>,
+    /// The seqs in `recv_buf` as sorted, disjoint, non-adjacent half-open
+    /// ranges (C's SACK block list), kept per packet so an ACK costs
+    /// O(ranges) instead of a walk of the buffer.
+    recv_ranges: Vec<(u32, u32)>,
 
     // ── RTT estimation (Jacobson/Karels, matching C libudx constants) ──
     srtt: u32,
@@ -242,6 +417,15 @@ pub(crate) struct StreamInner {
     /// Remote's last advertised receive window.
     send_rwnd: u32,
 
+    // ── Tail loss probe (C `tlp_*`, RACK §7) ──
+    tlp_permitted: bool,
+    tlp_in_flight: bool,
+    tlp_is_retrans: bool,
+    tlp_end_seq: u32,
+
+    /// Idle heartbeat interval; `None` sends none (C `keepalive_timeout_ms`).
+    keepalive: Option<std::time::Duration>,
+
     // ── MTU probing state ──
     pub(crate) mtu_state: MtuState,
     pub(crate) mtu: usize,
@@ -252,6 +436,10 @@ pub(crate) struct StreamInner {
 
     // ── IO ──
     pub(crate) udp: Option<Arc<super::udp::Udp>>,
+    /// The socket `udp` belongs to. Holding it keeps the socket receiving
+    /// while the stream uses it, as a C stream keeps its `udx_socket_t`:
+    /// the last other handle (a holepunch pool, say) may be dropped first.
+    socket: Option<super::socket::UdxSocket>,
     pub(crate) read_tx: mpsc::UnboundedSender<StreamEvent>,
     close_tx: Option<oneshot::Sender<()>>,
     close_watch_tx: watch::Sender<bool>,
@@ -260,10 +448,14 @@ pub(crate) struct StreamInner {
 
     // ── Congestion control (BBR) ──
     pub(crate) congestion: super::congestion::CongestionController,
-    send_queue: VecDeque<QueuedPacket>,
+    /// Writes not yet sent, in order (C `write_queue`).
+    write_queue: VecDeque<WriteBuf>,
 
     // ── Relay ──
-    relay_target: Option<Arc<Mutex<StreamInner>>>,
+    /// Endpoint of the stream this one forwards to (C `relay_to`).
+    relay_target: Option<Endpoint>,
+    /// This stream's own endpoint, read by relay legs forwarding to it.
+    endpoint: Endpoint,
 
     // ── Firewall hook (set_firewall_hook path) ──
     /// Consulted while unconnected and for packets arriving on a socket
@@ -273,7 +465,7 @@ pub(crate) struct StreamInner {
     // ── Remote migration (`change_remote`) ──
     local_id: u32,
     /// Demux sender, so a migration can register the stream on another socket.
-    incoming_tx: Option<mpsc::UnboundedSender<IncomingPacket>>,
+    incoming_tx: Option<mpsc::Sender<IncomingPacket>>,
     registrations: Registrations,
     /// First seq not sent before the change, and the waiter released once
     /// the peer has ACKed up to it (C `seq_on_remote_changed`).
@@ -281,7 +473,14 @@ pub(crate) struct StreamInner {
     /// Released by data or a message from the current remote on this socket.
     remote_observed: Option<oneshot::Sender<()>>,
     observed_current_remote: bool,
+    /// Received MESSAGE payloads (C `on_recv`); `None` once terminated.
+    message_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Read side of `message_tx`, shared by `UdxStreamRemote` handles.
+    message_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>>,
     pub(crate) runtime: Option<Weak<super::runtime::RuntimeHandle>>,
+    /// Pacing timer wakeups, for tests of the send loop's idle behaviour.
+    #[cfg(test)]
+    pacing_wakeups: u32,
 }
 
 impl StreamInner {
@@ -297,10 +496,14 @@ impl StreamInner {
         // Migration waiters learn the stream died (their receivers error).
         self.remote_change = None;
         self.remote_observed = None;
+        // Message readers see the end once the queue is read.
+        self.message_tx = None;
         // Wake readers: an aborted stream reads as EOF instead of hanging.
         let _ = self.read_tx.send(StreamEvent::End);
         // Release the socket so a suspended DHT socket can be rebound.
         self.udp = None;
+        self.socket = None;
+        self.publish_endpoint();
         deregister(
             self.local_id,
             &self.registrations,
@@ -319,14 +522,17 @@ impl StreamInner {
             }
         }
         // Abort handles can outlive the stream; they must not pin packet storage.
-        self.send_queue = VecDeque::new();
+        self.write_queue = VecDeque::new();
         self.outgoing.clear();
         self.inflight_count = 0;
+        self.sacked_count = 0;
         self.send_order = VecDeque::new();
-        self.lost_queue = Vec::new();
+        self.lost_queue = VecDeque::new();
         self.sack_cover = Vec::new();
         self.recv_buf.clear();
+        self.recv_ranges = Vec::new();
         self.queued_bytes = 0;
+        self.unacked_written = 0;
         self.unacked_bytes = 0;
         if let Some(w) = self.write_waker.take() {
             w.wake();
@@ -336,14 +542,126 @@ impl StreamInner {
         }
     }
 
+    /// End the stream with `kind` (C `close_stream(stream, err)`): pending
+    /// writes and the reader see the error, then the stream terminates.
+    fn fail(&mut self, kind: std::io::ErrorKind, reason: &'static str) {
+        if self.terminated {
+            return;
+        }
+        let queued = self.write_queue.iter_mut().filter_map(|w| w.done.take());
+        let sent = self
+            .pending_writes
+            .drain(..)
+            .filter_map(|mut pw| pw.tx.take());
+        for tx in sent.chain(queued) {
+            let _ = tx.send(Err(UdxError::Io(std::io::Error::new(kind, reason))));
+        }
+        let _ = self.read_tx.send(StreamEvent::Error(kind));
+        self.terminate();
+    }
+
+    /// Our END is ACKed: it and everything before it reached the peer (C
+    /// `UDX_STREAM_ENDED`).
+    fn end_acked(&self) -> bool {
+        self.ended && !self.terminated && self.all_acked()
+    }
+
+    /// Both directions have ended and everything we sent is ACKed (C
+    /// `UDX_STREAM_ALL_ENDED`): the stream closes by itself.
+    fn all_ended(&self) -> bool {
+        self.remote_ended && self.end_acked()
+    }
+
+    /// Close a stream whose both directions ended (C `close_stream(stream,
+    /// 0)`): a stream that ended first leaves a timewait entry for its id on
+    /// every socket it was registered on, answering a late DATA or END with
+    /// the final ACK for `TIMEWAIT` (C `stream_timewait`). The peer's data
+    /// and EOF are queued for the reader (it may not have read them yet)
+    /// and every write completed, so close observers fire with no error.
+    fn close_ended(&mut self) {
+        if self.timewait_wanted {
+            self.enter_timewait();
+        }
+        self.terminate();
+    }
+
+    fn enter_timewait(&self) {
+        let (Some(udp), Some(remote_addr), Some(tx)) =
+            (&self.udp, self.remote_addr, &self.incoming_tx)
+        else {
+            return;
+        };
+        let timewait = Arc::new(Timewait {
+            udp: Arc::downgrade(udp),
+            remote_addr,
+            header: self.control_header(0).encode(),
+        });
+        let local_id = self.local_id;
+        let maps: Vec<_> = self
+            .registrations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(Arc::downgrade)
+            .collect();
+        for map in maps.iter().filter_map(Weak::upgrade) {
+            let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(guard.get(&local_id), Some(StreamEntry::Stream(ours)) if ours.same_channel(tx))
+            {
+                guard.insert(local_id, StreamEntry::Timewait(Arc::clone(&timewait)));
+            }
+        }
+        // C `timewait_timeout`: the id is free again, unless a new stream
+        // took it already.
+        tokio::spawn(async move {
+            tokio::time::sleep(TIMEWAIT).await;
+            for map in maps.iter().filter_map(Weak::upgrade) {
+                let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+                if matches!(guard.get(&local_id), Some(StreamEntry::Timewait(entry)) if Arc::ptr_eq(entry, &timewait))
+                {
+                    guard.remove(&local_id);
+                }
+            }
+        });
+    }
+
+    /// Publish where this stream sends, for relay legs forwarding to it.
+    fn publish_endpoint(&self) {
+        let endpoint = match (self.connected, self.remote_addr, &self.udp) {
+            (true, Some(addr), Some(udp)) => Some((self.remote_id, addr, Arc::clone(udp))),
+            _ => None,
+        };
+        *self.endpoint.lock().unwrap_or_else(|e| e.into_inner()) = endpoint;
+    }
+
+    /// Header of a control packet (ACK, heartbeat) as C `udx_write_header`.
+    fn control_header(&self, type_flags: u8) -> Header {
+        Header {
+            type_flags,
+            data_offset: 0,
+            remote_id: self.remote_id,
+            recv_window: DEFAULT_RWND,
+            seq: self.next_seq,
+            ack: self.next_remote_seq,
+        }
+    }
+
+    pub(crate) fn set_keepalive(&mut self, interval: Option<std::time::Duration>) {
+        self.keepalive = interval.filter(|interval| !interval.is_zero());
+        if let Some(tx) = &self.notify_tx {
+            let _ = tx.send(StreamNotify::Keepalive);
+        }
+    }
+
     pub(crate) fn close_observer(&self) -> watch::Receiver<bool> {
         self.close_watch_rx.clone()
     }
 
     // ── MTU ──────────────────────────────────────────────────────────────────
 
+    /// Payload bytes per packet at the current MTU (C `udx__max_payload`).
     pub(crate) fn max_payload(&self) -> usize {
-        self.mtu - HEADER_SIZE
+        self.mtu - ip_overhead(self.remote_addr) - HEADER_SIZE
     }
 
     /// Back to the base MTU, re-probing from scratch: a migrated stream is
@@ -351,41 +669,34 @@ impl StreamInner {
     fn reset_mtu(&mut self) {
         self.mtu = MTU_BASE;
         self.mtu_state = MtuState::Base;
-        self.mtu_probe_size = MTU_BASE + MTU_STEP;
+        // The first probe confirms the base size, as in C.
+        self.mtu_probe_size = MTU_BASE;
         self.mtu_probe_count = 0;
         self.mtu_probe_wanted = false;
         self.mtu_max = MTU_MAX;
+        let mss = self.max_payload() as u32;
+        self.congestion.on_mtu_change(mss);
     }
 
-    /// Inflate a DATA packet to `mtu_probe_size` by inserting zero padding after the header.
-    /// Sets `data_offset` so the receiver skips the padding via `payload_offset()`.
-    /// Returns `true` if the packet was successfully probeified.
-    fn mtu_probeify_packet(&mut self, packet: &mut Vec<u8>) -> bool {
-        if packet.len() < HEADER_SIZE {
+    /// Pad a full DATA packet to the IP size `mtu_probe_size` with zeros
+    /// after the header, as C `mtu_probeify_packet` (padding 0..=255; the
+    /// receiver skips it through `data_offset`). Returns whether the packet
+    /// became a probe.
+    fn mtu_probeify_packet(&mut self, packet: &mut Vec<u8>, remote_addr: SocketAddr) -> bool {
+        if packet.len() < HEADER_SIZE || packet[2] & FLAG_DATA == 0 || packet[3] != 0 {
             return false;
         }
-        let target_size = self.mtu_probe_size;
-        if target_size <= packet.len() {
+        let ip_size = packet.len() + ip_overhead(Some(remote_addr));
+        let Some(padding) = self.mtu_probe_size.checked_sub(ip_size) else {
             return false;
-        }
-
-        let padding = target_size - packet.len();
-        // data_offset is u8 — can only pad up to 255 bytes.
-        // This naturally limits probing to nearly-full packets (matching C libudx).
+        };
         if padding > 255 {
             return false;
         }
-        // Insert padding between header and payload: shift payload right
-        let payload = packet[HEADER_SIZE..].to_vec();
-        packet.truncate(HEADER_SIZE);
-        packet.extend(std::iter::repeat_n(0u8, padding));
-        packet.extend_from_slice(&payload);
-
-        // Set data_offset in header byte [3]
+        packet.splice(HEADER_SIZE..HEADER_SIZE, std::iter::repeat_n(0u8, padding));
         packet[3] = padding as u8;
-
         self.mtu_probe_wanted = false;
-        tracing::trace!(probe_size = target_size, padding, "mtu: probeify");
+        tracing::trace!(probe_size = self.mtu_probe_size, padding, "mtu: probeify");
         true
     }
 
@@ -405,17 +716,107 @@ impl StreamInner {
             self.mtu_probe_wanted = true;
         }
 
-        self.congestion.on_mtu_change(old_mtu, self.mtu);
+        let mss = self.max_payload() as u32;
+        self.congestion.on_mtu_change(mss);
         tracing::debug!(old_mtu, new_mtu = self.mtu, state = ?self.mtu_state, "mtu: probe acked");
     }
 
-    // ── Write preparation ────────────────────────────────────────────────────
+    /// A probe was lost: strip its padding (C `mtu_unprobeify_packet`).
+    /// Probes are counted when sent (`send_new`, C udx.c:858), so an
+    /// old-path probe lost after `reset_mtu` costs the new path nothing.
+    fn unprobeify(&mut self, seq: u32) {
+        let Some(pkt) = self.outgoing.get_mut(&seq) else {
+            return;
+        };
+        if !pkt.is_mtu_probe {
+            return;
+        }
+        let before = pkt.packet.len();
+        strip_probe_padding(&mut pkt.packet);
+        pkt.is_mtu_probe = false;
+        let stripped = before - pkt.packet.len();
+        self.unacked_bytes = self.unacked_bytes.saturating_sub(stripped);
+        tracing::debug!(probes = self.mtu_probe_count, "mtu: probe failed");
+        if self.mtu_state == MtuState::Search {
+            if self.mtu_probe_count >= MTU_MAX_PROBES {
+                self.mtu_state = MtuState::SearchComplete;
+                self.mtu_probe_wanted = false;
+            } else {
+                self.mtu_probe_wanted = true;
+            }
+        }
+    }
 
-    /// Reserve sequence numbers for a write of `data_len` bytes.
-    pub(crate) fn prepare_write(&mut self, data_len: usize) -> Result<WritePrep> {
+    /// The kernel refused a GSO send of `udp_size`-byte datagrams with
+    /// `EMSGSIZE`: the path MTU is below that IP size. Treat it as a failed
+    /// probe that ends the search, and step the MTU back below it.
+    pub(crate) fn on_send_too_big(&mut self, udp_size: usize) {
+        let ip_size = udp_size + ip_overhead(self.remote_addr);
+        self.mtu_state = MtuState::SearchComplete;
+        self.mtu_probe_wanted = false;
+        if self.mtu < ip_size {
+            return;
+        }
+        let old_mtu = self.mtu;
+        // The probe grid point below the refused size, never under the base.
+        self.mtu = MTU_BASE + ip_size.saturating_sub(MTU_BASE + 1) / MTU_STEP * MTU_STEP;
+        self.mtu_max = self.mtu;
+        let mss = self.max_payload() as u32;
+        self.congestion.on_mtu_change(mss);
+        tracing::debug!(old_mtu, new_mtu = self.mtu, "mtu: send too big");
+    }
+
+    // ── Write queue ──────────────────────────────────────────────────────────
+
+    /// Queue `data` behind earlier writes (C `udx_stream_write`). It is cut
+    /// into packets when the windows and the pacer let it go, at the MTU
+    /// and peer of that moment, possibly sharing a packet with neighbouring
+    /// writes as in C. `done` resolves once the packet carrying the last
+    /// byte is cumulatively ACKed; an empty write rides on the next packet
+    /// sent, as in C. An empty write nobody waits for queues nothing.
+    pub(crate) fn queue_write(
+        &mut self,
+        data: &[u8],
+        done: Option<oneshot::Sender<Result<()>>>,
+    ) -> Result<()> {
+        // A hooked stream may queue before its first packet commits a peer.
         if !self.connected && self.firewall_hook.is_none() {
             return Err(UdxError::Io(std::io::Error::other("stream not connected")));
         }
+        self.check_open()?;
+        if data.is_empty() && done.is_none() {
+            return Ok(());
+        }
+        self.push_write(WriteBuf {
+            data: data.to_vec(),
+            sent: 0,
+            end: false,
+            done,
+        });
+        Ok(())
+    }
+
+    /// Queue the FIN behind every write (C `udx_stream_write_end`); later
+    /// writes are refused. `done` resolves once the peer ACKed it.
+    pub(crate) fn queue_end(&mut self, done: Option<oneshot::Sender<Result<()>>>) -> Result<()> {
+        if !self.connected {
+            return Err(UdxError::Io(std::io::Error::other("stream not connected")));
+        }
+        self.check_open()?;
+        self.ended = true;
+        // C `udx_stream_write_end`: the side that ends first waits in
+        // timewait once the stream closes.
+        self.timewait_wanted = !self.remote_ended;
+        self.push_write(WriteBuf {
+            data: Vec::new(),
+            sent: 0,
+            end: true,
+            done,
+        });
+        Ok(())
+    }
+
+    fn check_open(&self) -> Result<()> {
         if self.ended {
             return Err(UdxError::Io(std::io::Error::other(
                 "stream already shut down",
@@ -425,73 +826,22 @@ impl StreamInner {
         if self.udp.is_none() || self.notify_tx.is_none() {
             return Err(UdxError::StreamClosed);
         }
-        // When the firewall hook hasn't fired yet, remote_addr is not known.
-        // Use the unspecified sentinel (0.0.0.0:0); the processor will update
-        // queued packets once the hook fires and remote_addr is resolved.
-        let remote_addr = self
-            .remote_addr
-            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-        let remote_id = self.remote_id;
-
-        let max_payload = self.max_payload();
-        let chunk_count = if data_len == 0 {
-            1
-        } else {
-            data_len.div_ceil(max_payload)
-        };
-        let first_seq = self.next_seq;
-        let ack_threshold = first_seq + chunk_count as u32;
-        self.next_seq = ack_threshold;
-        let current_ack = self.next_remote_seq;
-
-        Ok(WritePrep {
-            remote_addr,
-            remote_id,
-            first_seq,
-            ack_threshold,
-            current_ack,
-        })
+        Ok(())
     }
 
-    /// Reserve the sequence number of the FIN; later writes are refused.
-    pub(crate) fn prepare_end(&mut self) -> Result<WritePrep> {
-        if !self.connected {
-            return Err(UdxError::Io(std::io::Error::other("stream not connected")));
+    /// Stage a write and wake the processor. A write landing on an idle
+    /// stream whose peer advertised a zero window asks for a zero-window
+    /// probe at once (C `_udx_stream_write`, udx.c:2805).
+    fn push_write(&mut self, write: WriteBuf) {
+        if self.unacked_written == 0 && self.send_rwnd == 0 && self.connected {
+            self.zwp_wanted = true;
         }
-        if self.ended {
-            return Err(UdxError::Io(std::io::Error::other(
-                "stream already shut down",
-            )));
+        self.queued_bytes += write.data.len();
+        self.unacked_written += write.data.len();
+        self.write_queue.push_back(write);
+        if let Some(tx) = &self.notify_tx {
+            let _ = tx.send(StreamNotify::DataQueued);
         }
-        if self.udp.is_none() || self.notify_tx.is_none() {
-            return Err(UdxError::StreamClosed);
-        }
-        let remote_addr = self.remote_addr.ok_or(UdxError::StreamClosed)?;
-        self.ended = true;
-        let remote_id = self.remote_id;
-
-        let seq = self.next_seq;
-        self.next_seq = seq + 1;
-        let current_ack = self.next_remote_seq;
-
-        Ok(WritePrep {
-            remote_addr,
-            remote_id,
-            first_seq: seq,
-            ack_threshold: seq + 1,
-            current_ack,
-        })
-    }
-
-    /// Resolves once the remote has cumulatively ACKed every seq below
-    /// `ack_threshold`, or with `StreamClosed` when the stream dies first.
-    pub(crate) fn watch_ack(&mut self, ack_threshold: u32) -> oneshot::Receiver<Result<()>> {
-        let (tx, rx) = oneshot::channel();
-        self.pending_writes.push(PendingWrite {
-            ack_threshold,
-            tx: Some(tx),
-        });
-        rx
     }
 
     /// Send-buffer bytes still free for `UdxAsyncStream::poll_write`.
@@ -514,7 +864,24 @@ impl StreamInner {
 
     /// True once nothing is queued and everything sent has been ACKed.
     pub(crate) fn all_acked(&self) -> bool {
-        self.send_queue.is_empty() && self.outgoing.is_empty()
+        self.write_queue.is_empty() && self.outgoing.is_empty()
+    }
+
+    // ── Clock ────────────────────────────────────────────────────────────────
+
+    /// The time the state machine runs on: `Instant::now()`, or a test's
+    /// fake clock.
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = self.clock {
+            return clock;
+        }
+        Instant::now()
+    }
+
+    /// `now` in whole milliseconds since `epoch` (C `uv_now`).
+    fn clock_ms(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.epoch).as_millis() as u64
     }
 
     // ── Outgoing packet registration ─────────────────────────────────────────
@@ -527,9 +894,13 @@ impl StreamInner {
         remote_addr: SocketAddr,
         is_mtu_probe: bool,
     ) {
-        let now = Instant::now();
-        let inflight = self.inflight();
-        let rate_info = self.congestion.on_packet_sent(seq, inflight, now);
+        let now = self.now();
+        let now_ms = self.clock_ms(now);
+        let was_idle = self.inflight() == 0;
+        // C `udx__rate_pkt_sent`: nothing outstanding starts a new flight.
+        let rate_info = self
+            .congestion
+            .on_packet_sent(self.outgoing.is_empty(), now_ms);
         tracing::trace!(
             seq,
             is_mtu_probe,
@@ -554,9 +925,16 @@ impl StreamInner {
             if previous.is_inflight() {
                 self.inflight_count -= 1;
             }
+            if previous.sacked {
+                self.sacked_count -= 1;
+            }
         }
         self.inflight_count += 1;
         self.send_order.push_back((now, seq));
+        if was_idle {
+            self.congestion
+                .on_transmit_start(self.srtt, self.inflight_count, now_ms);
+        }
     }
 
     pub(crate) fn inflight(&self) -> u32 {
@@ -567,101 +945,294 @@ impl StreamInner {
         self.inflight_count
     }
 
-    pub(crate) fn queue_for_send(&mut self, packets: Vec<(u32, Vec<u8>)>, remote_addr: SocketAddr) {
-        let count = packets.len();
-        for (seq, packet) in packets {
-            self.queued_bytes += packet.len();
-            self.send_queue.push_back(QueuedPacket {
-                packet,
-                seq,
-                remote_addr,
-            });
+    /// A packet can be built: bytes or the FIN wait in `write_queue`. Empty
+    /// writes alone wait for the next packet, as in C.
+    fn has_unsent(&self) -> bool {
+        self.queued_bytes > 0 || self.write_queue.back().is_some_and(|w| w.end)
+    }
+
+    /// Build the next DATA and/or END packet from the write queue at the
+    /// current MTU, peer and ACK (C `send_new_packet`, `_send_new_packet`):
+    /// up to `max_payload` bytes across as many writes as fit, END set on
+    /// the packet that takes the FIN. Each write the packet finishes waits
+    /// for this seq's cumulative ACK. Returns the seq and the packet.
+    fn next_packet(&mut self) -> Option<(u32, Vec<u8>)> {
+        if !self.has_unsent() {
+            return None;
         }
-        tracing::trace!(
-            count,
-            queue_len = self.send_queue.len(),
-            "queue_for_send: packets staged"
-        );
-        if let Some(tx) = &self.notify_tx {
-            let _ = tx.send(StreamNotify::DataQueued);
+        let seq = self.next_seq;
+        let mut capacity = self.max_payload();
+        let mut packet = Vec::with_capacity(HEADER_SIZE + capacity);
+        packet.resize(HEADER_SIZE, 0);
+        let mut flags = 0;
+        while capacity > 0 {
+            let Some(write) = self.write_queue.front_mut() else {
+                break;
+            };
+            let len = capacity.min(write.data.len() - write.sent);
+            packet.extend_from_slice(&write.data[write.sent..write.sent + len]);
+            write.sent += len;
+            capacity -= len;
+            self.queued_bytes -= len;
+            if len > 0 {
+                flags |= FLAG_DATA;
+            }
+            if write.sent < write.data.len() {
+                break;
+            }
+            let Some(write) = self.write_queue.pop_front() else {
+                break;
+            };
+            if let Some(tx) = write.done {
+                self.pending_writes.push(PendingWrite {
+                    ack_threshold: seq.wrapping_add(1),
+                    tx: Some(tx),
+                });
+            }
+            if write.end {
+                flags |= FLAG_END;
+                break;
+            }
         }
-    }
-
-    /// Stage a write's packets, restarting the BBR transmit clock when the
-    /// stream was idle.
-    pub(crate) fn queue_write(&mut self, packets: Vec<(u32, Vec<u8>)>, remote_addr: SocketAddr) {
-        if self.send_idle() {
-            self.congestion.on_transmit_start(Instant::now());
+        Header {
+            type_flags: flags,
+            data_offset: 0,
+            remote_id: self.remote_id,
+            recv_window: DEFAULT_RWND,
+            seq,
+            ack: self.next_remote_seq,
         }
-        self.queue_for_send(packets, remote_addr);
+        .encode_into(&mut packet[..HEADER_SIZE]);
+        self.next_seq = seq.wrapping_add(1);
+        Some((seq, packet))
     }
 
-    /// Take the next packet to send off the queue.
-    fn pop_queued(&mut self) -> Option<QueuedPacket> {
-        let queued = self.send_queue.pop_front()?;
-        self.queued_bytes = self.queued_bytes.saturating_sub(queued.packet.len());
-        Some(queued)
+    /// True when queued data or retransmits wait for the processor.
+    fn has_pending_send(&self) -> bool {
+        self.connected && (self.has_unsent() || !self.lost_queue.is_empty())
     }
 
-    pub(crate) fn send_idle(&self) -> bool {
-        self.outgoing.is_empty() && self.send_queue.is_empty()
+    /// Everything sent is ACKed but the peer's window is zero with data
+    /// waiting: only a zero-window probe can learn when it opens (C ZWP).
+    fn zero_window_stalled(&self) -> bool {
+        self.connected && self.send_rwnd == 0 && self.outgoing.is_empty() && self.has_unsent()
     }
 
-    /// Take the queued packets the congestion window, the peer's window and
-    /// the pacer allow now, registering each as sent. Returns them with the
-    /// pacing delay that ended the batch, if that is what ended it.
-    fn take_send_batch(&mut self) -> (Vec<(Vec<u8>, SocketAddr)>, Option<std::time::Duration>) {
+    /// Front of the retransmit queue, skipping seqs ACKed, SACKed or already
+    /// retransmitted since they were queued.
+    fn next_lost(&mut self) -> Option<u32> {
+        while let Some(&seq) = self.lost_queue.front() {
+            if self.outgoing.get(&seq).is_some_and(|p| p.lost && !p.sacked) {
+                return Some(seq);
+            }
+            self.lost_queue.pop_front();
+        }
+        None
+    }
+
+    /// Send `seq` again (C `retransmit_packet`): a fresh send time, back in
+    /// flight if it was marked lost.
+    fn retransmit(&mut self, seq: u32) -> Option<(Vec<u8>, SocketAddr)> {
+        let now = self.now();
+        let now_ms = self.clock_ms(now);
+        let was_idle = self.inflight_count == 0;
+        // C `_send_packet` takes the delivery state at every transmission.
+        let rate_info = self.congestion.on_packet_sent(false, now_ms);
+        let pkt = self.outgoing.get_mut(&seq)?;
+        pkt.retransmit_count += 1;
+        pkt.time_sent = now;
+        pkt.rate_info = Some(rate_info);
+        let sent = (pkt.packet.clone(), pkt.remote_addr);
+        if pkt.lost {
+            pkt.lost = false;
+            self.inflight_count += 1;
+        }
+        self.send_order.push_back((now, seq));
+        self.retransmits += 1;
+        if was_idle {
+            self.congestion
+                .on_transmit_start(self.srtt, self.inflight_count, now_ms);
+        }
+        Some(sent)
+    }
+
+    /// Take what the congestion window, the peer's window and the pacer
+    /// allow now (C `send_packets`): lost packets first, then queued data.
+    /// Retransmits ignore the peer's window, as in C `stream_may_send`.
+    /// Returns the packets, why the batch ended and whether it held new data.
+    fn take_send_batch(&mut self) -> (Vec<(Vec<u8>, SocketAddr)>, SendStop, bool) {
         let mut batch = Vec::new();
+        let mut new_data = false;
         // A hooked stream has no peer until its first packet commits one (C
         // `udx_stream_write` is ENOTCONN before that): sending now would
         // address 0.0.0.0:0 and lose the packets for good, retransmits included.
-        while self.connected && !self.send_queue.is_empty() {
+        if !self.connected {
+            return (batch, SendStop::Idle, false);
+        }
+        loop {
+            let lost = self.next_lost();
+            if lost.is_none() && !self.has_unsent() {
+                return (batch, SendStop::Idle, new_data);
+            }
             // `register_sent` already counts this batch's packets.
             let inflight = self.inflight();
-            self.congestion
-                .check_app_limited(self.queued_bytes, inflight);
-            if !self.congestion.can_send(inflight, self.send_rwnd) {
-                break;
-            }
-            let delay = self.congestion.pacing_delay(Instant::now());
-            if delay > std::time::Duration::ZERO {
-                return (batch, Some(delay));
-            }
-            let Some(queued) = self.pop_queued() else {
-                break;
+            let window = if lost.is_some() {
+                u32::MAX
+            } else {
+                self.send_rwnd
             };
-            let mut packet = queued.packet;
-            let is_data = packet.len() >= HEADER_SIZE && packet[2] & FLAG_DATA != 0;
-            if is_data && self.mtu_state == MtuState::Base {
-                self.mtu_state = MtuState::Search;
-                self.mtu_probe_wanted = true;
+            if !self.congestion.can_send(inflight, window) {
+                return (batch, SendStop::Window, new_data);
             }
-            // No probes while old-path packets are still in flight (C udx.c:846).
-            let is_mtu_probe = is_data
-                && self.mtu_state == MtuState::Search
-                && self.mtu_probe_wanted
-                && self.remote_change.is_none()
-                && self.mtu_probeify_packet(&mut packet);
-            self.register_sent(queued.seq, packet.clone(), queued.remote_addr, is_mtu_probe);
+            let now = self.now();
+            let delay = self.congestion.pacing_delay(now);
+            if delay > std::time::Duration::ZERO {
+                return (batch, SendStop::Pacing(delay), new_data);
+            }
+            // C `_send_packet` checks just before each send; a retransmit
+            // waiting means the sender is not app-limited.
             self.congestion
-                .pacing
-                .try_consume(packet.len() as u32, Instant::now());
-            batch.push((packet, queued.remote_addr));
+                .check_app_limited(self.unacked_written, inflight, lost.is_some());
+            let sent = match lost {
+                Some(seq) => {
+                    self.lost_queue.pop_front();
+                    self.retransmit(seq)
+                }
+                None => self.send_new(true),
+            };
+            let Some((packet, to)) = sent else { continue };
+            new_data |= lost.is_none();
+            self.congestion.pacing.try_consume(packet.len() as u32, now);
+            batch.push((packet, to));
         }
-        (batch, None)
+    }
+
+    /// Build and register the next packet (C `_send_new_packet`), as an MTU
+    /// probe when one is wanted and `may_probe` (not for a loss probe).
+    fn send_new(&mut self, may_probe: bool) -> Option<(Vec<u8>, SocketAddr)> {
+        let remote_addr = self.remote_addr?;
+        let (seq, mut packet) = self.next_packet()?;
+        // No probes while old-path packets are still in flight (C udx.c:846).
+        let is_mtu_probe = may_probe
+            && self.mtu_probe_wanted
+            && self.remote_change.is_none()
+            && self.mtu_probeify_packet(&mut packet, remote_addr);
+        if is_mtu_probe {
+            self.mtu_probe_count += 1;
+        }
+        self.register_sent(seq, packet.clone(), remote_addr, is_mtu_probe);
+        Some((packet, remote_addr))
+    }
+
+    /// Base tail-loss-probe timeout in ms, or `None` when no probe is due
+    /// (C `schedule_loss_probe`, RACK §7.2).
+    fn loss_probe_timeout(&self) -> Option<u32> {
+        if self.outgoing.is_empty()
+            || self.congestion.ca_state != CaState::Open
+            || self.sacked_count > 0
+        {
+            return None;
+        }
+        if self.srtt == 0 {
+            return Some(1_000);
+        }
+        let extra = if self.outgoing.len() == 1 {
+            TLP_MAX_ACK_DELAY_MS
+        } else {
+            0
+        };
+        Some(self.srtt * 2 + extra)
+    }
+
+    /// The loss probe timer fired (C `udx_tlp_timeout`): send one new packet
+    /// regardless of the windows, or else the last packet sent again.
+    fn take_loss_probe(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
+        if self.outgoing.is_empty() || self.tlp_in_flight || !self.tlp_permitted {
+            return None;
+        }
+        // C `_send_packet` checks app-limited before every send.
+        let retransmit_pending = self.next_lost().is_some();
+        let inflight = self.inflight();
+        self.congestion
+            .check_app_limited(self.unacked_written, inflight, retransmit_pending);
+        let (sent, end_seq, is_retrans) = if self.connected && self.has_unsent() {
+            let seq = self.next_seq;
+            (self.send_new(false)?, seq, false)
+        } else {
+            let (&seq, pkt) = self.outgoing.last_key_value()?;
+            if pkt.lost || pkt.sacked {
+                return None;
+            }
+            (self.retransmit(seq)?, seq, true)
+        };
+        let now = self.now();
+        self.congestion.pacing.try_consume(sent.0.len() as u32, now);
+        self.tlp_in_flight = true;
+        self.tlp_is_retrans = is_retrans;
+        self.tlp_end_seq = end_seq;
+        self.tlp_permitted = false;
+        Some(sent)
+    }
+
+    /// The retransmission timer fired with data in flight (C
+    /// `udx_rto_timeout`): mark lost what had time to be ACKed and cut the
+    /// window to what is still in flight plus one. `rto` itself stays; only
+    /// the timer backs off (`rto_fired`). The lost packets leave through
+    /// `take_send_batch`.
+    fn on_rto(&mut self) {
+        let now = self.now();
+        self.congestion.on_rto(self.next_seq);
+        self.tlp_in_flight = false;
+        self.tlp_is_retrans = false;
+        self.lost_queue.clear();
+        // C reads the reorder window after entering Loss (rack 6.3).
+        let wait = std::time::Duration::from_millis(
+            u64::from(self.rack_rtt) + u64::from(self.rack_reo_wnd()),
+        );
+        let mut newly_lost = Vec::new();
+        for (&seq, pkt) in &mut self.outgoing {
+            if pkt.sacked {
+                continue;
+            }
+            if !pkt.lost && (seq == self.remote_acked || pkt.time_sent + wait < now) {
+                pkt.lost = true;
+                newly_lost.push(seq);
+            }
+            if pkt.lost {
+                self.lost_queue.push_back(seq);
+            }
+        }
+        self.inflight_count -= newly_lost.len() as u32;
+        for seq in newly_lost {
+            self.unprobeify(seq);
+        }
+        self.congestion.cwnd = self.inflight_count + 1;
+    }
+
+    /// The RTO timer fired with data in flight (C `udx_rto_timeout`): give
+    /// up (`None`) on the seventh firing without progress, else run
+    /// `on_rto` and return the next timeout, `2 × rto` (C keeps `rto` and
+    /// doubles only the timer, udx.c:1234).
+    fn rto_fired(&mut self) -> Option<std::time::Duration> {
+        self.rto_timeouts += 1;
+        if self.rto_timeouts > MAX_RTO_TIMEOUTS {
+            return None;
+        }
+        self.on_rto();
+        Some(std::time::Duration::from_millis(u64::from(self.rto) * 2))
     }
 
     // ── RTT estimation (Jacobson/Karels) ─────────────────────────────────────
 
-    /// Update the RTT estimator with a new sample.
+    /// Update the RTT estimator with a sample already passed through
+    /// `clamp_rtt` and floored at 1 ms (C `ack_packet`).
     ///
     /// Uses standard constants matching C libudx:
     ///   α = 1/8 (SRTT smoothing)
     ///   β = 1/4 (RTTVAR smoothing)
     ///   K = 4   (RTO multiplier for RTTVAR)
     ///   G = 1000ms (minimum RTO granularity)
-    fn update_rtt(&mut self, rtt_ms: u32) {
-        let rtt = rtt_ms.min(MAX_RTT_MS);
+    fn update_rtt(&mut self, rtt: u32) {
         if self.srtt == 0 {
             // First sample
             self.srtt = rtt;
@@ -673,22 +1244,85 @@ impl StreamInner {
             // SRTT <- (7/8) * SRTT + (1/8) * R
             self.srtt = (7 * self.srtt + rtt) / 8;
         }
+        self.tlp_permitted = true;
         // RTO <- SRTT + max(G, K * RTTVAR) where K=4, G=1000ms
         self.rto = (self.srtt + 4 * self.rttvar).clamp(1_000, MAX_RTO_MS);
+    }
+
+    /// An RTT sample as C `clamp_rtt` takes it: the first is capped at
+    /// `MAX_RTT_MS`; later ones only when they look like a suspend (over
+    /// 5 s and over `srtt + 5 * rttvar`), down to that bound.
+    fn clamp_rtt(&self, rtt: u64) -> u32 {
+        if self.srtt == 0 {
+            return rtt.min(u64::from(MAX_RTT_MS)) as u32;
+        }
+        let outlier = u64::from(self.srtt) + 5 * u64::from(self.rttvar);
+        if rtt > outlier && rtt > 5_000 {
+            return outlier.min(u64::from(MAX_RTT_MS)) as u32;
+        }
+        rtt as u32
+    }
+
+    /// RACK §6.2 for one packet the peer delivered, cumulatively or by SACK
+    /// (C `ack_packet`, udx.c:1351-1404): RTT sample, minimum RTT, the RACK
+    /// packet and reordering detection.
+    fn on_packet_acked(&mut self, seq: u32, time_sent: Instant, retransmitted: bool, now: Instant) {
+        let mut rtt = self.clamp_rtt(now.saturating_duration_since(time_sent).as_millis() as u64);
+        if !retransmitted {
+            // A 1 ms clock: 0 means "under a millisecond", and srtt 0 means
+            // no sample yet.
+            rtt = rtt.max(1);
+            let t = self.clock_ms(now);
+            self.rtt_min.apply_min(RTT_MIN_WINDOW_MS, t, rtt);
+            self.update_rtt(rtt);
+        }
+        // Step 2: the delivered packet sent last.
+        if !retransmitted || rtt >= self.rtt_min.get() {
+            self.rack_rtt = rtt;
+            // C `rs->rtt_ms`: the ACK's rate sample takes this RTT.
+            self.rs_rtt = rtt;
+            self.rack_advance(time_sent, seq);
+        }
+        // Step 3: a never-retransmitted packet delivered below the highest
+        // delivered one was reordered.
+        let next = seq.wrapping_add(1);
+        if seq_after(next, self.rack_fack) {
+            self.rack_fack = next;
+        } else if seq_after(self.rack_fack, next) && !retransmitted {
+            self.reordering_seen = true;
+        }
+    }
+
+    /// RACK §6.2.4 reorder window in ms (C `rack_update_reo_wnd`): closed in
+    /// recovery and after three SACKed packets until reordering is seen,
+    /// else a quarter of the minimum RTT, at most `srtt`.
+    fn rack_reo_wnd(&self) -> u32 {
+        if !self.reordering_seen
+            && (self.congestion.ca_state != CaState::Open || self.sacked_count >= 3)
+        {
+            return 0;
+        }
+        (self.rtt_min.get() / 4).min(self.srtt)
     }
 
     // ── ACK processing ───────────────────────────────────────────────────────
 
     /// Process a cumulative ACK from the remote peer.
     ///
-    /// Removes ACKed packets from the outgoing buffer, measures RTT from the
-    /// earliest non-retransmitted packet, resets the RTO timeout counter, and
-    /// returns completed write senders plus rate info for congestion control.
+    /// Removes ACKed packets from the outgoing buffer, runs RACK's per-packet
+    /// update (`on_packet_acked`) for each one not SACKed before, resets the
+    /// RTO timeout counter, and returns completed write senders plus rate
+    /// info for congestion control. A packet SACKed earlier was delivered
+    /// then (C removes it from `outgoing` at the SACK), so it counts once.
+    ///
+    /// An ACK beyond the first unsent seq is ignored (C udx.c:1738): it
+    /// cannot come from the peer, and accepting it would fake delivery.
     ///
     /// Congestion control is NOT called here — the caller must combine this
     /// rate info with SACK rate info and loss count, then call `congestion.on_ack`.
     fn on_cumulative_ack(&mut self, ack: u32) -> (WriteSenders, AckedRateInfo) {
-        if !seq_after(ack, self.remote_acked) {
+        let now = self.now();
+        if !seq_after(ack, self.remote_acked) || seq_after(ack, self.next_seq) {
             return (Vec::new(), Vec::new());
         }
 
@@ -714,26 +1348,36 @@ impl StreamInner {
         });
         let removed = std::mem::replace(&mut self.outgoing, to_keep);
 
-        let mut rtt_measured = false;
-        let mut acked_rate_info: Vec<(u32, super::congestion::rate::PacketRateInfo)> = Vec::new();
+        let mut acked_rate_info = Vec::new();
         for (&seq, pkt) in &removed {
             self.unacked_bytes = self.unacked_bytes.saturating_sub(pkt.packet.len());
             if pkt.is_inflight() {
                 self.inflight_count -= 1;
             }
-            if pkt.retransmit_count == 0 {
-                if !rtt_measured {
-                    let elapsed = pkt.time_sent.elapsed().as_millis() as u32;
-                    self.update_rtt(elapsed);
-                    rtt_measured = true;
+            if pkt.sacked {
+                self.sacked_count -= 1;
+            } else {
+                self.unacked_written = self
+                    .unacked_written
+                    .saturating_sub(payload_len(&pkt.packet));
+                self.on_packet_acked(seq, pkt.time_sent, pkt.retransmit_count > 0, now);
+                if let Some(info) = pkt.rate_info {
+                    acked_rate_info.push(Delivered {
+                        seq,
+                        time_sent: self.clock_ms(pkt.time_sent),
+                        info,
+                    });
                 }
-                self.rack_advance(pkt.time_sent, seq);
             }
-            if let Some(info) = &pkt.rate_info {
-                acked_rate_info.push((seq, *info));
-            }
-            if pkt.is_mtu_probe && self.mtu_state == MtuState::Search {
+            // C `ack_packet`: a probe counts only while probes are out on
+            // this path (`mtu_probe_count > 0`).
+            if pkt.is_mtu_probe && self.mtu_state == MtuState::Search && self.mtu_probe_count > 0 {
                 self.on_mtu_probe_acked();
+            }
+            // The first delivery starts the MTU search (C `ack_packet`).
+            if self.mtu_state == MtuState::Base {
+                self.mtu_state = MtuState::Search;
+                self.mtu_probe_wanted = true;
             }
         }
 
@@ -772,10 +1416,8 @@ impl StreamInner {
     /// Ranges are untrusted input: only packets actually in `outgoing` are
     /// visited, so a block like `0..0xFFFFFFFF` costs one tree walk, not four
     /// billion lookups (C `udx_sack_is_valid` rejects it outright).
-    fn on_sack(
-        &mut self,
-        ranges: &[SackRange],
-    ) -> Vec<(u32, super::congestion::rate::PacketRateInfo)> {
+    fn on_sack(&mut self, ranges: &[SackRange]) -> Vec<Delivered> {
+        let epoch = self.epoch;
         let mut sack_rate_info = Vec::new();
         let mut delivered = Vec::new();
         let mut left_flight = 0;
@@ -820,11 +1462,21 @@ impl StreamInner {
                             left_flight += 1;
                         }
                         pkt.sacked = true;
-                        if pkt.retransmit_count == 0 {
-                            delivered.push((pkt.time_sent, seq));
-                        }
-                        if let Some(info) = &pkt.rate_info {
-                            sack_rate_info.push((seq, *info));
+                        self.sacked_count += 1;
+                        // C `ack_packet` counts SACKed bytes as ACKed.
+                        self.unacked_written = self
+                            .unacked_written
+                            .saturating_sub(payload_len(&pkt.packet));
+                        delivered.push((seq, pkt.time_sent, pkt.retransmit_count > 0));
+                        if let Some(info) = pkt.rate_info {
+                            sack_rate_info.push(Delivered {
+                                seq,
+                                time_sent: pkt
+                                    .time_sent
+                                    .saturating_duration_since(epoch)
+                                    .as_millis() as u64,
+                                info,
+                            });
                         }
                     }
                 }
@@ -832,8 +1484,13 @@ impl StreamInner {
             cover_insert(&mut self.sack_cover, start, end);
         }
         self.inflight_count -= left_flight;
-        for (time_sent, seq) in delivered {
-            self.rack_advance(time_sent, seq);
+        if left_flight > 0 && self.mtu_state == MtuState::Base {
+            self.mtu_state = MtuState::Search;
+            self.mtu_probe_wanted = true;
+        }
+        let now = self.now();
+        for (seq, time_sent, retransmitted) in delivered {
+            self.on_packet_acked(seq, time_sent, retransmitted, now);
         }
         sack_rate_info
     }
@@ -851,76 +1508,164 @@ impl StreamInner {
 
     // ── Loss detection ───────────────────────────────────────────────────────
 
-    /// Detect lost packets with RACK's ordering rule (C `rack_detect_loss`,
-    /// RFC 8985 §6.2): an unacked packet is lost once the peer has delivered
-    /// a packet that was sent after it. A retransmission gets a fresh send
-    /// time, so it is not declared lost again until something sent after it
-    /// is delivered, about one RTT later; without that, every SACK arriving
-    /// during a retransmission's flight would retransmit it once more.
-    /// Returns the number of newly detected losses.
+    /// Detect lost packets with RACK (C `rack_detect_loss`, RFC 8985 §6.2):
+    /// an unacked packet is lost once the peer has delivered a packet sent
+    /// after it and `rack_rtt + reo_wnd` has passed since it was sent. A
+    /// retransmission gets a fresh send time, so it is not declared lost
+    /// again until something sent after it is delivered, about one RTT
+    /// later; without that, every SACK arriving during a retransmission's
+    /// flight would retransmit it once more.
     ///
-    /// Simplification of C: no reordering window (`reo_wnd`) and no timer;
-    /// a packet is lost as soon as the ordering rule says so.
-    fn detect_losses(&mut self) -> u32 {
-        // ACKed packets can never be lost: drop their entries even before the first delivery.
-        while let Some(&(_, seq)) = self.send_order.front() {
-            if self.outgoing.contains_key(&seq) {
-                break;
-            }
-            self.send_order.pop_front();
-        }
+    /// Returns the number of newly detected losses and, when a packet sent
+    /// before the RACK packet is still inside the reorder window, how long
+    /// until the last such packet leaves it (C's `timeout`, the reorder
+    /// timer, `udx_rack_reo_timeout`).
+    fn detect_losses(&mut self, now: Instant) -> (u32, Option<std::time::Duration>) {
+        self.drop_finished_send_order();
         let Some((rack_time_sent, rack_seq)) = self.rack else {
-            return 0;
+            return (0, None);
         };
+        let wait = std::time::Duration::from_millis(
+            u64::from(self.rack_rtt) + u64::from(self.rack_reo_wnd()),
+        );
 
-        // An entry is current while its packet still carries that send time.
+        // Send times never decrease along `send_order`, so the scan stops at
+        // the first entry sent after the RACK packet (C breaks there too).
         let mut lost_seqs = Vec::new();
-        // Sent strictly before the newest delivery: lost if still in flight;
-        // either way the entry is finished with.
+        let mut timeout = None;
+        for &(sent, seq) in &self.send_order {
+            if sent > rack_time_sent {
+                break;
+            }
+            // Sent at the same instant: the seq decides.
+            if sent == rack_time_sent && !seq_after(rack_seq, seq) {
+                continue;
+            }
+            // An entry is current while its packet still carries that send time.
+            let Some(pkt) = self.outgoing.get_mut(&seq) else {
+                continue;
+            };
+            if pkt.time_sent != sent || !pkt.is_inflight() {
+                continue;
+            }
+            let deadline = sent + wait;
+            if deadline <= now {
+                pkt.lost = true;
+                lost_seqs.push(seq);
+            } else {
+                // Later entries were sent later: this is the largest so far.
+                timeout = Some(deadline - now);
+            }
+        }
+        self.drop_finished_send_order();
+        self.inflight_count -= lost_seqs.len() as u32;
+        self.lost_queue.extend(lost_seqs.iter().copied());
+        let mtu_probes = lost_seqs
+            .iter()
+            .filter(|seq| self.outgoing.get(seq).is_some_and(|p| p.is_mtu_probe))
+            .count() as u32;
+        for &seq in &lost_seqs {
+            self.unprobeify(seq);
+        }
+        // C `rack_detect_loss`: recovery lasts until the ACK passes what
+        // was sent so far.
+        let (lost, recovery) =
+            self.congestion
+                .on_losses(lost_seqs.len() as u32, mtu_probes, self.next_seq);
+        if recovery {
+            // RACK §7.1 TLP_init.
+            self.tlp_in_flight = false;
+            self.tlp_is_retrans = false;
+        }
+        (lost, timeout)
+    }
+
+    /// Drop `send_order` entries at the front that loss detection is done
+    /// with: the packet was ACKed, SACKed, marked lost or sent again since.
+    fn drop_finished_send_order(&mut self) {
         while let Some(&(sent, seq)) = self.send_order.front() {
-            if sent >= rack_time_sent {
+            if self
+                .outgoing
+                .get(&seq)
+                .is_some_and(|p| p.time_sent == sent && p.is_inflight())
+            {
                 break;
             }
             self.send_order.pop_front();
-            if let Some(pkt) = self.outgoing.get_mut(&seq) {
-                if pkt.time_sent == sent && pkt.is_inflight() {
-                    pkt.lost = true;
-                    lost_seqs.push(seq);
-                }
-            }
         }
-        // Sent at the same instant: the seq decides, and the entries stay.
-        for &(sent, seq) in &self.send_order {
-            if sent != rack_time_sent {
-                break;
-            }
-            if seq_after(rack_seq, seq) {
-                if let Some(pkt) = self.outgoing.get_mut(&seq) {
-                    if pkt.time_sent == sent && pkt.is_inflight() {
-                        pkt.lost = true;
-                        lost_seqs.push(seq);
-                    }
-                }
-            }
+    }
+
+    /// The reorder timer fired (C `udx_rack_reo_timeout`): run loss
+    /// detection again with no new ACK. Packets still inside the window wait
+    /// for the next ACK or the RTO, as in C. Returns the newly lost count.
+    fn on_reorder_timeout(&mut self) -> u32 {
+        let now = self.now();
+        self.detect_losses(now).0
+    }
+
+    /// Process the ACK part of an incoming packet: window, cumulative ACK,
+    /// SACK blocks, loss detection and congestion control.
+    fn on_ack_packet(&mut self, header: &Header, sacks: Option<&[SackRange]>) -> AckOutcome {
+        // An ACK for data never sent is out of bounds (C udx.c:1738).
+        if seq_after(header.ack, self.next_seq) {
+            return AckOutcome::default();
         }
-        self.inflight_count -= lost_seqs.len() as u32;
-        self.lost_queue.extend_from_slice(&lost_seqs);
-
-        let was_open = self.congestion.ca_state == CaState::Open;
-
-        for &seq in &lost_seqs {
-            self.congestion.on_packet_lost(seq);
+        // An older ACK must not overwrite a newer window (C send_wl2).
+        if !seq_after(self.remote_acked, header.ack) {
+            self.send_rwnd = header.recv_window;
         }
-
-        // Record the recovery boundary: when all packets up to high_seq
-        // are ACK'd, we can exit Recovery → Open.
-        if was_open && self.congestion.ca_state == CaState::Recovery {
-            if let Some(&max_seq) = self.outgoing.keys().last() {
-                self.congestion.high_seq = max_seq;
-            }
+        // RACK §7.4.2: the loss probe repaired the tail.
+        if self.tlp_in_flight
+            && !seq_after(self.tlp_end_seq, header.ack)
+            && (!self.tlp_is_retrans || seq_after(header.ack, self.tlp_end_seq))
+        {
+            self.tlp_in_flight = false;
         }
-
-        lost_seqs.len() as u32
+        // C `process_packet`: Recovery and Loss end once the cumulative ACK
+        // passes `high_seq`, before this ACK's packets are counted.
+        self.congestion.on_cumulative_ack(header.ack);
+        let data_inflight = self.remote_acked != self.next_seq;
+        self.rs_rtt = 0;
+        let prev_acked = self.remote_acked;
+        let (completed, mut acked_rate_info) = self.on_cumulative_ack(header.ack);
+        if let Some(ranges) = sacks {
+            acked_rate_info.extend(self.on_sack(ranges));
+        }
+        let now = self.now();
+        // Loss detection runs only when the ACK delivered something (C
+        // `if (delivered > 0)`, rack 6.2.5).
+        let delivered = !acked_rate_info.is_empty();
+        let (lost_count, reorder_timeout, batch) = if delivered {
+            let (lost, timeout) = self.detect_losses(now);
+            // C `rack_detect_loss` ends with `send_packets` (udx.c:1164),
+            // before `bbr_main`: the lost packets leave under the window
+            // they were lost from, which BBR's recovery window then covers.
+            (lost, timeout, self.take_send_batch().0)
+        } else {
+            (0, None, Vec::new())
+        };
+        // C runs the rate sample and BBR on every ACK that found data in
+        // flight, whatever it delivered.
+        if data_inflight {
+            let inflight = self.inflight();
+            let now_ms = self.clock_ms(now);
+            self.congestion.on_ack(
+                &acked_rate_info,
+                lost_count,
+                inflight,
+                self.srtt,
+                self.rs_rtt,
+                self.rtt_min.get(),
+                now_ms,
+            );
+        }
+        AckOutcome {
+            completed,
+            ack_advanced: self.remote_acked != prev_acked,
+            delivered,
+            reorder_timeout,
+            batch,
+        }
     }
 
     // ── Receive buffering ────────────────────────────────────────────────────
@@ -934,6 +1679,10 @@ impl StreamInner {
     /// A single packet may carry both FLAG_DATA and FLAG_END (C libudx combines
     /// the last data chunk with the end marker). In that case two events are
     /// produced: Data followed by End.
+    ///
+    /// Out-of-order packets beyond the window we advertise are dropped: a
+    /// sender that honours the window never sends them, and keeping them
+    /// would let one peer grow the buffer without bound (C has no bound).
     fn receive_data(
         &mut self,
         seq: u32,
@@ -941,127 +1690,80 @@ impl StreamInner {
         flags: u8,
         events: &mut Vec<StreamEvent>,
     ) {
-        // Duplicate or already-received packet — ignore
-        if seq < self.next_remote_seq {
+        // After the peer's END nothing more is read (C `SHOULD_READ`,
+        // udx.c:1682): readers have their EOF.
+        if self.remote_ended {
             return;
         }
-
-        if seq == self.next_remote_seq {
+        let next = self.next_remote_seq;
+        if seq == next {
             // In-order: deliver directly
             push_events(events, payload, flags);
-            self.next_remote_seq = seq + 1;
+            self.remote_ended |= flags & FLAG_END != 0;
+            self.next_remote_seq = seq.wrapping_add(1);
 
-            // Drain consecutive buffered packets
-            while let Some(recvd) = self.recv_buf.remove(&self.next_remote_seq) {
-                push_events(events, recvd.payload, recvd.flags);
-                self.next_remote_seq += 1;
+            // Drain the buffered range that now continues the stream.
+            if self
+                .recv_ranges
+                .first()
+                .is_some_and(|&(start, _)| start == self.next_remote_seq)
+            {
+                self.recv_ranges.remove(0);
+                while let Some(recvd) = self.recv_buf.remove(&self.next_remote_seq) {
+                    push_events(events, recvd.payload, recvd.flags);
+                    self.remote_ended |= recvd.flags & FLAG_END != 0;
+                    self.next_remote_seq = self.next_remote_seq.wrapping_add(1);
+                    if self.remote_ended {
+                        self.recv_buf.clear();
+                        self.recv_ranges.clear();
+                        break;
+                    }
+                }
             }
-        } else {
-            // Out-of-order: buffer for later delivery
-            self.recv_buf
-                .entry(seq)
-                .or_insert(RecvdPacket { payload, flags });
+            return;
         }
+        // Duplicate or already-received packet, or beyond the window.
+        if !seq_after(seq, next)
+            || seq.wrapping_sub(next) >= RECV_WINDOW_PACKETS
+            || self.recv_buf.contains_key(&seq)
+        {
+            return;
+        }
+        self.recv_buf.insert(seq, RecvdPacket { payload, flags });
+        range_insert(&mut self.recv_ranges, next, seq);
     }
 
     // ── SACK generation ──────────────────────────────────────────────────────
 
-    /// Compute SACK ranges from the out-of-order receive buffer.
-    /// Returns contiguous ranges of received sequence numbers that are
-    /// beyond the cumulative ACK point.
+    /// SACK ranges of the out-of-order receive buffer, lowest first, at most
+    /// `MAX_SACK_RANGES` (C `send_ack`).
     fn sack_ranges(&self) -> Vec<SackRange> {
-        if self.recv_buf.is_empty() {
-            return Vec::new();
-        }
-
-        let mut ranges = Vec::new();
-        let mut iter = self.recv_buf.keys();
-
-        if let Some(&first) = iter.next() {
-            let mut start = first;
-            let mut end = first + 1;
-
-            for &seq in iter {
-                if seq == end {
-                    // Extend current range
-                    end = seq + 1;
-                } else {
-                    // Gap found: close current range, start new one
-                    ranges.push(SackRange { start, end });
-                    if ranges.len() >= MAX_SACK_RANGES {
-                        return ranges;
-                    }
-                    start = seq;
-                    end = seq + 1;
-                }
-            }
-            ranges.push(SackRange { start, end });
-        }
-        ranges
+        self.recv_ranges
+            .iter()
+            .take(MAX_SACK_RANGES)
+            .map(|&(start, end)| SackRange { start, end })
+            .collect()
     }
+}
 
-    // ── Retransmission ───────────────────────────────────────────────────────
-
-    /// Collect packets to retransmit: every un-SACKed packet (RTO), or with
-    /// `only_lost` just the ones SACK gap analysis marked lost (fast retransmit).
-    /// Updates retransmit_count and time_sent for each retransmitted packet.
-    /// For MTU probes: strips padding, marks failure, and may transition to SearchComplete.
-    fn collect_retransmits(&mut self, only_lost: bool) -> Vec<(Vec<u8>, SocketAddr)> {
-        let now = Instant::now();
-        let mut retransmits = Vec::new();
-        let mut probe_failed = false;
-        let mut stripped = 0;
-        // Fast retransmit visits only what `detect_losses` marked, in seq order
-        // like the full (RTO) walk.
-        let seqs: Vec<u32> = if only_lost {
-            let mut seqs = std::mem::take(&mut self.lost_queue);
-            seqs.sort_unstable();
-            seqs.dedup();
-            seqs
-        } else {
-            self.lost_queue.clear();
-            self.outgoing.keys().copied().collect()
-        };
-        for seq in seqs {
-            let Some(pkt) = self.outgoing.get_mut(&seq) else {
-                continue;
-            };
-            if !pkt.sacked && (pkt.lost || !only_lost) {
-                if pkt.is_mtu_probe {
-                    let before = pkt.packet.len();
-                    strip_probe_padding(&mut pkt.packet);
-                    stripped += before - pkt.packet.len();
-                    pkt.is_mtu_probe = false;
-                    probe_failed = true;
-                }
-                retransmits.push((pkt.packet.clone(), pkt.remote_addr));
-                pkt.retransmit_count += 1;
-                pkt.time_sent = now;
-                if pkt.lost {
-                    pkt.lost = false;
-                    self.inflight_count += 1;
-                }
-                self.send_order.push_back((now, seq));
-            }
+/// Add `seq` to `ranges` (sorted, disjoint, non-adjacent half-open seq
+/// ranges, ordered by distance from `base`), merging neighbours like C's
+/// SACK block tree. `seq` must not be in a range yet.
+fn range_insert(ranges: &mut Vec<(u32, u32)>, base: u32, seq: u32) {
+    let offset = |s: u32| s.wrapping_sub(base);
+    let next = seq.wrapping_add(1);
+    // First range ending at or after `seq`.
+    let at = ranges.partition_point(|&(_, end)| offset(end) < offset(seq));
+    if at < ranges.len() && ranges[at].1 == seq {
+        ranges[at].1 = next;
+        if at + 1 < ranges.len() && ranges[at + 1].0 == next {
+            ranges[at].1 = ranges[at + 1].1;
+            ranges.remove(at + 1);
         }
-        self.unacked_bytes = self.unacked_bytes.saturating_sub(stripped);
-        self.retransmits += retransmits.len() as u64;
-        if probe_failed {
-            self.mtu_probe_count += 1;
-            tracing::debug!(
-                failures = self.mtu_probe_count,
-                max = MTU_MAX_PROBES,
-                only_lost,
-                "mtu: probe failed (retransmit)"
-            );
-            if self.mtu_probe_count >= MTU_MAX_PROBES {
-                self.mtu_state = MtuState::SearchComplete;
-                self.mtu_probe_wanted = false;
-            } else {
-                self.mtu_probe_wanted = true;
-            }
-        }
-        retransmits
+    } else if at < ranges.len() && ranges[at].0 == next {
+        ranges[at].0 = seq;
+    } else {
+        ranges.insert(at, (seq, next));
     }
 }
 
@@ -1125,19 +1827,98 @@ fn push_events(events: &mut Vec<StreamEvent>, payload: Vec<u8>, flags: u8) {
     }
 }
 
-// ── WritePrep ────────────────────────────────────────────────────────────────
-
-/// Sequence numbers reserved for one write (or the FIN); `ack_threshold` is
-/// one past the last reserved seq.
-pub(crate) struct WritePrep {
-    pub remote_addr: SocketAddr,
-    pub remote_id: u32,
-    pub first_seq: u32,
-    pub ack_threshold: u32,
-    pub current_ack: u32,
-}
-
 // ── UdxStream ────────────────────────────────────────────────────────────────
+
+impl StreamInner {
+    fn new(
+        local_id: u32,
+        read_tx: mpsc::UnboundedSender<StreamEvent>,
+        close_tx: Option<oneshot::Sender<()>>,
+        incoming_tx: Option<mpsc::Sender<IncomingPacket>>,
+        registrations: Registrations,
+        runtime: Option<Weak<super::runtime::RuntimeHandle>>,
+    ) -> Self {
+        let (close_watch_tx, close_watch_rx) = watch::channel(false);
+        let (message_tx, message_rx) = mpsc::channel(MESSAGE_QUEUE);
+        let epoch = Instant::now();
+        Self {
+            remote_id: 0,
+            remote_addr: None,
+            connected: false,
+            terminated: false,
+            ended: false,
+            remote_ended: false,
+            timewait_wanted: false,
+            next_seq: 0,
+            pending_writes: Vec::new(),
+            outgoing: BTreeMap::new(),
+            inflight_count: 0,
+            send_order: VecDeque::new(),
+            lost_queue: VecDeque::new(),
+            sacked_count: 0,
+            sack_cover: Vec::new(),
+            queued_bytes: 0,
+            unacked_written: 0,
+            unacked_bytes: 0,
+            write_waker: None,
+            flush_waker: None,
+            next_remote_seq: 0,
+            remote_acked: 0,
+            rack: None,
+            rack_rtt: 0,
+            rs_rtt: 0,
+            zwp_wanted: false,
+            rack_fack: 0,
+            reordering_seen: false,
+            rtt_min: WinFilter::new(0, u32::MAX),
+            epoch,
+            #[cfg(test)]
+            clock: None,
+            recv_buf: BTreeMap::new(),
+            recv_ranges: Vec::new(),
+            srtt: 0,
+            rttvar: 0,
+            rto: INITIAL_RTO_MS,
+            rto_timeouts: 0,
+            retransmits: 0,
+            send_rwnd: DEFAULT_RWND,
+            tlp_permitted: false,
+            tlp_in_flight: false,
+            tlp_is_retrans: false,
+            tlp_end_seq: 0,
+            keepalive: Some(DEFAULT_KEEPALIVE),
+            mtu_state: MtuState::Base,
+            mtu: MTU_BASE,
+            mtu_probe_size: MTU_BASE,
+            mtu_probe_count: 0,
+            mtu_probe_wanted: false,
+            mtu_max: MTU_MAX,
+            udp: None,
+            socket: None,
+            read_tx,
+            close_tx,
+            close_watch_tx,
+            close_watch_rx,
+            notify_tx: None,
+            congestion: super::congestion::CongestionController::new(MAX_PAYLOAD as u32, epoch),
+            write_queue: VecDeque::new(),
+            relay_target: None,
+            endpoint: Endpoint::default(),
+            firewall_hook: None,
+            local_id,
+            incoming_tx,
+            registrations,
+            remote_change: None,
+            remote_observed: None,
+            observed_current_remote: false,
+            message_tx: Some(message_tx),
+            message_rx: Arc::new(tokio::sync::Mutex::new(message_rx)),
+            runtime,
+            #[cfg(test)]
+            pacing_wakeups: 0,
+        }
+    }
+}
 
 /// A reliable, ordered, bidirectional byte stream over UDP.
 ///
@@ -1148,8 +1929,8 @@ pub struct UdxStream {
     local_id: u32,
     pub(crate) inner: Arc<Mutex<StreamInner>>,
     processor: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    incoming_tx: Option<mpsc::UnboundedSender<IncomingPacket>>,
-    incoming_rx: Mutex<Option<mpsc::UnboundedReceiver<IncomingPacket>>>,
+    incoming_tx: Option<mpsc::Sender<IncomingPacket>>,
+    incoming_rx: Mutex<Option<mpsc::Receiver<IncomingPacket>>>,
     pub(crate) read_rx: Option<mpsc::UnboundedReceiver<StreamEvent>>,
     close_rx: Option<oneshot::Receiver<()>>,
     /// Stream maps of every socket this stream is registered on, so the
@@ -1164,64 +1945,17 @@ impl UdxStream {
     ) -> Self {
         let (read_tx, read_rx) = mpsc::unbounded_channel();
         let (close_tx, close_rx) = oneshot::channel();
-        let (close_watch_tx, close_watch_rx) = watch::channel(false);
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_QUEUE);
         let registrations = Registrations::default();
 
-        let inner = StreamInner {
-            remote_id: 0,
-            remote_addr: None,
-            connected: false,
-            terminated: false,
-            ended: false,
-            next_seq: 0,
-            pending_writes: Vec::new(),
-            outgoing: BTreeMap::new(),
-            inflight_count: 0,
-            send_order: VecDeque::new(),
-            lost_queue: Vec::new(),
-            sack_cover: Vec::new(),
-            queued_bytes: 0,
-            unacked_bytes: 0,
-            write_waker: None,
-            flush_waker: None,
-            next_remote_seq: 0,
-            remote_acked: 0,
-            rack: None,
-            recv_buf: BTreeMap::new(),
-            srtt: 0,
-            rttvar: 0,
-            rto: INITIAL_RTO_MS,
-            rto_timeouts: 0,
-            retransmits: 0,
-            send_rwnd: DEFAULT_RWND,
-            mtu_state: MtuState::Base,
-            mtu: MTU_BASE,
-            mtu_probe_size: MTU_BASE + MTU_STEP,
-            mtu_probe_count: 0,
-            mtu_probe_wanted: false,
-            mtu_max: MTU_MAX,
-            udp: None,
-            read_tx,
-            close_tx: Some(close_tx),
-            close_watch_tx,
-            close_watch_rx,
-            notify_tx: None,
-            congestion: super::congestion::CongestionController::new(
-                crate::native::stream::MAX_PAYLOAD as u32,
-                INITIAL_RTO_MS,
-            ),
-            send_queue: VecDeque::new(),
-            relay_target: None,
-            firewall_hook: None,
+        let inner = StreamInner::new(
             local_id,
-            incoming_tx: Some(incoming_tx.clone()),
-            registrations: Arc::clone(&registrations),
-            remote_change: None,
-            remote_observed: None,
-            observed_current_remote: false,
+            read_tx,
+            Some(close_tx),
+            Some(incoming_tx.clone()),
+            Arc::clone(&registrations),
             runtime,
-        };
+        );
 
         Self {
             local_id,
@@ -1277,10 +2011,22 @@ impl UdxStream {
         }
     }
 
-    /// Returns the current effective MTU (Maximum Transmission Unit) in bytes.
+    /// Returns the current effective MTU in bytes: the IP packet size, as
+    /// C libudx `udx_stream_get_mtu` reports it.
     pub fn effective_mtu(&self) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.mtu
+    }
+
+    /// Send a heartbeat after every `interval` without traffic, and end the
+    /// stream with a timeout error once the peer stays silent for six
+    /// intervals (the peer answers each heartbeat). `None` turns both off
+    /// (C `udx_stream_set_keepalive` with 0). The default is 5 s.
+    pub fn set_keepalive(&self, interval: Option<std::time::Duration>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_keepalive(interval);
     }
 
     /// Connect to a remote stream identified by `remote_id` at `remote_addr`.
@@ -1316,15 +2062,11 @@ impl UdxStream {
                 inner.remote_id = remote_id;
                 inner.remote_addr = Some(remote_addr);
                 inner.udp = Some(udp);
+                inner.socket = Some(socket.clone());
                 inner.connected = true;
+                inner.publish_endpoint();
                 // The hook stays armed: C keeps `on_firewall` for packets
                 // that later arrive on another socket.
-                let sentinel: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                for packet in &mut inner.send_queue {
-                    if packet.remote_addr == sentinel {
-                        packet.remote_addr = remote_addr;
-                    }
-                }
                 if let Some(tx) = &inner.notify_tx {
                     let _ = tx.send(StreamNotify::DataQueued);
                 }
@@ -1349,8 +2091,10 @@ impl UdxStream {
             inner.remote_id = remote_id;
             inner.remote_addr = Some(remote_addr);
             inner.udp = Some(udp);
+            inner.socket = Some(socket.clone());
             inner.connected = true;
             inner.notify_tx = Some(notify_tx);
+            inner.publish_endpoint();
         }
 
         self.register_on(socket)?;
@@ -1365,33 +2109,28 @@ impl UdxStream {
         Ok(())
     }
 
-    /// Write `data` reliably. Resolves when the remote peer ACKs all packets.
+    /// Write `data` reliably. Resolves when the remote peer ACKs all of it.
+    /// An empty write resolves with the next packet sent (C semantics).
     pub async fn write(&self, data: &[u8]) -> Result<()> {
-        let (prep, max_payload, ack_rx) = {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let prep = inner.prepare_write(data.len())?;
-            let ack_rx = inner.watch_ack(prep.ack_threshold);
-            (prep, inner.max_payload(), ack_rx)
-        };
-        let packets = build_data_packets(&prep, data, max_payload);
+        let (tx, rx) = oneshot::channel();
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .queue_write(packets, prep.remote_addr);
-
-        ack_rx.await.map_err(|_| UdxError::StreamClosed)?
+            .queue_write(data, Some(tx))?;
+        rx.await.map_err(|_| UdxError::StreamClosed)?
     }
 
-    /// Read the next message. Returns `None` on EOF or stream close.
+    /// Read the next message. Returns `None` on EOF or stream close, and an
+    /// error once when the peer destroyed the stream or it timed out.
     pub async fn read(&mut self) -> Result<Option<Vec<u8>>> {
         let rx = self.read_rx.as_mut().ok_or(UdxError::StreamClosed)?;
         match rx.recv().await {
             Some(StreamEvent::Data(d)) => Ok(Some(d)),
-            Some(StreamEvent::End) => {
+            Some(StreamEvent::Error(kind)) => {
                 self.read_rx = None;
-                Ok(None)
+                Err(UdxError::Io(std::io::Error::new(kind, "UDX stream failed")))
             }
-            None => {
+            Some(StreamEvent::End) | None => {
                 self.read_rx = None;
                 Ok(None)
             }
@@ -1400,18 +2139,12 @@ impl UdxStream {
 
     /// Send a write-end (FIN) and wait for the remote peer to ACK it.
     pub async fn shutdown(&self) -> Result<()> {
-        let ack_rx = {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let prep = inner.prepare_end()?;
-            let ack_rx = inner.watch_ack(prep.ack_threshold);
-            inner.queue_write(
-                vec![(prep.first_seq, build_end_packet(&prep))],
-                prep.remote_addr,
-            );
-            ack_rx
-        };
-
-        ack_rx.await.map_err(|_| UdxError::StreamClosed)?
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .queue_end(Some(tx))?;
+        rx.await.map_err(|_| UdxError::StreamClosed)?
     }
 
     /// Set up packet-level relay forwarding to `destination`.
@@ -1419,8 +2152,19 @@ impl UdxStream {
     /// Both streams must be on the same runtime. Relayed packets bypass
     /// congestion control — only the `remote_id` header field is rewritten.
     pub fn relay_to(&self, destination: &UdxStream) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.relay_target = Some(Arc::clone(&destination.inner));
+        // Take the destination's endpoint first: no stream lock is held
+        // while another is taken.
+        let endpoint = Arc::clone(
+            &destination
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .endpoint,
+        );
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .relay_target = Some(endpoint);
         tracing::debug!("relay_to configured");
         Ok(())
     }
@@ -1452,6 +2196,7 @@ impl UdxStream {
             }
             inner.remote_id = remote_id;
             inner.udp = Some(udp);
+            inner.socket = Some(socket.clone());
             inner.notify_tx = Some(notify_tx);
             inner.firewall_hook = Some(Box::new(hook));
         }
@@ -1509,7 +2254,8 @@ impl UdxStream {
         Ok(())
     }
 
-    /// Spawn the processor task; it deregisters the stream when it exits.
+    /// Spawn the processor task. Its guard terminates and deregisters the
+    /// stream however the task ends, a panic included.
     fn start_processor(&self, notify_rx: mpsc::UnboundedReceiver<StreamNotify>) -> Result<()> {
         let incoming_rx = self
             .incoming_rx
@@ -1517,13 +2263,15 @@ impl UdxStream {
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .ok_or_else(|| UdxError::Io(std::io::Error::other("processor already started")))?;
-        let inner = Arc::clone(&self.inner);
-        let registrations = Arc::clone(&self.registrations);
-        let local_id = self.local_id;
-        let incoming_tx = self.incoming_tx.clone();
+        let guard = ProcessorGuard {
+            inner: Arc::clone(&self.inner),
+            local_id: self.local_id,
+            registrations: Arc::clone(&self.registrations),
+            incoming_tx: self.incoming_tx.clone(),
+        };
         let handle = tokio::spawn(async move {
-            process_incoming(inner, incoming_rx, notify_rx).await;
-            deregister(local_id, &registrations, incoming_tx.as_ref());
+            process_incoming(Arc::clone(&guard.inner), incoming_rx, notify_rx).await;
+            drop(guard);
         });
         *self.processor.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         Ok(())
@@ -1531,27 +2279,13 @@ impl UdxStream {
 
     /// Destroy the stream, sending DESTROY unless it is a relay leg (C libudx parity).
     pub async fn destroy(mut self) -> Result<()> {
-        let destroy_info = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if inner.connected && inner.relay_target.is_none() {
-                inner.udp.clone().zip(inner.remote_addr).map(|(udp, addr)| {
-                    let header = Header {
-                        type_flags: FLAG_DESTROY,
-                        data_offset: 0,
-                        remote_id: inner.remote_id,
-                        recv_window: 0,
-                        seq: inner.next_seq,
-                        ack: inner.next_remote_seq,
-                    };
-                    (udp, addr, header)
-                })
-            } else {
-                None
-            }
-        };
-
-        if let Some((udp, addr, header)) = destroy_info {
-            let _ = udp.send_to(&header.encode(), addr).await;
+        let destroy = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .destroy_packet();
+        if let Some((udp, addr, packet)) = destroy {
+            let _ = udp.send_to(&packet, addr).await;
         }
 
         let processor_handle = self.processor.lock().ok().and_then(|mut g| g.take());
@@ -1571,6 +2305,48 @@ impl UdxStream {
 
         tracing::debug!(local_id = self.local_id, "stream destroyed");
         Ok(())
+    }
+}
+
+/// Owned by the processor task: terminates and deregisters the stream when
+/// the task ends, whether it returns, is aborted or panics.
+struct ProcessorGuard {
+    inner: Arc<Mutex<StreamInner>>,
+    local_id: u32,
+    registrations: Registrations,
+    incoming_tx: Option<mpsc::Sender<IncomingPacket>>,
+}
+
+impl Drop for ProcessorGuard {
+    fn drop(&mut self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .terminate();
+        deregister(
+            self.local_id,
+            &self.registrations,
+            self.incoming_tx.as_ref(),
+        );
+    }
+}
+
+impl StreamInner {
+    /// The DESTROY packet C `udx_stream_destroy` sends: only from a
+    /// connected stream that is not a relay leg.
+    fn destroy_packet(&self) -> Option<(Arc<super::udp::Udp>, SocketAddr, [u8; HEADER_SIZE])> {
+        if !self.connected || self.relay_target.is_some() {
+            return None;
+        }
+        let header = Header {
+            type_flags: FLAG_DESTROY,
+            data_offset: 0,
+            remote_id: self.remote_id,
+            recv_window: 0,
+            seq: self.next_seq,
+            ack: self.next_remote_seq,
+        };
+        Some((self.udp.clone()?, self.remote_addr?, header.encode()))
     }
 }
 
@@ -1607,20 +2383,10 @@ impl UdxStreamAbort {
     /// Fail pending writes and reads; send DESTROY unless this is a relay leg.
     pub fn abort(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.connected && inner.relay_target.is_none() {
-            if let (Some(udp), Some(addr)) = (inner.udp.clone(), inner.remote_addr) {
-                let header = Header {
-                    type_flags: FLAG_DESTROY,
-                    data_offset: 0,
-                    remote_id: inner.remote_id,
-                    recv_window: 0,
-                    seq: inner.next_seq,
-                    ack: inner.next_remote_seq,
-                };
-                tokio::spawn(async move {
-                    let _ = udp.send_to(&header.encode(), addr).await;
-                });
-            }
+        if let Some((udp, addr, packet)) = inner.destroy_packet() {
+            tokio::spawn(async move {
+                let _ = udp.send_to(&packet, addr).await;
+            });
         }
         // The processor only exits on Shutdown; queue it before `terminate`
         // drops the sender (the queued message still arrives), or the task
@@ -1740,11 +2506,11 @@ impl UdxStreamRemote {
             inner.remote_addr = Some(remote_addr);
             inner.observed_current_remote = false;
             inner.udp = Some(udp);
-            // Not sent yet, so bound to the remote at send time as in C.
-            for queued in &mut inner.send_queue {
-                queued.remote_addr = remote_addr;
-                queued.packet[4..8].copy_from_slice(&remote_id.to_le_bytes());
-            }
+            inner.socket = Some(socket.clone());
+            // Relay legs forwarding to this stream follow it to the new path.
+            inner.publish_endpoint();
+            // Unsent data is cut into packets at send time, for this peer
+            // at the base MTU, as in C.
             inner.reset_mtu();
             let done = inner.outgoing.keys().next_back().copied().map(|last| {
                 let (tx, rx) = oneshot::channel();
@@ -1809,6 +2575,23 @@ impl UdxStreamRemote {
         });
         Ok(())
     }
+
+    /// Next unreliable message the peer sent with `try_send` (C `on_recv`,
+    /// Node `rawStream.on('message')`), in arrival order. Up to 64 unread
+    /// messages are kept; more are dropped like any unread datagram.
+    /// Returns `StreamClosed` once the stream has closed and every kept
+    /// message was read.
+    pub async fn recv_message(&self) -> Result<Vec<u8>> {
+        let rx = Arc::clone(
+            &self
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .message_rx,
+        );
+        let mut rx = rx.lock().await;
+        rx.recv().await.ok_or(UdxError::StreamClosed)
+    }
 }
 
 impl Drop for UdxStream {
@@ -1833,30 +2616,48 @@ impl Drop for UdxStream {
 
 async fn process_incoming(
     inner: Arc<Mutex<StreamInner>>,
-    mut incoming_rx: mpsc::UnboundedReceiver<IncomingPacket>,
+    mut incoming_rx: mpsc::Receiver<IncomingPacket>,
     mut notify_rx: mpsc::UnboundedReceiver<StreamNotify>,
 ) {
     use tokio::time::{self, Duration, Instant as TokioInstant};
 
     let mut shutting_down = false;
+    // Set when the owner dropped the stream: DESTROY once the queue is sent.
+    let mut destroy_when_sent = false;
     let mut read_events = Vec::new();
     // In-order DATA packets received since the last ACK went out.
     let mut pending_acks = 0u32;
+    // Zero-window probes sent since the peer last advertised a window.
+    let mut zwp_probes = 0u32;
+    // When the peer was last heard from, for the keepalive's dead-peer check.
+    let mut last_heard = TokioInstant::now();
+    let far = || TokioInstant::now() + FAR_FUTURE;
 
-    // RTO timer starts far in the future (no data in flight initially).
+    // Retransmission timer, also the zero-window probe timer while
+    // nothing is in flight (C keeps one stream timer for both).
     let rto_sleep = time::sleep(FAR_FUTURE);
     tokio::pin!(rto_sleep);
+
+    let tlp_sleep = time::sleep(FAR_FUTURE);
+    tokio::pin!(tlp_sleep);
+
+    // RACK reorder timer (C `UDX_TIMER_RACK_REO`). C keeps one stream timer,
+    // so while this one is armed neither the loss probe nor the RTO is.
+    let reo_sleep = time::sleep(FAR_FUTURE);
+    tokio::pin!(reo_sleep);
 
     let pacing_sleep = time::sleep(FAR_FUTURE);
     tokio::pin!(pacing_sleep);
 
-    let mut keepalive = time::interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
-    keepalive.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let keepalive = inner.lock().unwrap_or_else(|e| e.into_inner()).keepalive;
+    let keepalive_sleep = time::sleep(keepalive.unwrap_or(FAR_FUTURE));
+    tokio::pin!(keepalive_sleep);
 
     loop {
         // The burst that deferred an ACK has been processed.
         if pending_acks > 0 && incoming_rx.is_empty() {
-            send_current_ack(&inner);
+            let ack = inner.lock().unwrap_or_else(|e| e.into_inner()).ack_packet();
+            send_now(ack);
             pending_acks = 0;
         }
         tokio::select! {
@@ -1904,16 +2705,11 @@ async fn process_incoming(
                                     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                                     guard.remote_addr = Some(packet.addr);
                                     guard.udp = packet.socket.udp_arc().ok();
+                                    guard.socket = Some(packet.socket.clone());
                                     guard.connected = true;
-                                    // Patch any packets queued before the hook fired
-                                    // (they were staged with the 0.0.0.0:0 sentinel).
-                                    let sentinel: std::net::SocketAddr =
-                                        "0.0.0.0:0".parse().unwrap();
-                                    for qp in &mut guard.send_queue {
-                                        if qp.remote_addr == sentinel {
-                                            qp.remote_addr = packet.addr;
-                                        }
-                                    }
+                                    guard.publish_endpoint();
+                                    // Writes queued before the hook fired go
+                                    // out now, built for this peer.
                                     if let Some(tx) = &guard.notify_tx {
                                         let _ = tx.send(StreamNotify::DataQueued);
                                     }
@@ -1927,9 +2723,12 @@ async fn process_incoming(
                         }
                     }
                 }
+                last_heard = TokioInstant::now();
 
                 // ── Peer seen on the current path (after `change_remote`) ──
-                {
+                // Also reads the relay target, so the relay check below takes
+                // no second lock.
+                let relay_target = {
                     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                     // Out-of-order data does not prove the old path has drained.
                     let observed = header.has_flag(FLAG_MESSAGE)
@@ -1946,7 +2745,8 @@ async fn process_incoming(
                             }
                         }
                     }
-                }
+                    guard.relay_target.clone()
+                };
 
                 // ── Relay fast-path ──────────────────────────────
                 //
@@ -1969,28 +2769,19 @@ async fn process_incoming(
                 // stream's 4-tuple, and *this same packet* still gets
                 // relayed below rather than being absorbed into normal
                 // (unread) stream processing.
-                let relay_info = {
-                    let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.relay_target.as_ref().map(|target| {
-                        let tgt = target.lock().unwrap_or_else(|e| e.into_inner());
-                        (tgt.remote_id, tgt.remote_addr, tgt.udp.clone())
-                    })
-                };
-
-                if let Some((dest_remote_id, dest_addr, dest_udp)) = relay_info {
+                //
+                // The destination is read from its published endpoint, not
+                // its `StreamInner`: two legs relaying to each other must
+                // never hold one stream lock while taking the other.
+                if let Some(target) = relay_target {
+                    let destination = target.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let mut fwd = packet.data;
-                    if fwd.len() >= 8 {
+                    if let Some((dest_remote_id, dest_addr, dest_udp)) = destination {
                         fwd[4..8].copy_from_slice(&dest_remote_id.to_le_bytes());
+                        let _ = dest_udp.send_to(&fwd, dest_addr).await;
                     }
-                    if let (Some(udp), Some(addr)) = (dest_udp, dest_addr) {
-                        let _ = udp.send_to(&fwd, addr).await;
-                    }
-                    if fwd.len() > 2 && fwd[2] & FLAG_DESTROY != 0 {
+                    if header.has_flag(FLAG_DESTROY) {
                         tracing::debug!("relay: DESTROY received, closing relay stream");
-                        let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(tx) = guard.close_tx.take() {
-                            let _ = tx.send(());
-                        }
                         break;
                     }
                     continue;
@@ -2005,7 +2796,6 @@ async fn process_incoming(
                 );
 
                 // ── ACK + SACK processing ────────────────────────────
-                let has_ack = header.ack > 0;
                 // Decode SACK ranges from wire format (outside lock). C libudx
                 // sends them with data_offset = 0, so the region is derived
                 // from the packet length, not from data_offset alone.
@@ -2013,78 +2803,73 @@ async fn process_incoming(
                     .sack_region(packet.data.len())
                     .and_then(|region| decode_sack(&packet.data[region]).ok());
 
-                if has_ack || sack_ranges.is_some() {
-                    let (completed, outgoing_empty, ack_advanced, fast_retransmits, udp_for_retransmit) = {
-                        let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.send_rwnd = header.recv_window;
-                        let prev_acked = guard.remote_acked;
-
-                        let (write_completions, mut acked_rate_info) = if has_ack {
-                            guard.on_cumulative_ack(header.ack)
-                        } else {
-                            (Vec::new(), Vec::new())
-                        };
-
-                        if let Some(ranges) = &sack_ranges {
-                            let sack_info = guard.on_sack(ranges);
-                            acked_rate_info.extend(sack_info);
-                        }
-
-                        let lost_count = guard.detect_losses();
-
-                        if !acked_rate_info.is_empty() || lost_count > 0 {
-                            let inflight = guard.inflight();
-                            let now = Instant::now();
-                            guard.congestion.on_ack(&acked_rate_info, lost_count, inflight, now);
-                        }
-
-                        let retransmits = guard.collect_retransmits(true);
-                        let udp = guard.udp.clone();
-
-                        let empty = guard.outgoing.is_empty();
-                        let advanced = guard.remote_acked != prev_acked;
-                        (write_completions, empty, advanced, retransmits, udp)
-                    };
-
-                    // Notify completed writes (outside lock)
-                    for tx in completed.into_iter().flatten() {
-                        let _ = tx.send(Ok(()));
-                    }
-
-                    // Fast retransmit lost packets (outside lock)
-                    if let Some(udp) = udp_for_retransmit {
-                        for (packet_bytes, dest) in fast_retransmits {
-                            let udp = Arc::clone(&udp);
-                            tokio::spawn(async move {
-                                let _ = udp.send_to(&packet_bytes, dest).await;
-                            });
-                        }
-                    }
-
-                    // Re-arm the RTO only when the cumulative ACK advanced
-                    // (C `arm_rto_or_tlp = ack_advanced && data_inflight`,
-                    // RFC 6298 5.3); dup/SACK-only/heartbeat ACKs leave it.
-                    if outgoing_empty {
-                        rto_sleep.as_mut().reset(TokioInstant::now() + FAR_FUTURE);
-                    } else if ack_advanced {
-                        let rto = inner.lock().unwrap_or_else(|e| e.into_inner()).rto as u64;
-                        rto_sleep.as_mut().reset(
-                            TokioInstant::now() + Duration::from_millis(rto),
-                        );
-                    }
-
-                    {
-                        let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                        if !guard.send_queue.is_empty() {
-                            drop(guard);
-                            pacing_sleep.as_mut().reset(TokioInstant::now());
-                        }
-                    }
-                } else {
-                    // No ACK/SACK — still update recv window
+                let (outcome, outgoing_empty, rto, tlp, send_pending, end_acked_now, remote_ended, udp) = {
                     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.send_rwnd = header.recv_window;
+                    let outcome = guard.on_ack_packet(&header, sack_ranges.as_deref());
+                    let end_acked_now = outcome.ack_advanced && guard.end_acked();
+                    (
+                        outcome,
+                        guard.outgoing.is_empty(),
+                        Duration::from_millis(guard.rto.into()),
+                        guard.loss_probe_timeout(),
+                        guard.has_pending_send(),
+                        end_acked_now,
+                        guard.remote_ended,
+                        guard.udp.clone(),
+                    )
+                };
+                for tx in outcome.completed.into_iter().flatten() {
+                    let _ = tx.send(Ok(()));
                 }
+                if let (false, Some(udp)) = (outcome.batch.is_empty(), udp) {
+                    if let Some(size) = udp.send_batch(&outcome.batch).await {
+                        inner.lock().unwrap_or_else(|e| e.into_inner()).on_send_too_big(size);
+                    }
+                }
+                if header.recv_window > 0 {
+                    zwp_probes = 0;
+                }
+                // Timers after an ACK, as C `process_packet` (udx.c:1832-1866):
+                // everything ACKed stops them; a reorder wait replaces the
+                // loss probe and the RTO (C has one timer), and the RTO then
+                // runs from this ACK (`next_rto_ts`); else the RTO (or a loss
+                // probe) is re-armed only when the cumulative ACK advanced
+                // (C `arm_rto_or_tlp = ack_advanced && data_inflight`, RFC
+                // 6298 5.3); dup/SACK-only/heartbeat ACKs leave it alone.
+                let now = TokioInstant::now();
+                let reo_armed = reo_sleep.deadline() < now + FAR_FUTURE / 2;
+                if outcome.ack_advanced && outgoing_empty {
+                    rto_sleep.as_mut().reset(far());
+                    tlp_sleep.as_mut().reset(far());
+                    reo_sleep.as_mut().reset(far());
+                } else if let Some(reorder) = outcome.reorder_timeout {
+                    reo_sleep.as_mut().reset(now + reorder);
+                    tlp_sleep.as_mut().reset(far());
+                    rto_sleep.as_mut().reset(now + rto);
+                } else if outcome.ack_advanced {
+                    reo_sleep.as_mut().reset(far());
+                    rto_sleep.as_mut().reset(now + rto);
+                    let tlp = tlp.map(|ms| Duration::from_millis(ms.into()).min(rto));
+                    tlp_sleep.as_mut().reset(tlp.map_or_else(far, |tlp| now + tlp));
+                } else if outcome.delivered && reo_armed && !outgoing_empty {
+                    // C moves `next_rto_ts`, which the reorder timer re-arms.
+                    rto_sleep.as_mut().reset(now + rto);
+                }
+                if send_pending {
+                    pacing_sleep.as_mut().reset(TokioInstant::now());
+                }
+                // The peer ACKed our END after its own END was delivered:
+                // the stream is done, without another ACK (C udx.c:1803).
+                if end_acked_now && remote_ended {
+                    inner.lock().unwrap_or_else(|e| e.into_inner()).close_ended();
+                    break;
+                }
+
+                // A MESSAGE payload for `recv_message` (C `on_recv`,
+                // udx.c:1699-1707); C drops one whose data_offset runs past it.
+                let message = (header.has_flag(FLAG_MESSAGE)
+                    && header.payload_offset() <= packet.data.len())
+                .then(|| packet.data[header.payload_offset()..].to_vec());
 
                 // ── DATA / END processing (unified — handles combined DATA+END packets) ──
                 let is_data = header.has_flag(FLAG_DATA);
@@ -2096,58 +2881,67 @@ async fn process_incoming(
                     let recv_flags = (if is_data { FLAG_DATA } else { 0 })
                         | (if is_end { FLAG_END } else { 0 });
 
-                    let (read_tx, udp, remote_addr, remote_id, ack_val, sack_ranges) = {
+                    let (read_tx, ack) = {
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                         guard.receive_data(header.seq, payload, recv_flags, &mut read_events);
-                        let sacks = guard.sack_ranges();
-                        let ack_val = guard.next_remote_seq;
-                        (
-                            guard.read_tx.clone(),
-                            guard.udp.clone(),
-                            guard.remote_addr,
-                            guard.remote_id,
-                            ack_val,
-                            sacks,
-                        )
+                        // One ACK per receive burst (at most ACK_EVERY packets):
+                        // out-of-order data and END are ACKed at once.
+                        pending_acks += 1;
+                        // C answers the ACK of our END with a final ACK.
+                        let ack_now = is_end
+                            || end_acked_now
+                            || !guard.recv_ranges.is_empty()
+                            || pending_acks >= ACK_EVERY
+                            || incoming_rx.is_empty();
+                        let ack = if ack_now {
+                            pending_acks = 0;
+                            guard.ack_packet()
+                        } else {
+                            None
+                        };
+                        (guard.read_tx.clone(), ack)
                     };
                     for event in read_events.drain(..) {
                         let _ = read_tx.send(event);
                     }
-                    // One ACK per receive burst (at most ACK_EVERY packets):
-                    // out-of-order data and END are ACKed at once.
-                    pending_acks += 1;
-                    if is_end
-                        || !sack_ranges.is_empty()
-                        || pending_acks >= ACK_EVERY
-                        || incoming_rx.is_empty()
-                    {
-                        send_ack(&udp, remote_addr, remote_id, ack_val, &sack_ranges);
-                        pending_acks = 0;
+                    send_now(ack);
+                } else if end_acked_now {
+                    // C `send_ack` after the peer ACKed our END (udx.c:1810).
+                    let ack = inner.lock().unwrap_or_else(|e| e.into_inner()).ack_packet();
+                    send_now(ack);
+                }
+
+                // Both directions ended: close (C `send_ack` on
+                // `UDX_STREAM_ALL_ENDED`), leaving a timewait if we ended first.
+                {
+                    let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.all_ended() {
+                        guard.close_ended();
+                        break;
                     }
                 }
 
                 // ── DESTROY processing ───────────────────────────────
                 if header.has_flag(FLAG_DESTROY) {
-                    let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = guard.read_tx.send(StreamEvent::End);
-                    if let Some(tx) = guard.close_tx.take() {
-                        let _ = tx.send(());
-                    }
+                    inner
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .fail(std::io::ErrorKind::ConnectionReset, "stream destroyed by peer");
                     break;
+                }
+
+                if let Some(message) = message {
+                    let tx = inner.lock().unwrap_or_else(|e| e.into_inner()).message_tx.clone();
+                    if let Some(tx) = tx {
+                        // Full queue: dropped, as an unread datagram.
+                        let _ = tx.try_send(message);
+                    }
                 }
 
                 // ── HEARTBEAT response ───────────────────────────────
                 if header.has_flag(FLAG_HEARTBEAT) {
-                    let (udp, remote_addr, remote_id, ack_val) = {
-                        let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                        (
-                            guard.udp.clone(),
-                            guard.remote_addr,
-                            guard.remote_id,
-                            guard.next_remote_seq,
-                        )
-                    };
-                    send_ack(&udp, remote_addr, remote_id, ack_val, &[]);
+                    let ack = inner.lock().unwrap_or_else(|e| e.into_inner()).ack_packet();
+                    send_now(ack);
                 }
             }
 
@@ -2160,163 +2954,209 @@ async fn process_incoming(
                         shutting_down = true;
                         pacing_sleep.as_mut().reset(TokioInstant::now());
                     }
+                    StreamNotify::Dropped => {
+                        shutting_down = true;
+                        destroy_when_sent = true;
+                        pacing_sleep.as_mut().reset(TokioInstant::now());
+                    }
+                    StreamNotify::Keepalive => {
+                        let interval = inner.lock().unwrap_or_else(|e| e.into_inner()).keepalive;
+                        last_heard = TokioInstant::now();
+                        keepalive_sleep
+                            .as_mut()
+                            .reset(last_heard + interval.unwrap_or(FAR_FUTURE));
+                    }
                 }
             }
 
             _ = &mut pacing_sleep => {
-                let (packets_to_send, should_arm_rto, new_rto_ms) = {
+                let (batch, stop, arm_rto, tlp, rto, udp, zwp) = {
                     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                    let was_outgoing_empty = guard.outgoing.is_empty();
-                    let (batch, delay) = guard.take_send_batch();
-                    if let Some(delay) = delay {
-                        pacing_sleep.as_mut().reset(TokioInstant::now() + delay);
+                    #[cfg(test)]
+                    {
+                        guard.pacing_wakeups += 1;
                     }
-                    let should_arm = was_outgoing_empty && !guard.outgoing.is_empty();
-                    let rto = guard.rto as u64;
-                    (batch, should_arm, rto)
+                    let was_outgoing_empty = guard.outgoing.is_empty();
+                    let (batch, stop, new_data) = guard.take_send_batch();
+                    let arm_rto = was_outgoing_empty && !guard.outgoing.is_empty();
+                    // C `arm_stream_timers`: new data (re)schedules the loss probe.
+                    let tlp = if new_data { guard.loss_probe_timeout() } else { None };
+                    let zwp = std::mem::take(&mut guard.zwp_wanted)
+                        .then(|| guard.heartbeat_packet())
+                        .flatten();
+                    (
+                        batch,
+                        stop,
+                        arm_rto,
+                        tlp,
+                        Duration::from_millis(guard.rto.into()),
+                        guard.udp.clone(),
+                        zwp,
+                    )
                 };
-
-                let udp_clone = {
-                    let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.udp.clone()
-                };
-                if let Some(udp) = udp_clone {
-                    udp.send_batch(&packets_to_send).await;
+                // C udx.c:2806: probe the zero window now, again at the RTO.
+                if zwp.is_some() {
+                    send_now(zwp);
+                    rto_sleep.as_mut().reset(TokioInstant::now() + rto);
                 }
 
-                if should_arm_rto {
-                    rto_sleep.as_mut().reset(
-                        TokioInstant::now() + Duration::from_millis(new_rto_ms),
-                    );
+                if let Some(udp) = udp {
+                    if let Some(size) = udp.send_batch(&batch).await {
+                        inner.lock().unwrap_or_else(|e| e.into_inner()).on_send_too_big(size);
+                    }
                 }
 
-                // The hook's `DataQueued` notify re-arms pacing once connected.
-                let has_more = {
-                    let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.connected && !guard.send_queue.is_empty()
-                };
-                if shutting_down && !has_more {
+                let now = TokioInstant::now();
+                if arm_rto {
+                    rto_sleep.as_mut().reset(now + rto);
+                }
+                if let Some(tlp) = tlp {
+                    let rto_left = rto_sleep.deadline().saturating_duration_since(now);
+                    tlp_sleep
+                        .as_mut()
+                        .reset(now + Duration::from_millis(tlp.into()).min(rto_left));
+                    // C's single timer: the probe replaces a reorder wait.
+                    reo_sleep.as_mut().reset(far());
+                }
+                match stop {
+                    SendStop::Pacing(delay) => pacing_sleep.as_mut().reset(now + delay),
+                    // An ACK, the RTO or a zero-window probe moves things on:
+                    // no timer poll while the window is full.
+                    SendStop::Window => {
+                        pacing_sleep.as_mut().reset(far());
+                        let stalled = inner.lock().unwrap_or_else(|e| e.into_inner()).zero_window_stalled();
+                        // C udx.c:1841: probe the zero window after one RTO.
+                        if stalled && rto_sleep.deadline() > now + FAR_FUTURE / 2 {
+                            rto_sleep.as_mut().reset(now + rto);
+                        }
+                    }
+                    SendStop::Idle => pacing_sleep.as_mut().reset(far()),
+                }
+
+                if shutting_down {
+                    let destroy = {
+                        let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.connected && guard.has_unsent() {
+                            continue;
+                        }
+                        if destroy_when_sent { guard.destroy_packet() } else { None }
+                    };
+                    // C `udx_stream_destroy`: the peer learns at once.
+                    if let Some((udp, addr, packet)) = destroy {
+                        let _ = udp.send_to(&packet, addr).await;
+                    }
                     break;
-                }
-                if has_more {
-                    pacing_sleep.as_mut().reset(TokioInstant::now() + Duration::from_millis(1));
-                } else {
-                    pacing_sleep.as_mut().reset(TokioInstant::now() + FAR_FUTURE);
                 }
             }
 
             _ = &mut rto_sleep => {
-                let (retransmits, udp, new_rto, should_close) = {
-                    let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-
-                    if guard.outgoing.is_empty() {
-                        // False alarm — nothing to retransmit
-                        rto_sleep.as_mut().reset(TokioInstant::now() + FAR_FUTURE);
+                let now = TokioInstant::now();
+                let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                let rto = Duration::from_millis(guard.rto.into());
+                if guard.outgoing.is_empty() {
+                    if !guard.zero_window_stalled() {
+                        rto_sleep.as_mut().reset(far());
                         continue;
                     }
-
-                    guard.rto_timeouts += 1;
-
-                    if guard.rto_timeouts >= MAX_RTO_TIMEOUTS {
-                        // Exceeded max timeouts — fail the stream
-                        (Vec::new(), None, 0u64, true)
-                    } else {
-                        guard.congestion.on_rto();
-                        if let Some(&max_seq) = guard.outgoing.keys().last() {
-                            guard.congestion.high_seq = max_seq;
-                        }
-                        guard.rto = (guard.rto * 2).min(MAX_RTO_MS);
-                        let retransmits = guard.collect_retransmits(false);
-                        let rto = guard.rto as u64;
-                        (retransmits, guard.udp.clone(), rto, false)
+                    // Zero-window probe (C `udx_zwp_timeout`): the peer's
+                    // ACK to the heartbeat carries its current window.
+                    zwp_probes += 1;
+                    if shutting_down && zwp_probes >= MAX_RTO_TIMEOUTS {
+                        tracing::debug!("stream failed: peer window stayed closed");
+                        guard.fail(std::io::ErrorKind::TimedOut, "peer window stayed closed");
+                        break;
                     }
-                };
+                    let probe = guard.heartbeat_packet();
+                    drop(guard);
+                    send_now(probe);
+                    rto_sleep.as_mut().reset(now + rto * 2);
+                    continue;
+                }
 
-                if should_close {
-                    // Fail all pending writes with timeout error
-                    let pending: Vec<_> = {
-                        let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                        std::mem::take(&mut guard.pending_writes)
-                    };
-                    for mut pw in pending {
-                        if let Some(tx) = pw.tx.take() {
-                            let _ = tx.send(Err(UdxError::Io(
-                                std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    "RTO timeout exceeded",
-                                ),
-                            )));
-                        }
-                    }
+                let Some(rto) = guard.rto_fired() else {
                     tracing::warn!("stream failed: exceeded max RTO timeouts");
+                    guard.fail(std::io::ErrorKind::TimedOut, "RTO timeout exceeded");
                     break;
-                }
+                };
+                drop(guard);
+                tracing::debug!(rto_ms = rto.as_millis() as u64, "rto: retransmitting");
+                rto_sleep.as_mut().reset(now + rto);
+                tlp_sleep.as_mut().reset(far());
+                reo_sleep.as_mut().reset(far());
+                pacing_sleep.as_mut().reset(now);
+            }
 
-                // Retransmit unACKed/unSACKed packets
-                if let Some(udp) = udp {
-                    tracing::debug!(
-                        count = retransmits.len(),
-                        rto_ms = new_rto,
-                        "retransmitting packets"
-                    );
-                    for (packet_bytes, dest) in retransmits {
-                        let udp = Arc::clone(&udp);
-                        tokio::spawn(async move {
-                            let _ = udp.send_to(&packet_bytes, dest).await;
-                        });
-                    }
+            // ── RACK reorder timer (C `udx_rack_reo_timeout`) ────────
+            _ = &mut reo_sleep => {
+                reo_sleep.as_mut().reset(far());
+                let now = TokioInstant::now();
+                let (send_pending, all_acked) = {
+                    let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.on_reorder_timeout();
+                    (guard.has_pending_send(), guard.outgoing.is_empty())
+                };
+                if send_pending {
+                    pacing_sleep.as_mut().reset(now);
                 }
+                // C `rearm_rto(stream, false)`: the RTO at its saved time,
+                // at least 1 ms away; the loss probe is gone.
+                tlp_sleep.as_mut().reset(far());
+                if all_acked {
+                    rto_sleep.as_mut().reset(far());
+                } else if rto_sleep.deadline() <= now {
+                    rto_sleep.as_mut().reset(now + Duration::from_millis(1));
+                }
+            }
 
-                // Schedule next RTO check
-                rto_sleep.as_mut().reset(
-                    TokioInstant::now() + Duration::from_millis(new_rto),
-                );
+            // ── Tail loss probe (C `udx_tlp_timeout`) ───────────────
+            _ = &mut tlp_sleep => {
+                tlp_sleep.as_mut().reset(far());
+                let (probe, rto, udp) = {
+                    let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                    (guard.take_loss_probe(), guard.rto, guard.udp.clone())
+                };
+                if let (Some((packet, addr)), Some(udp)) = (probe, udp) {
+                    let _ = udp.send_to(&packet, addr).await;
+                    rto_sleep
+                        .as_mut()
+                        .reset(TokioInstant::now() + Duration::from_millis(rto.into()));
+                }
             }
 
             // ── Keepalive heartbeat ──────────────────────────────────
-            _ = keepalive.tick() => {
-                let (should_send, udp, addr, remote_id, ack_val) = {
-                    let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                    if guard.connected && guard.outgoing.is_empty() && guard.relay_target.is_none() {
-                        (
-                            true,
-                            guard.udp.clone(),
-                            guard.remote_addr,
-                            guard.remote_id,
-                            guard.next_remote_seq,
-                        )
-                    } else {
-                        (false, None, None, 0, 0)
-                    }
+            _ = &mut keepalive_sleep => {
+                let now = TokioInstant::now();
+                let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(interval) = guard.keepalive else {
+                    keepalive_sleep.as_mut().reset(far());
+                    continue;
                 };
-
-                if should_send {
-                    if let (Some(udp), Some(addr)) = (udp, addr) {
-                        let header = Header {
-                            type_flags: FLAG_HEARTBEAT,
-                            data_offset: 0,
-                            remote_id,
-                            recv_window: DEFAULT_RWND,
-                            seq: 0,
-                            ack: ack_val,
-                        };
-                        let packet = header.encode();
-                        tokio::spawn(async move {
-                            let _ = udp.send_to(&packet, addr).await;
-                        });
-                    }
+                keepalive_sleep.as_mut().reset(now + interval);
+                // Relay legs and unconnected streams have no peer to hear.
+                if !guard.connected || guard.relay_target.is_some() {
+                    last_heard = now;
+                    continue;
                 }
+                if now.duration_since(last_heard) >= interval * KEEPALIVE_DEAD_INTERVALS {
+                    tracing::debug!("stream failed: peer silent through keepalives");
+                    guard.fail(std::io::ErrorKind::TimedOut, "peer stopped answering keepalives");
+                    break;
+                }
+                let probe = if guard.outgoing.is_empty() {
+                    guard.heartbeat_packet()
+                } else {
+                    None
+                };
+                drop(guard);
+                send_now(probe);
             }
         }
     }
-
-    inner.lock().unwrap_or_else(|e| e.into_inner()).terminate();
 }
 
-// ── Packet building ──────────────────────────────────────────────────────────
-
-/// Build a wire-format DATA packet (header + payload).
-pub(crate) fn build_data_packet(remote_id: u32, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
+/// A wire-format DATA packet (header + payload), for state-machine tests.
+#[cfg(test)]
+fn build_data_packet(remote_id: u32, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
     let header = Header {
         type_flags: FLAG_DATA,
         data_offset: 0,
@@ -2331,119 +3171,50 @@ pub(crate) fn build_data_packet(remote_id: u32, seq: u32, ack: u32, payload: &[u
     packet
 }
 
-/// Chunk `data` into the DATA packets reserved by `prep` (one empty packet
-/// for an empty write).
-pub(crate) fn build_data_packets(
-    prep: &WritePrep,
-    data: &[u8],
-    max_payload: usize,
-) -> Vec<(u32, Vec<u8>)> {
-    let chunks: Vec<&[u8]> = if data.is_empty() {
-        vec![&[]]
-    } else {
-        data.chunks(max_payload).collect()
-    };
-    chunks
-        .iter()
-        .enumerate()
-        .map(|(i, chunk)| {
-            let seq = prep.first_seq + i as u32;
-            (
-                seq,
-                build_data_packet(prep.remote_id, seq, prep.current_ack, chunk),
-            )
-        })
-        .collect()
-}
+// ── Control packets (ACK, heartbeat) ─────────────────────────────────────────
 
-/// Build the FIN packet reserved by `prepare_end`.
-pub(crate) fn build_end_packet(prep: &WritePrep) -> Vec<u8> {
-    Header {
-        type_flags: FLAG_END,
-        data_offset: 0,
-        remote_id: prep.remote_id,
-        recv_window: DEFAULT_RWND,
-        seq: prep.first_seq,
-        ack: prep.current_ack,
+/// A control packet ready to send: socket, destination, bytes.
+type ControlPacket = (Arc<super::udp::Udp>, SocketAddr, Vec<u8>);
+
+impl StreamInner {
+    /// An ACK for what the stream has received, with SACK blocks for the
+    /// out-of-order buffer (C `send_ack`).
+    ///
+    /// SACK blocks follow the header. C libudx reads them from `data_offset`
+    /// bytes when that is set, else from the whole body (it always sends
+    /// `data_offset = 0`); we set `data_offset` while it fits in a byte so older
+    /// Rust peers keep parsing, and fall back to `0` beyond 31 ranges.
+    fn ack_packet(&self) -> Option<ControlPacket> {
+        let (udp, addr) = (self.udp.clone()?, self.remote_addr?);
+        let sacks = self.sack_ranges();
+        let sack_byte_len = sacks.len() * 8;
+        let mut header = self.control_header(if sacks.is_empty() { 0 } else { FLAG_SACK });
+        header.data_offset = u8::try_from(sack_byte_len).unwrap_or(0);
+        let mut packet = vec![0u8; HEADER_SIZE + sack_byte_len];
+        header.encode_into(&mut packet[..HEADER_SIZE]);
+        encode_sack(&sacks, &mut packet[HEADER_SIZE..]);
+        Some((udp, addr, packet))
     }
-    .encode()
-    .to_vec()
+
+    /// A heartbeat (C `send_probe`); the peer answers it with an ACK.
+    fn heartbeat_packet(&self) -> Option<ControlPacket> {
+        let packet = self.control_header(FLAG_HEARTBEAT).encode().to_vec();
+        Some((self.udp.clone()?, self.remote_addr?, packet))
+    }
 }
 
-// ── send_ack ─────────────────────────────────────────────────────────────────
-
-/// ACK what the stream has received so far (a deferred burst ACK).
-fn send_current_ack(inner: &Arc<Mutex<StreamInner>>) {
-    let (udp, remote_addr, remote_id, ack, sacks) = {
-        let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            guard.udp.clone(),
-            guard.remote_addr,
-            guard.remote_id,
-            guard.next_remote_seq,
-            guard.sack_ranges(),
-        )
-    };
-    send_ack(&udp, remote_addr, remote_id, ack, &sacks);
-}
-
-/// Send an ACK packet, optionally including SACK ranges.
-///
-/// SACK blocks follow the header. C libudx reads them from `data_offset`
-/// bytes when that is set, else from the whole body (it always sends
-/// `data_offset = 0`); we set `data_offset` while it fits in a byte so older
-/// Rust peers keep parsing, and fall back to `0` beyond 31 ranges.
-fn send_ack(
-    udp: &Option<Arc<super::udp::Udp>>,
-    remote_addr: Option<SocketAddr>,
-    remote_id: u32,
-    ack: u32,
-    sack_ranges: &[SackRange],
-) {
-    let (Some(udp), Some(addr)) = (udp.as_ref(), remote_addr) else {
+/// Send a control packet without waiting: inline when the socket has room
+/// (no task or scheduler round trip), else from a task.
+fn send_now(packet: Option<ControlPacket>) {
+    let Some((udp, addr, packet)) = packet else {
         return;
     };
-    if sack_ranges.is_empty() {
-        let packet = Header {
-            type_flags: 0,
-            data_offset: 0,
-            remote_id,
-            recv_window: DEFAULT_RWND,
-            seq: 0,
-            ack,
-        }
-        .encode();
-        if !matches!(udp.try_send_to(&packet, addr), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
-        {
-            return;
-        }
-        let udp = Arc::clone(udp);
+    if matches!(udp.try_send_to(&packet, addr), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    {
         tokio::spawn(async move {
             let _ = udp.send_to(&packet, addr).await;
         });
-        return;
     }
-    let sack_byte_len = sack_ranges.len() * 8;
-    let header = Header {
-        type_flags: if sack_ranges.is_empty() { 0 } else { FLAG_SACK },
-        data_offset: u8::try_from(sack_byte_len).unwrap_or(0),
-        remote_id,
-        recv_window: DEFAULT_RWND,
-        seq: 0,
-        ack,
-    };
-    let mut packet = vec![0u8; HEADER_SIZE + sack_byte_len];
-    header.encode_into(&mut packet[..HEADER_SIZE]);
-    encode_sack(sack_ranges, &mut packet[HEADER_SIZE..]);
-    // The common ACK needs no task or scheduler round trip.
-    if !matches!(udp.try_send_to(&packet, addr), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
-    {
-        return;
-    }
-    let udp = Arc::clone(udp);
-    tokio::spawn(async move {
-        let _ = udp.send_to(&packet, addr).await;
-    });
 }
 
 #[cfg(test)]
@@ -2452,70 +3223,19 @@ mod mtu_tests {
 
     fn make_stream_inner() -> StreamInner {
         let (read_tx, _read_rx) = mpsc::unbounded_channel();
-        let (close_watch_tx, close_watch_rx) = watch::channel(false);
-        StreamInner {
-            remote_id: 0,
-            remote_addr: None,
-            connected: false,
-            terminated: false,
-            next_seq: 0,
-            pending_writes: Vec::new(),
-            outgoing: BTreeMap::new(),
-            inflight_count: 0,
-            send_order: VecDeque::new(),
-            lost_queue: Vec::new(),
-            sack_cover: Vec::new(),
-            queued_bytes: 0,
-            unacked_bytes: 0,
-            write_waker: None,
-            flush_waker: None,
-            next_remote_seq: 0,
-            remote_acked: 0,
-            rack: None,
-            recv_buf: BTreeMap::new(),
-            srtt: 0,
-            rttvar: 0,
-            rto: INITIAL_RTO_MS,
-            rto_timeouts: 0,
-            retransmits: 0,
-            send_rwnd: DEFAULT_RWND,
-            mtu_state: MtuState::Base,
-            mtu: MTU_BASE,
-            mtu_probe_size: MTU_BASE + MTU_STEP,
-            mtu_probe_count: 0,
-            mtu_probe_wanted: false,
-            mtu_max: MTU_MAX,
-            udp: None,
-            read_tx,
-            close_tx: None,
-            close_watch_tx,
-            close_watch_rx,
-            notify_tx: None,
-            congestion: crate::native::congestion::CongestionController::new(
-                MAX_PAYLOAD as u32,
-                INITIAL_RTO_MS,
-            ),
-            send_queue: VecDeque::new(),
-            relay_target: None,
-            ended: false,
-            firewall_hook: None,
-            local_id: 0,
-            incoming_tx: None,
-            registrations: Registrations::default(),
-            remote_change: None,
-            remote_observed: None,
-            observed_current_remote: false,
-            runtime: None,
-        }
+        StreamInner::new(0, read_tx, None, None, Registrations::default(), None)
     }
 
     #[test]
     fn stream_stats_keep_cumulative_retransmits_after_ack() {
         let mut inner = make_stream_inner();
+        inner.connected = true;
         inner.update_rtt(25);
         inner.register_sent(0, vec![1; MTU_BASE], "127.0.0.1:9".parse().unwrap(), false);
-        assert_eq!(inner.collect_retransmits(false).len(), 1);
-        assert_eq!(inner.collect_retransmits(false).len(), 1);
+        for _ in 0..2 {
+            inner.on_rto();
+            assert_eq!(inner.take_send_batch().0.len(), 1);
+        }
         inner.outgoing.clear();
         let handle = UdxStreamAbort::new(Arc::new(Mutex::new(inner)));
         assert_eq!(handle.stats(), (25, 2));
@@ -2534,10 +3254,13 @@ mod mtu_tests {
         inner.send_rwnd = DEFAULT_RWND;
         inner.mtu_state = MtuState::SearchComplete;
         inner.congestion.cwnd = 10;
-        let packets = (0..50)
-            .map(|seq| (seq, build_data_packet(1, seq, 0, &[0; 100])))
-            .collect();
-        inner.queue_for_send(packets, addr);
+        let data = vec![0; 50 * inner.max_payload()];
+        inner.push_write(WriteBuf {
+            data,
+            sent: 0,
+            end: false,
+            done: None,
+        });
 
         assert_eq!(inner.take_send_batch().0.len(), 10);
         assert_eq!(inner.inflight(), 10);
@@ -2551,6 +3274,8 @@ mod mtu_tests {
     #[test]
     fn incremental_rack_matches_full_scan() {
         let mut inner = make_stream_inner();
+        inner.connected = true;
+        inner.congestion.cwnd = 1_000_000;
         let addr = "127.0.0.1:9".parse().unwrap();
         let mut rng = 0x2545_f491_4f6c_dd1du64;
         let mut next = || {
@@ -2561,11 +3286,17 @@ mod mtu_tests {
         };
         let (mut next_seq, mut acked) = (0u32, 0u32);
         let mut total_lost = 0;
+        let mut now = Instant::now();
         for _ in 0..4000 {
+            // A fake clock moving 0-2 ms per step, so the RACK RTT and the
+            // reorder window take part.
+            now += std::time::Duration::from_millis(next() % 3);
+            inner.clock = Some(now);
             match next() % 6 {
                 0 | 1 => {
                     inner.register_sent(next_seq, vec![0; 64], addr, false);
                     next_seq += 1;
+                    inner.next_seq = next_seq;
                 }
                 2 if next_seq > acked => {
                     let start = acked + (next() % u64::from(next_seq - acked)) as u32;
@@ -2583,6 +3314,10 @@ mod mtu_tests {
                         Some(r) => r,
                         None => continue,
                     };
+                    let wait = std::time::Duration::from_millis(
+                        u64::from(inner.rack_rtt) + u64::from(inner.rack_reo_wnd()),
+                    );
+                    let mut waiting = None;
                     let expected: Vec<u32> = inner
                         .outgoing
                         .iter()
@@ -2591,9 +3326,19 @@ mod mtu_tests {
                                 && (p.time_sent < rack_time
                                     || (p.time_sent == rack_time && seq_after(rack_seq, seq)))
                         })
+                        .filter(|&(_, p)| {
+                            let due = p.time_sent + wait <= now;
+                            if !due {
+                                let left = p.time_sent + wait - now;
+                                waiting = waiting.max(Some(left));
+                            }
+                            due
+                        })
                         .map(|(&seq, _)| seq)
                         .collect();
-                    assert_eq!(inner.detect_losses() as usize, expected.len());
+                    let (lost, timeout) = inner.detect_losses(now);
+                    assert_eq!(lost as usize, expected.len());
+                    assert_eq!(timeout, waiting);
                     assert!(expected.iter().all(|seq| inner.outgoing[seq].lost));
                     total_lost += expected.len();
                 }
@@ -2604,7 +3349,7 @@ mod mtu_tests {
                         .values()
                         .filter(|p| p.lost && !p.sacked)
                         .count();
-                    assert_eq!(inner.collect_retransmits(true).len(), lost);
+                    assert_eq!(inner.take_send_batch().0.len(), lost);
                     assert!(inner.outgoing.values().all(|p| !p.lost || p.sacked));
                 }
                 _ => {}
@@ -2628,12 +3373,12 @@ mod mtu_tests {
                     flags: FLAG_DATA,
                 },
             );
-            inner.send_queue.push_back(QueuedPacket {
-                seq,
-                packet: vec![3; MTU_MAX],
-                remote_addr: addr,
+            inner.push_write(WriteBuf {
+                data: vec![3; MTU_MAX],
+                sent: 0,
+                end: false,
+                done: None,
             });
-            inner.queued_bytes += MTU_MAX;
         }
     }
 
@@ -2663,9 +3408,9 @@ mod mtu_tests {
                         .map(|packet| packet.payload.len())
                         .sum::<usize>()
                     + inner
-                        .send_queue
+                        .write_queue
                         .iter()
-                        .map(|packet| packet.packet.len())
+                        .map(|write| write.data.len())
                         .sum::<usize>()
             })
             .sum();
@@ -2681,10 +3426,10 @@ mod mtu_tests {
         let mut inner = make_stream_inner();
         fill_packet_buffers(&mut inner);
         inner.terminate();
-        assert!(inner.send_queue.is_empty());
+        assert!(inner.write_queue.is_empty());
         assert!(inner.outgoing.is_empty());
         assert!(inner.recv_buf.is_empty());
-        assert_eq!(inner.send_queue.capacity(), 0);
+        assert_eq!(inner.write_queue.capacity(), 0);
         assert_eq!(inner.queued_bytes, 0);
         assert_eq!(inner.unacked_bytes, 0);
         inner.terminate();
@@ -2714,85 +3459,203 @@ mod mtu_tests {
         assert_eq!(inner.mtu, MTU_BASE);
         assert!(!inner.mtu_probe_wanted);
         assert_eq!(inner.mtu_probe_count, 0);
-        assert_eq!(inner.mtu_probe_size, MTU_BASE + MTU_STEP);
+        // C starts with a probe at the base size, confirming it.
+        assert_eq!(inner.mtu_probe_size, MTU_BASE);
         assert_eq!(inner.mtu_max, MTU_MAX);
     }
 
-    // T5: MTU probe failure falls back gracefully — retransmit strips padding and increments failure count
+    /// A lost probe is sent again without its padding and counts as one
+    /// failed probe (C `mtu_unprobeify_packet`).
     #[test]
     fn mtu_probe_failure_fallback() {
         let mut inner = make_stream_inner();
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        inner.connected = true;
+        inner.remote_addr = Some(addr);
         inner.mtu_state = MtuState::Search;
-        inner.mtu = MTU_BASE;
+        inner.mtu_probe_size = MTU_BASE + MTU_STEP;
+        let mut packet = build_data_packet(0, 0, 0, &[0xAB; MAX_PAYLOAD]);
+        assert!(inner.mtu_probeify_packet(&mut packet, addr));
+        inner.register_sent(0, packet, addr, true);
+        // `send_new` counts a probe when it sends it (C udx.c:858).
+        inner.mtu_probe_count = 1;
+        inner.next_seq = 1;
 
-        let payload = vec![0xABu8; MTU_BASE - HEADER_SIZE];
-        let packet = build_data_packet(0, 0, 0, &payload);
-        inner.outgoing.insert(
-            0,
-            SentPacket {
-                packet,
-                remote_addr: "0.0.0.0:0".parse().unwrap(),
-                time_sent: Instant::now(),
-                retransmit_count: 0,
-                sacked: false,
-                is_mtu_probe: true,
-                lost: false,
-                rate_info: None,
-            },
-        );
-
-        let retransmits = inner.collect_retransmits(false);
+        inner.on_rto();
+        let retransmits = inner.take_send_batch().0;
         assert_eq!(retransmits.len(), 1);
+        assert_eq!(retransmits[0].0.len(), MTU_BASE - IPV4_UDP_OVERHEAD);
         assert_eq!(inner.mtu_probe_count, 1);
-        assert!(
-            !inner.outgoing[&0].is_mtu_probe,
-            "probe flag should be cleared after retransmit"
-        );
+        assert!(!inner.outgoing[&0].is_mtu_probe);
         assert_eq!(
             inner.outgoing[&0].packet[3], 0,
             "data_offset should be reset"
         );
-        assert_eq!(
-            inner.mtu_state,
-            MtuState::Search,
-            "still searching after 1 failure"
-        );
-        assert!(
-            inner.mtu_probe_wanted,
-            "should want another probe after non-terminal failure"
-        );
+        assert_eq!(inner.mtu_state, MtuState::Search);
+        assert!(inner.mtu_probe_wanted);
     }
 
-    // T6: Probe uses data_offset padding — probeify inflates packet to probe size
+    /// MTU values are IP packet sizes as in C: at the base MTU an IPv4
+    /// packet carries 1152 payload bytes (UDP datagram 1172), IPv6 1132, and
+    /// a probe to 1232 pads that full packet by 32 bytes.
     #[test]
-    fn mtu_probe_uses_data_offset_padding() {
+    fn mtu_is_an_ip_packet_size_like_c() {
         let mut inner = make_stream_inner();
-        inner.mtu_state = MtuState::Search;
-        inner.mtu_probe_size = MTU_BASE + MTU_STEP;
+        let v4: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let v6: SocketAddr = "[::1]:9".parse().unwrap();
+        inner.remote_addr = Some(v4);
+        assert_eq!(inner.max_payload(), 1152);
+        inner.remote_addr = Some(v6);
+        assert_eq!(inner.max_payload(), 1132);
+        inner.remote_addr = Some(v4);
 
-        let payload = vec![0xCDu8; MTU_BASE - HEADER_SIZE];
+        let payload = vec![0xCDu8; inner.max_payload()];
         let mut packet = build_data_packet(0, 0, 0, &payload);
-        let original_len = packet.len();
-        assert_eq!(original_len, MTU_BASE);
+        assert_eq!(packet.len(), 1172);
+        // The first probe confirms the base size with no padding.
+        assert!(inner.mtu_probeify_packet(&mut packet.clone(), v4));
+        inner.mtu_probe_size = MTU_BASE + MTU_STEP;
+        assert!(inner.mtu_probeify_packet(&mut packet, v4));
+        assert_eq!(packet.len() + IPV4_UDP_OVERHEAD, MTU_BASE + MTU_STEP);
+        assert_eq!(packet[3] as usize, MTU_STEP);
+        assert_eq!(&packet[HEADER_SIZE + MTU_STEP..], &payload[..]);
+        // The search tops out at a 1500-byte IP packet: 1472-byte datagrams.
+        inner.mtu = MTU_MAX;
+        assert_eq!(inner.max_payload() + HEADER_SIZE, 1472);
+    }
 
-        let ok = inner.mtu_probeify_packet(&mut packet);
-        assert!(ok, "probeify should succeed for nearly-full packet");
-        assert_eq!(
-            packet.len(),
-            MTU_BASE + MTU_STEP,
-            "packet should be inflated to probe size"
-        );
-        assert_eq!(
-            packet[3] as usize, MTU_STEP,
-            "data_offset should equal padding size"
-        );
+    /// `EMSGSIZE` from a GSO send of full packets steps the MTU back to the
+    /// probe size below and ends the search.
+    #[test]
+    fn send_too_big_steps_the_mtu_back() {
+        let mut inner = make_stream_inner();
+        inner.remote_addr = Some("127.0.0.1:9".parse().unwrap());
+        inner.mtu_state = MtuState::Search;
+        inner.mtu = 1488;
+        inner.on_send_too_big(1488 - IPV4_UDP_OVERHEAD);
+        assert_eq!(inner.mtu, 1456);
+        assert_eq!(inner.mtu_max, 1456);
+        assert_eq!(inner.mtu_state, MtuState::SearchComplete);
+        assert!(!inner.mtu_probe_wanted);
+        // A refused probe above the MTU only ends the search.
+        inner.on_send_too_big(1500);
+        assert_eq!(inner.mtu, 1456);
+    }
 
-        let payload_start = HEADER_SIZE + MTU_STEP;
+    /// M2: a cumulative ACK beyond what was sent (from anyone who guesses
+    /// the stream id) must not clear the send buffer or fake delivery.
+    #[test]
+    fn ack_beyond_next_seq_is_ignored() {
+        let mut inner = make_stream_inner();
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        for seq in 0..4 {
+            inner.register_sent(seq, build_data_packet(0, seq, 0, b"x"), addr, false);
+        }
+        inner.next_seq = 4;
+        let (tx, mut ack_rx) = oneshot::channel();
+        inner.pending_writes.push(PendingWrite {
+            ack_threshold: 4,
+            tx: Some(tx),
+        });
+        let (completed, _) = inner.on_cumulative_ack(inner.next_seq + 1000);
+        assert!(completed.is_empty());
+        assert_eq!(inner.outgoing.len(), 4);
+        assert_eq!(inner.pending_writes.len(), 1);
+        assert!(ack_rx.try_recv().is_err());
+        assert_eq!(inner.remote_acked, 0);
+        // The real ACK still completes the write.
+        let (completed, _) = inner.on_cumulative_ack(4);
+        assert_eq!(completed.len(), 1);
+    }
+
+    /// S3: 100k DATA packets far ahead of the cumulative ACK leave a buffer
+    /// bounded by the advertised window, and SACK generation stays cheap.
+    #[test]
+    fn far_future_data_keeps_the_reorder_buffer_bounded() {
+        let mut inner = make_stream_inner();
+        let mut events = Vec::new();
+        for i in 0..100_000u32 {
+            inner.receive_data(2 + i, Vec::new(), FLAG_DATA, &mut events);
+            assert!(inner.sack_ranges().len() <= MAX_SACK_RANGES);
+        }
+        assert!(inner.recv_buf.len() < RECV_WINDOW_PACKETS as usize);
+        assert_eq!(inner.recv_ranges, vec![(2, RECV_WINDOW_PACKETS)]);
+        assert!(events.is_empty());
+        // Filling the gap delivers the whole buffered range in order.
+        inner.receive_data(0, Vec::new(), FLAG_DATA, &mut events);
+        inner.receive_data(1, Vec::new(), FLAG_DATA, &mut events);
+        assert_eq!(inner.next_remote_seq, RECV_WINDOW_PACKETS);
+        assert!(inner.recv_buf.is_empty() && inner.recv_ranges.is_empty());
+    }
+
+    /// N1: sequence numbers wrap; `u32::MAX` must not overflow in a debug build.
+    #[test]
+    fn receive_side_handles_sequence_wraparound() {
+        let mut inner = make_stream_inner();
+        let mut events = Vec::new();
+        inner.receive_data(u32::MAX, b"far".to_vec(), FLAG_DATA, &mut events);
+        let _ = inner.sack_ranges();
+        assert!(inner.recv_buf.is_empty(), "u32::MAX is behind seq 0");
+
+        inner.next_remote_seq = u32::MAX - 1;
+        inner.receive_data(1, b"c".to_vec(), FLAG_DATA, &mut events);
+        inner.receive_data(u32::MAX, b"b".to_vec(), FLAG_DATA, &mut events);
         assert_eq!(
-            &packet[payload_start..],
-            &payload[..],
-            "original payload should be intact after padding"
+            inner.sack_ranges(),
+            vec![
+                SackRange {
+                    start: u32::MAX,
+                    end: 0
+                },
+                SackRange { start: 1, end: 2 }
+            ]
         );
+        inner.receive_data(0, b"x".to_vec(), FLAG_DATA, &mut events);
+        assert_eq!(inner.recv_ranges, vec![(u32::MAX, 2)]);
+        inner.receive_data(u32::MAX - 1, b"a".to_vec(), FLAG_DATA, &mut events);
+        assert_eq!(inner.next_remote_seq, 2);
+        let data: Vec<_> = events
+            .iter()
+            .map(|e| match e {
+                StreamEvent::Data(d) => d.clone(),
+                _ => panic!("data only"),
+            })
+            .collect();
+        assert_eq!(
+            data,
+            [b"a".to_vec(), b"b".to_vec(), b"x".to_vec(), b"c".to_vec()]
+        );
+        // Old seqs (before the cumulative ACK) are dropped.
+        inner.receive_data(u32::MAX - 5, b"old".to_vec(), FLAG_DATA, &mut events);
+        assert!(inner.recv_buf.is_empty());
+    }
+
+    /// S2: an RTO with 1 MiB in flight retransmits at most `cwnd` packets in
+    /// its first burst, and `cwnd` drops to what is still in flight plus one.
+    #[test]
+    fn rto_burst_is_bounded_by_cwnd() {
+        let mut inner = make_stream_inner();
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        inner.connected = true;
+        inner.remote_addr = Some(addr);
+        let count = (1 << 20) / MAX_PAYLOAD as u32 + 1;
+        for seq in 0..count {
+            inner.register_sent(
+                seq,
+                build_data_packet(0, seq, 0, &[0; MAX_PAYLOAD]),
+                addr,
+                false,
+            );
+        }
+        inner.next_seq = count;
+        inner.congestion.cwnd = count;
+
+        inner.on_rto();
+        let cwnd = inner.congestion.cwnd;
+        assert_eq!(cwnd, inner.inflight() + 1);
+        let burst = inner.take_send_batch();
+        assert!(burst.0.len() <= cwnd as usize, "{} > {cwnd}", burst.0.len());
+        assert_eq!(burst.1, SendStop::Window);
     }
 
     /// A SACK block spanning the whole sequence space (one 28-byte packet
@@ -2823,7 +3686,7 @@ mod mtu_tests {
             "SACK walk is not bounded"
         );
 
-        let seqs: Vec<u32> = sacked.iter().map(|(seq, _)| *seq).collect();
+        let seqs: Vec<u32> = sacked.iter().map(|d| d.seq).collect();
         assert_eq!(seqs, vec![5, 6, 9]);
         assert!(inner.outgoing.values().all(|p| p.sacked));
         assert_eq!(inner.inflight(), 0);
@@ -2854,27 +3717,16 @@ mod mtu_tests {
     #[test]
     fn mtu_max_probe_failures_completes_search() {
         let mut inner = make_stream_inner();
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
         inner.mtu_state = MtuState::Search;
         inner.mtu = MTU_BASE + MTU_STEP;
 
         for i in 0..MTU_MAX_PROBES {
-            let payload = vec![0xEFu8; MTU_BASE - HEADER_SIZE];
-            let packet = build_data_packet(0, i, 0, &payload);
-            inner.outgoing.insert(
-                i,
-                SentPacket {
-                    packet,
-                    remote_addr: "0.0.0.0:0".parse().unwrap(),
-                    time_sent: Instant::now(),
-                    retransmit_count: 0,
-                    sacked: false,
-                    is_mtu_probe: true,
-                    lost: false,
-                    rate_info: None,
-                },
-            );
-
-            let _ = inner.collect_retransmits(false);
+            let packet = build_data_packet(0, i, 0, &[0xEF; MAX_PAYLOAD]);
+            inner.mtu_probe_count += 1;
+            inner.register_sent(i, packet, addr, true);
+            inner.next_seq = i + 1;
+            inner.on_rto();
         }
 
         assert_eq!(inner.mtu_state, MtuState::SearchComplete);
@@ -2891,6 +3743,165 @@ mod mtu_tests {
 mod abort_tests {
     use super::*;
     use std::time::Duration;
+
+    /// Bind a runtime socket and a raw UDP peer; connect stream 5 to it.
+    async fn raw_peer_stream() -> (
+        crate::UdxRuntime,
+        crate::UdxSocket,
+        UdxStream,
+        tokio::net::UdpSocket,
+    ) {
+        let runtime = crate::UdxRuntime::new().unwrap();
+        let socket = runtime.create_socket().await.unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stream = runtime.create_stream(5).await.unwrap();
+        stream
+            .connect(&socket, 6, peer.local_addr().unwrap())
+            .await
+            .unwrap();
+        (runtime, socket, stream, peer)
+    }
+
+    /// Next packet the raw peer receives within `wait`, as (header, from).
+    async fn recv_header(
+        peer: &tokio::net::UdpSocket,
+        wait: Duration,
+    ) -> Option<(Header, SocketAddr)> {
+        let mut buf = [0u8; 2048];
+        let (len, from) = tokio::time::timeout(wait, peer.recv_from(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        Some((Header::decode(&buf[..len]).ok()?, from))
+    }
+
+    fn ack(ack: u32, recv_window: u32) -> [u8; HEADER_SIZE] {
+        Header {
+            type_flags: 0,
+            data_offset: 0,
+            remote_id: 5,
+            recv_window,
+            seq: 0,
+            ack,
+        }
+        .encode()
+    }
+
+    /// S1: a peer advertising a zero window must not make the send loop poll
+    /// (C probes it at the RTO instead), and a dropped stream stuck behind
+    /// the zero window ends after the RTO budget of probes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_window_does_not_spin_and_dropped_stream_ends() {
+        use tokio::io::AsyncWriteExt;
+        let (_runtime, _socket, stream, peer) = raw_peer_stream().await;
+        let inner = Arc::clone(&stream.inner);
+        let abort = stream.abort_handle();
+        let mut stream = stream.into_async_stream();
+        // More than the initial window, so data stays queued.
+        stream.write_all(&[7u8; 64 * 1024]).await.unwrap();
+        let mut next = 0;
+        let mut from = None;
+        while let Some((header, addr)) = recv_header(&peer, Duration::from_millis(200)).await {
+            next = next.max(header.seq + 1);
+            from = Some(addr);
+        }
+        assert!(next > 0, "the first window was sent");
+        peer.send_to(&ack(next, 0), from.unwrap()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = inner.lock().unwrap().pacing_wakeups;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let wakeups = inner.lock().unwrap().pacing_wakeups - before;
+        assert!(wakeups <= 5, "{wakeups} send-loop wakeups in 500 ms");
+        assert!(abort.is_alive());
+
+        inner.lock().unwrap().rto = 20;
+        drop(stream);
+        for _ in 0..150 {
+            if !abort.is_alive() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("dropped stream behind a zero window never ended");
+    }
+
+    /// RACK §7 tail loss probe: a lost last packet is sent again after about
+    /// two RTTs, not after the 1 s RTO.
+    #[tokio::test]
+    async fn tail_loss_probe_resends_the_last_packet_before_the_rto() {
+        use tokio::io::AsyncWriteExt;
+        let (_runtime, _socket, stream, peer) = raw_peer_stream().await;
+        let mut stream = stream.into_async_stream();
+        stream.write_all(b"one").await.unwrap();
+        let (first, from) = recv_header(&peer, Duration::from_secs(1)).await.unwrap();
+        peer.send_to(&ack(first.seq + 1, DEFAULT_RWND), from)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        stream.write_all(b"two").await.unwrap();
+        let (lost, _) = recv_header(&peer, Duration::from_secs(1)).await.unwrap();
+        let (probe, _) = recv_header(&peer, Duration::from_millis(500))
+            .await
+            .expect("no loss probe before the RTO");
+        assert_eq!(probe.seq, lost.seq);
+        assert!(probe.has_flag(FLAG_DATA));
+    }
+
+    /// S5: with keepalive on, the stream sends heartbeats and ends with a
+    /// timeout once the peer stays silent for six intervals.
+    #[tokio::test]
+    async fn keepalive_ends_a_stream_whose_peer_is_silent() {
+        let (_runtime, _socket, mut stream, peer) = raw_peer_stream().await;
+        stream.set_keepalive(Some(Duration::from_millis(30)));
+        let (heartbeat, _) = recv_header(&peer, Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert!(heartbeat.has_flag(FLAG_HEARTBEAT));
+        let err = tokio::time::timeout(Duration::from_secs(2), stream.read())
+            .await
+            .expect("silent peer was never detected")
+            .expect_err("a dead peer is an error, not EOF");
+        assert!(matches!(err, UdxError::Io(e) if e.kind() == std::io::ErrorKind::TimedOut));
+    }
+
+    /// A stream keeps receiving on the socket it moved to after the caller
+    /// drops its own handle of that socket (hyperdht drops the holepunch
+    /// socket handle once the relay-to-direct upgrade is done). C streams
+    /// hold their `udx_socket_t`.
+    #[tokio::test]
+    async fn stream_keeps_its_socket_open_after_change_remote() {
+        let (runtime, _socket, mut stream, peer) = raw_peer_stream().await;
+        let direct = runtime.create_socket().await.unwrap();
+        direct.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let direct_addr = direct.local_addr().await.unwrap();
+        stream
+            .remote_handle()
+            .change_remote(&direct, 6, peer.local_addr().unwrap())
+            .await
+            .unwrap();
+        drop(direct);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut bytes = Header {
+            type_flags: FLAG_DATA,
+            data_offset: 0,
+            remote_id: 5,
+            recv_window: DEFAULT_RWND,
+            seq: 0,
+            ack: 0,
+        }
+        .encode()
+        .to_vec();
+        bytes.extend_from_slice(b"direct");
+        peer.send_to(&bytes, direct_addr).await.unwrap();
+        let data = tokio::time::timeout(Duration::from_secs(1), stream.read())
+            .await
+            .expect("the moved stream stopped receiving")
+            .unwrap();
+        assert_eq!(data.as_deref(), Some(&b"direct"[..]));
+    }
 
     #[tokio::test]
     async fn closed_id_can_be_reused_before_old_handles_and_processor_are_dropped() {
@@ -3095,5 +4106,828 @@ mod abort_tests {
                 .expect("observer must complete within timeout")
                 .expect("observer task must not panic");
         }
+    }
+
+    /// RACK reorder timer (C `udx_rack_reo_timeout`): a hole the peer SACKs
+    /// around is resent when the reorder window ends, with no further ACK
+    /// and long before the 1 s RTO. Seq 0 gives a 20 ms RTT sample, so the
+    /// window is open (min RTT / 4 = 5 ms).
+    #[tokio::test]
+    async fn reorder_timer_resends_a_hole_without_another_ack() {
+        use tokio::io::AsyncWriteExt;
+        let (_runtime, _socket, stream, peer) = raw_peer_stream().await;
+        let mut stream = stream.into_async_stream();
+        stream.write_all(b"a").await.unwrap();
+        let (first, from) = recv_header(&peer, Duration::from_secs(1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        peer.send_to(&ack(first.seq + 1, DEFAULT_RWND), from)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        stream.write_all(&[1u8; 3 * MAX_PAYLOAD]).await.unwrap();
+        let mut seqs = Vec::new();
+        while seqs.len() < 3 {
+            let (header, _) = recv_header(&peer, Duration::from_secs(1)).await.unwrap();
+            seqs.push(header.seq);
+        }
+        let hole = seqs[0];
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The peer got all but the first: ack it, SACK the other two.
+        let mut sack = Header {
+            type_flags: FLAG_SACK,
+            data_offset: 8,
+            remote_id: 5,
+            recv_window: DEFAULT_RWND,
+            seq: 0,
+            ack: hole,
+        }
+        .encode()
+        .to_vec();
+        sack.resize(HEADER_SIZE + 8, 0);
+        encode_sack(
+            &[SackRange {
+                start: hole + 1,
+                end: hole + 3,
+            }],
+            &mut sack[HEADER_SIZE..],
+        );
+        peer.send_to(&sack, from).await.unwrap();
+
+        let (resent, _) = recv_header(&peer, Duration::from_millis(500))
+            .await
+            .expect("the hole was not resent before the RTO");
+        assert!(resent.has_flag(FLAG_DATA));
+        assert_eq!(resent.seq, hole);
+    }
+
+    /// C `process_packet` hands a MESSAGE payload to `on_recv`
+    /// (udx.c:1699-1707): `recv_message` returns it, after skipping
+    /// `data_offset` bytes, and ends with `StreamClosed` after the stream.
+    #[tokio::test]
+    async fn message_payloads_reach_recv_message() {
+        let (_runtime, socket, stream, peer) = raw_peer_stream().await;
+        let to = socket.local_addr().await.unwrap();
+        let remote = stream.remote_handle();
+        let message = |data_offset: u8, body: &[u8]| {
+            let mut packet = Header {
+                type_flags: FLAG_MESSAGE,
+                data_offset,
+                remote_id: 5,
+                recv_window: DEFAULT_RWND,
+                seq: 0,
+                ack: 0,
+            }
+            .encode()
+            .to_vec();
+            packet.extend_from_slice(body);
+            packet
+        };
+        peer.send_to(&message(0, b"hello"), to).await.unwrap();
+        peer.send_to(&message(2, b"..world"), to).await.unwrap();
+        let next = || async {
+            tokio::time::timeout(Duration::from_secs(1), remote.recv_message())
+                .await
+                .expect("no message")
+        };
+        assert_eq!(next().await.unwrap(), b"hello");
+        assert_eq!(next().await.unwrap(), b"world");
+        stream.abort_handle().abort();
+        assert!(matches!(next().await, Err(UdxError::StreamClosed)));
+    }
+
+    fn packet(type_flags: u8, seq: u32, ack: u32) -> [u8; HEADER_SIZE] {
+        Header {
+            type_flags,
+            data_offset: 0,
+            remote_id: 5,
+            recv_window: DEFAULT_RWND,
+            seq,
+            ack,
+        }
+        .encode()
+    }
+
+    fn entry(socket: &crate::UdxSocket) -> Option<&'static str> {
+        match socket.streams_ref().lock().unwrap().get(&5) {
+            Some(StreamEntry::Stream(_)) => Some("stream"),
+            Some(StreamEntry::Timewait(_)) => Some("timewait"),
+            None => None,
+        }
+    }
+
+    /// Our stream (5) ends first, the raw peer ACKs the END, then ends too.
+    async fn end_first(stream: &mut UdxStream, peer: &tokio::net::UdpSocket, to: SocketAddr) {
+        let peer_side = async {
+            let (end, _) = recv_header(peer, Duration::from_secs(1)).await.unwrap();
+            assert!(end.has_flag(FLAG_END) && end.seq == 0);
+            peer.send_to(&packet(0, 0, 1), to).await.unwrap();
+        };
+        let (ended, ()) = tokio::join!(stream.shutdown(), peer_side);
+        ended.unwrap();
+        // C `send_ack` once the peer ACKed our END (udx.c:1810).
+        let (state, _) = recv_header(peer, Duration::from_millis(500)).await.unwrap();
+        assert_eq!((state.type_flags, state.seq, state.ack), (0, 1, 0));
+        assert!(
+            stream.abort_handle().is_alive(),
+            "the peer has not ended yet"
+        );
+        peer.send_to(&packet(FLAG_END, 0, 1), to).await.unwrap();
+        let (final_ack, _) = recv_header(peer, Duration::from_millis(500)).await.unwrap();
+        assert_eq!(
+            (final_ack.type_flags, final_ack.seq, final_ack.ack),
+            (0, 1, 1)
+        );
+    }
+
+    /// C `close_stream` on `UDX_STREAM_ALL_ENDED` and `stream_timewait`: the
+    /// side that ended first closes by itself once both ends are ACKed; for
+    /// `TIMEWAIT` its id answers a late DATA or END with the final ACK
+    /// (`process_timewait`), ignores anything else, and reaches nothing.
+    #[tokio::test]
+    async fn stream_that_ends_first_closes_and_answers_from_timewait() {
+        let (_runtime, socket, mut stream, peer) = raw_peer_stream().await;
+        let to = socket.local_addr().await.unwrap();
+        let abort = stream.abort_handle();
+        end_first(&mut stream, &peer, to).await;
+
+        tokio::time::timeout(Duration::from_secs(1), abort.closed())
+            .await
+            .expect("a stream with both ends done closes without its owner");
+        assert!(!abort.is_alive());
+        assert!(matches!(stream.read().await, Ok(None)));
+        assert_eq!(entry(&socket), Some("timewait"));
+
+        // The peer missed our final ACK and sends its END again.
+        peer.send_to(&packet(FLAG_END, 0, 1), to).await.unwrap();
+        let (answer, _) = recv_header(&peer, Duration::from_millis(500))
+            .await
+            .expect("timewait answers a late END");
+        assert_eq!((answer.type_flags, answer.seq, answer.ack), (0, 1, 1));
+        assert_eq!(answer.remote_id, 6);
+        peer.send_to(&packet(FLAG_DATA, 0, 1), to).await.unwrap();
+        assert!(
+            recv_header(&peer, Duration::from_millis(500))
+                .await
+                .is_some()
+        );
+        peer.send_to(&packet(FLAG_HEARTBEAT, 1, 1), to)
+            .await
+            .unwrap();
+        assert!(
+            recv_header(&peer, Duration::from_millis(200))
+                .await
+                .is_none()
+        );
+        // A DESTROY for an id in timewait is ignored (C `process_timewait`).
+        peer.send_to(&packet(FLAG_DESTROY, 1, 1), to).await.unwrap();
+        assert!(
+            recv_header(&peer, Duration::from_millis(200))
+                .await
+                .is_none()
+        );
+        assert!(!abort.is_alive());
+        assert_eq!(entry(&socket), Some("timewait"));
+
+        tokio::time::sleep(TIMEWAIT).await;
+        assert_eq!(entry(&socket), None, "timewait ends after {TIMEWAIT:?}");
+        peer.send_to(&packet(FLAG_END, 0, 1), to).await.unwrap();
+        assert!(
+            recv_header(&peer, Duration::from_millis(300))
+                .await
+                .is_none()
+        );
+    }
+
+    /// The side that ended second closes as soon as its END is ACKed, sends
+    /// nothing more and leaves no timewait (C udx.c:1803, 2848).
+    #[tokio::test]
+    async fn stream_that_ends_second_closes_without_timewait() {
+        let (_runtime, socket, mut stream, peer) = raw_peer_stream().await;
+        let to = socket.local_addr().await.unwrap();
+        let abort = stream.abort_handle();
+        peer.send_to(&packet(FLAG_END, 0, 0), to).await.unwrap();
+        let (ack, _) = recv_header(&peer, Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!(ack.ack, 1);
+        assert!(matches!(stream.read().await, Ok(None)));
+
+        let peer_side = async {
+            let (end, _) = recv_header(&peer, Duration::from_secs(1)).await.unwrap();
+            assert!(end.has_flag(FLAG_END) && end.seq == 0);
+            peer.send_to(&packet(0, 1, 1), to).await.unwrap();
+        };
+        let (ended, ()) = tokio::join!(stream.shutdown(), peer_side);
+        ended.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), abort.closed())
+            .await
+            .expect("closes once its END is ACKed");
+        assert!(
+            recv_header(&peer, Duration::from_millis(200))
+                .await
+                .is_none()
+        );
+        assert_eq!(entry(&socket), None);
+        peer.send_to(&packet(FLAG_END, 0, 1), to).await.unwrap();
+        assert!(
+            recv_header(&peer, Duration::from_millis(200))
+                .await
+                .is_none()
+        );
+    }
+
+    /// C `process_timewait` answers from the stream's socket at close
+    /// (`timewait->socket`) to its last remote (`timewait->remote_addr`),
+    /// whichever socket and source the late packet came on. After a
+    /// `change_remote` to a second socket, a late END on the old socket is
+    /// answered from the new socket to the new remote, and the old source
+    /// hears nothing.
+    #[tokio::test]
+    async fn timewait_answers_from_the_stream_socket_to_its_last_remote() {
+        let (runtime, old_socket, mut stream, old_peer) = raw_peer_stream().await;
+        let new_socket = runtime.create_socket().await.unwrap();
+        new_socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let old_to = old_socket.local_addr().await.unwrap();
+        let new_to = new_socket.local_addr().await.unwrap();
+        let new_peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stream
+            .remote_handle()
+            .change_remote(&new_socket, 6, new_peer.local_addr().unwrap())
+            .await
+            .unwrap();
+        end_first(&mut stream, &new_peer, new_to).await;
+        tokio::time::timeout(Duration::from_secs(1), stream.abort_handle().closed())
+            .await
+            .unwrap();
+
+        old_peer
+            .send_to(&packet(FLAG_END, 0, 1), old_to)
+            .await
+            .unwrap();
+        let (answer, from) = recv_header(&new_peer, Duration::from_millis(500))
+            .await
+            .expect("answered to the last remote");
+        assert_eq!((answer.seq, answer.ack), (1, 1));
+        assert_eq!(from.port(), new_to.port(), "from the stream's socket");
+        assert!(
+            recv_header(&old_peer, Duration::from_millis(200))
+                .await
+                .is_none()
+        );
+
+        new_peer
+            .send_to(&packet(FLAG_END, 0, 1), new_to)
+            .await
+            .unwrap();
+        let (_, from) = recv_header(&new_peer, Duration::from_millis(500))
+            .await
+            .expect("answered on the new socket");
+        assert_eq!(from.port(), new_to.port());
+    }
+
+    /// C `_udx_stream_write` (udx.c:2805): a write landing on an idle stream
+    /// behind a zero window sends a zero-window probe at once, not after
+    /// one RTO (1 s here).
+    #[tokio::test]
+    async fn write_behind_a_zero_window_probes_at_once() {
+        let (_runtime, socket, stream, peer) = raw_peer_stream().await;
+        let to = socket.local_addr().await.unwrap();
+        let peer_side = async {
+            let (data, _) = recv_header(&peer, Duration::from_secs(1)).await.unwrap();
+            peer.send_to(&ack(data.seq + 1, 0), to).await.unwrap();
+        };
+        let (written, ()) = tokio::join!(stream.write(b"one"), peer_side);
+        written.unwrap();
+        let start = tokio::time::Instant::now();
+        let probe = async {
+            loop {
+                let (header, _) = recv_header(&peer, Duration::from_millis(300))
+                    .await
+                    .expect("zero-window probe within 300 ms");
+                if header.has_flag(FLAG_HEARTBEAT) {
+                    return start.elapsed();
+                }
+            }
+        };
+        let (_, waited) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(400), stream.write(b"two")),
+            probe
+        );
+        assert!(
+            waited < Duration::from_millis(300),
+            "probe after {waited:?}"
+        );
+    }
+
+    /// A `UdxStream::write` future dropped after its first poll has queued
+    /// the data: every byte still goes out.
+    #[tokio::test]
+    async fn dropped_write_future_loses_no_bytes() {
+        let (_runtime, socket, stream, peer) = raw_peer_stream().await;
+        let to = socket.local_addr().await.unwrap();
+        let data = pattern(3_000);
+        let _ = tokio::time::timeout(Duration::from_millis(1), stream.write(&data)).await;
+        let mut received = Vec::new();
+        let mut next = 0;
+        while received.len() < data.len() {
+            let (header, _, payload) = recv_data(&peer, Duration::from_secs(2))
+                .await
+                .expect("the dropped write's data");
+            if header.seq == next {
+                next += 1;
+                received.extend_from_slice(&payload);
+            }
+            peer.send_to(&packet(0, 0, next), to).await.unwrap();
+        }
+        assert_eq!(received, data);
+    }
+
+    /// Keepalive keeps running on a half-closed stream (our END ACKed, the
+    /// peer's not yet sent), as C keeps its keepalive timer.
+    #[tokio::test]
+    async fn keepalive_runs_on_a_half_closed_stream() {
+        let (_runtime, socket, stream, peer) = raw_peer_stream().await;
+        let to = socket.local_addr().await.unwrap();
+        stream.set_keepalive(Some(Duration::from_millis(30)));
+        let peer_side = async {
+            loop {
+                let (header, _) = recv_header(&peer, Duration::from_secs(1)).await.unwrap();
+                if header.has_flag(FLAG_END) {
+                    peer.send_to(&packet(0, 0, header.seq + 1), to)
+                        .await
+                        .unwrap();
+                    return;
+                }
+            }
+        };
+        let (ended, ()) = tokio::join!(stream.shutdown(), peer_side);
+        ended.unwrap();
+        let heartbeat = async {
+            loop {
+                let (header, _) = recv_header(&peer, Duration::from_millis(500)).await?;
+                if header.has_flag(FLAG_HEARTBEAT) {
+                    return Some(());
+                }
+            }
+        };
+        assert!(
+            heartbeat.await.is_some(),
+            "heartbeats continue after our END"
+        );
+        assert!(stream.abort_handle().is_alive());
+    }
+
+    /// C `udx_stream_init` lets a new stream take an id in timewait; the
+    /// timewait then neither answers for it nor removes it on expiry.
+    #[tokio::test]
+    async fn new_stream_takes_an_id_in_timewait() {
+        let (runtime, socket, mut stream, peer) = raw_peer_stream().await;
+        let to = socket.local_addr().await.unwrap();
+        end_first(&mut stream, &peer, to).await;
+        tokio::time::timeout(Duration::from_secs(1), stream.abort_handle().closed())
+            .await
+            .unwrap();
+        assert_eq!(entry(&socket), Some("timewait"));
+
+        let mut fresh = runtime.create_stream(5).await.unwrap();
+        fresh
+            .connect(&socket, 6, peer.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(entry(&socket), Some("stream"));
+        let mut data = packet(FLAG_DATA, 0, 0).to_vec();
+        data.extend_from_slice(b"fresh");
+        peer.send_to(&data, to).await.unwrap();
+        let (ack, _) = recv_header(&peer, Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!((ack.seq, ack.ack), (0, 1), "the new stream answers");
+        assert_eq!(fresh.read().await.unwrap().as_deref(), Some(&b"fresh"[..]));
+
+        tokio::time::sleep(TIMEWAIT + Duration::from_millis(100)).await;
+        assert_eq!(entry(&socket), Some("stream"));
+    }
+
+    /// Next datagram within `wait`: header, wire length, payload.
+    async fn recv_data(
+        peer: &tokio::net::UdpSocket,
+        wait: Duration,
+    ) -> Option<(Header, usize, Vec<u8>)> {
+        let mut buf = [0u8; 2048];
+        let (len, _) = tokio::time::timeout(wait, peer.recv_from(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        let header = Header::decode(&buf[..len]).ok()?;
+        let payload = buf[header.payload_offset().min(len)..len].to_vec();
+        Some((header, len, payload))
+    }
+
+    /// C packetizes at send time (udx.c:2634-2636): data written before
+    /// `change_remote` but not sent yet leaves at the new path's base MTU,
+    /// for the new peer, in order, and the write completes.
+    #[tokio::test]
+    async fn change_remote_sends_queued_data_at_the_new_base_mtu() {
+        let (_runtime, socket, stream, old_peer) = raw_peer_stream().await;
+        let to = socket.local_addr().await.unwrap();
+        let new_peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        {
+            let mut inner = stream.inner.lock().unwrap();
+            inner.mtu = MTU_MAX;
+            inner.mtu_state = MtuState::SearchComplete;
+        }
+        let old_size = MTU_MAX - IPV4_UDP_OVERHEAD;
+        let new_size = MTU_BASE - IPV4_UDP_OVERHEAD;
+        let data = pattern(40_000);
+        let remote = stream.remote_handle();
+
+        let peers = async {
+            // The first window goes to the old peer at the old MTU.
+            let mut received = Vec::new();
+            let mut next = 0;
+            while let Some((header, len, payload)) =
+                recv_data(&old_peer, Duration::from_millis(300)).await
+            {
+                assert!(header.has_flag(FLAG_DATA));
+                assert_eq!(header.seq, next);
+                assert_eq!(len, old_size);
+                next += 1;
+                received.extend_from_slice(&payload);
+            }
+            assert!(
+                next > 0 && received.len() < data.len(),
+                "data is still queued"
+            );
+            let changed = remote.change_remote(&socket, 7, new_peer.local_addr().unwrap());
+            let ack_old = async {
+                old_peer.send_to(&packet(0, 0, next), to).await.unwrap();
+            };
+            let (changed, ()) = tokio::join!(changed, ack_old);
+            changed.unwrap();
+
+            // The rest goes to the new peer, cut at the new base MTU.
+            let mut flight = Vec::new();
+            while let Some(sent) = recv_data(&new_peer, Duration::from_millis(300)).await {
+                flight.push(sent);
+            }
+            assert!(!flight.is_empty(), "queued data goes to the new peer");
+            for (header, len, payload) in flight {
+                assert_eq!((header.remote_id, header.seq), (7, next));
+                if received.len() + payload.len() < data.len() {
+                    assert_eq!(len, new_size, "queued data is cut at the new MTU");
+                }
+                next += 1;
+                received.extend_from_slice(&payload);
+            }
+            // ACK as packets arrive until everything is in.
+            new_peer.send_to(&packet(0, 0, next), to).await.unwrap();
+            while received.len() < data.len() {
+                let (header, _, payload) = recv_data(&new_peer, Duration::from_secs(2))
+                    .await
+                    .expect("the rest of the queued data");
+                if header.seq == next {
+                    next += 1;
+                    received.extend_from_slice(&payload);
+                }
+                new_peer.send_to(&packet(0, 0, next), to).await.unwrap();
+            }
+            received
+        };
+        let (written, received) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(stream.write(&data), peers)
+        })
+        .await
+        .expect("transfer stalled");
+        written.expect("the write completes once the new peer ACKed it");
+        assert_eq!(received, data);
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+}
+
+#[cfg(test)]
+mod rack_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn ack_header(ack: u32) -> Header {
+        Header {
+            type_flags: 0,
+            data_offset: 0,
+            remote_id: 0,
+            recv_window: DEFAULT_RWND,
+            seq: 0,
+            ack,
+        }
+    }
+
+    /// A connected stream on a fake clock with one 20 ms RTT sample (`srtt`
+    /// and minimum RTT 20 ms, so the reorder window is 5 ms) and seqs 1-3
+    /// sent 1 ms apart from the returned instant.
+    fn three_in_flight() -> (StreamInner, Instant) {
+        let (read_tx, _read_rx) = mpsc::unbounded_channel();
+        let mut inner = StreamInner::new(0, read_tx, None, None, Registrations::default(), None);
+        let addr = "127.0.0.1:9".parse().unwrap();
+        inner.connected = true;
+        inner.remote_addr = Some(addr);
+        let t0 = Instant::now();
+        inner.clock = Some(t0);
+        inner.register_sent(0, build_data_packet(1, 0, 0, b"x"), addr, false);
+        inner.next_seq = 1;
+        let t1 = t0 + ms(20);
+        inner.clock = Some(t1);
+        inner.on_ack_packet(&ack_header(1), None);
+        assert_eq!((inner.srtt, inner.rtt_min.get()), (20, 20));
+        for seq in 1..4u32 {
+            inner.clock = Some(t1 + ms(u64::from(seq) - 1));
+            inner.register_sent(seq, build_data_packet(1, seq, 0, b"x"), addr, false);
+        }
+        inner.next_seq = 4;
+        (inner, t1)
+    }
+
+    /// Packets the peer receives out of order inside the reorder window (C
+    /// `rack_update_reo_wnd`: min RTT / 4, at most srtt) are not marked lost:
+    /// no retransmit, no recovery, no cwnd cut.
+    #[test]
+    fn reordered_packet_inside_the_window_is_not_retransmitted() {
+        let (mut inner, t1) = three_in_flight();
+        let cwnd = inner.congestion.cwnd;
+        // Seq 3 arrives first, 20 ms after it was sent: ack 1, SACK [3, 4).
+        inner.clock = Some(t1 + ms(22));
+        let outcome = inner.on_ack_packet(&ack_header(1), Some(&[SackRange { start: 3, end: 4 }]));
+        // Seq 2 (sent at t1 + 1) leaves the 20 + 5 ms window at t1 + 26.
+        assert_eq!(outcome.reorder_timeout, Some(ms(4)));
+        assert!(inner.lost_queue.is_empty());
+        assert_eq!(inner.congestion.ca_state, CaState::Open);
+
+        // Seqs 1 and 2 arrive 1 ms later.
+        inner.clock = Some(t1 + ms(23));
+        let outcome = inner.on_ack_packet(&ack_header(4), None);
+        assert!(outcome.ack_advanced && outcome.reorder_timeout.is_none());
+        assert_eq!(inner.retransmits, 0);
+        assert!(inner.lost_queue.is_empty());
+        assert_eq!(inner.congestion.ca_state, CaState::Open);
+        assert!(
+            inner.congestion.cwnd >= cwnd,
+            "cwnd cut to {}",
+            inner.congestion.cwnd
+        );
+        // Seqs 1 and 2 were delivered below seq 3 without a retransmit.
+        assert!(inner.reordering_seen);
+    }
+
+    /// A real loss inside the reorder window is found by the reorder timer
+    /// alone (C `udx_rack_reo_timeout`): no further ACK arrives.
+    #[test]
+    fn reorder_timer_detects_a_real_loss_without_another_ack() {
+        let (mut inner, t1) = three_in_flight();
+        inner.clock = Some(t1 + ms(22));
+        let outcome = inner.on_ack_packet(&ack_header(1), Some(&[SackRange { start: 3, end: 4 }]));
+        let wait = outcome.reorder_timeout.expect("a reorder wait");
+        assert!(inner.lost_queue.is_empty());
+
+        inner.clock = Some(t1 + ms(22) + wait);
+        assert_eq!(inner.on_reorder_timeout(), 2);
+        assert_eq!(inner.congestion.ca_state, CaState::Recovery);
+        let (batch, _, _) = inner.take_send_batch();
+        let resent: Vec<u32> = batch
+            .iter()
+            .map(|(packet, _)| Header::decode(packet).unwrap().seq)
+            .collect();
+        assert_eq!(resent, [1, 2]);
+    }
+
+    /// C `udx_rto_timeout` (udx.c:1225-1247): every firing re-arms the timer
+    /// at `2 × rto` without changing `rto`, and the seventh firing without
+    /// progress ends the stream (`rto_count > UDX_MAX_RTO_TIMEOUTS`).
+    #[test]
+    fn rto_backs_off_the_timer_only_and_gives_up_on_the_seventh() {
+        let (mut inner, _) = three_in_flight();
+        let rto = inner.rto;
+        for _ in 0..MAX_RTO_TIMEOUTS {
+            assert_eq!(inner.rto_fired(), Some(ms(u64::from(rto) * 2)));
+            assert_eq!(inner.rto, rto);
+        }
+        assert_eq!(inner.rto_fired(), None);
+    }
+
+    /// C `clamp_rtt` (udx.c:1290-1303): a sample over 5 s and over
+    /// `srtt + 5 × rttvar` (a suspend) counts as that bound; a 4 s one does not.
+    #[test]
+    fn suspend_length_rtt_sample_is_clamped() {
+        let (read_tx, _read_rx) = mpsc::unbounded_channel();
+        let mut inner = StreamInner::new(0, read_tx, None, None, Registrations::default(), None);
+        let t0 = Instant::now();
+        inner.srtt = 100;
+        inner.rttvar = 50;
+        inner.on_packet_acked(0, t0, false, t0 + ms(60_000));
+        // 350 ms, not 60 s (nor the 30 s cap).
+        assert_eq!(
+            (inner.srtt, inner.rttvar),
+            ((7 * 100 + 350) / 8, (3 * 50 + 250) / 4)
+        );
+
+        inner.srtt = 100;
+        inner.rttvar = 50;
+        inner.on_packet_acked(1, t0, false, t0 + ms(4_000));
+        assert_eq!(inner.srtt, (7 * 100 + 4_000) / 8);
+    }
+}
+
+#[cfg(test)]
+mod c_order_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A connected state machine on a fake clock with one RTT sample.
+    fn inner_with_rtt(rtt: u32) -> (StreamInner, Instant) {
+        let (read_tx, _rx) = mpsc::unbounded_channel();
+        let mut inner = StreamInner::new(0, read_tx, None, None, Registrations::default(), None);
+        inner.connected = true;
+        inner.remote_addr = Some("127.0.0.1:9".parse().unwrap());
+        inner.mtu_state = MtuState::SearchComplete;
+        let t0 = inner.epoch + Duration::from_millis(1000);
+        inner.clock = Some(t0);
+        inner.update_rtt(rtt);
+        inner
+            .rtt_min
+            .apply_min(RTT_MIN_WINDOW_MS, inner.clock_ms(t0), rtt);
+        (inner, t0)
+    }
+
+    fn write(inner: &mut StreamInner, packets: usize) {
+        let data = vec![7; packets * inner.max_payload()];
+        inner.push_write(WriteBuf {
+            data,
+            sent: 0,
+            end: false,
+            done: None,
+        });
+    }
+
+    fn sack_hdr(ack: u32) -> Header {
+        Header {
+            type_flags: FLAG_SACK,
+            data_offset: 0,
+            remote_id: 0,
+            recv_window: DEFAULT_RWND,
+            seq: 0,
+            ack,
+        }
+    }
+
+    /// cwnd 10; 0-7 sent at t0, 8-9 at t0+200; at t0+300 ACK 1 with SACK
+    /// 8..10 marks 1-7 lost. Leaves the stream in Recovery.
+    fn enter_recovery(extra: usize) -> (StreamInner, Instant, AckOutcome) {
+        let (mut inner, t0) = inner_with_rtt(100);
+        inner.congestion.cwnd = 10;
+        write(&mut inner, 8);
+        assert_eq!(inner.take_send_batch().0.len(), 8);
+        inner.clock = Some(t0 + Duration::from_millis(200));
+        write(&mut inner, 2 + extra);
+        assert_eq!(inner.take_send_batch().0.len(), 2);
+        inner.clock = Some(t0 + Duration::from_millis(300));
+        let outcome = inner.on_ack_packet(&sack_hdr(1), Some(&[SackRange { start: 8, end: 10 }]));
+        assert_eq!(inner.congestion.ca_state, CaState::Recovery);
+        assert_eq!(inner.congestion.high_seq, 10);
+        (inner, t0, outcome)
+    }
+
+    /// C `rack_detect_loss` sends before `bbr_main` (udx.c:1164, 1877):
+    /// every lost packet leaves under the pre-recovery window, which
+    /// `inflight + acked` (udx_bbr.c:207) then keeps at 10.
+    #[test]
+    fn recovery_entry_retransmits_every_lost_packet_first() {
+        let (inner, _, outcome) = enter_recovery(0);
+        assert_eq!(outcome.batch.len(), 7);
+        assert_eq!(inner.congestion.cwnd, 10);
+    }
+
+    /// C `process_packet`: recovery lasts until the cumulative ACK passes
+    /// `high_seq` (`>`, not `>=`); the next delivering ACK restores
+    /// `prior_cwnd`.
+    #[test]
+    fn recovery_exit_restores_prior_cwnd() {
+        let (mut inner, t0, _) = enter_recovery(2);
+        let prior = inner.congestion.prior_cwnd();
+        assert_eq!(prior, 10);
+        let mut t = 300;
+        while inner.remote_acked < 10 {
+            t += 100;
+            inner.clock = Some(t0 + Duration::from_millis(t));
+            let ack = inner.remote_acked + 1;
+            inner.on_ack_packet(&sack_hdr(ack), None);
+            let _ = inner.take_send_batch();
+            assert_eq!(
+                inner.congestion.ca_state,
+                CaState::Recovery,
+                "ack {ack} <= high_seq"
+            );
+        }
+        assert!(inner.next_seq >= 11, "new data left during recovery");
+        inner.clock = Some(t0 + Duration::from_millis(t + 100));
+        inner.on_ack_packet(&sack_hdr(11), None);
+        assert_eq!(inner.congestion.ca_state, CaState::Open);
+        assert!(inner.congestion.cwnd >= prior);
+    }
+
+    /// C counts probes when sent (udx.c:858) and zeroes the count with the
+    /// MTU state (udx.c:2378): an old-path probe lost after `reset_mtu`
+    /// costs the new path nothing, and its late ACK raises no MTU.
+    #[test]
+    fn old_path_probe_costs_the_new_path_nothing() {
+        let (mut inner, t0) = inner_with_rtt(100);
+        inner.mtu_state = MtuState::Search;
+        inner.mtu_probe_size = 1232;
+        inner.mtu_probe_wanted = true;
+        write(&mut inner, 1);
+        assert_eq!(inner.take_send_batch().0.len(), 1);
+        assert!(inner.outgoing[&0].is_mtu_probe);
+        assert_eq!(inner.mtu_probe_count, 1, "counted when sent");
+        inner.reset_mtu();
+        inner.clock = Some(t0 + Duration::from_millis(2000));
+        inner.on_rto();
+        assert_eq!(inner.mtu_probe_count, 0);
+        assert_eq!(inner.mtu_state, MtuState::Base);
+
+        // A probe still in flight across the change is ACKed late.
+        let (mut inner, _) = inner_with_rtt(100);
+        inner.mtu_state = MtuState::Search;
+        inner.mtu_probe_size = 1232;
+        inner.mtu_probe_wanted = true;
+        write(&mut inner, 1);
+        inner.take_send_batch();
+        inner.reset_mtu();
+        inner.mtu_state = MtuState::Search;
+        inner.on_cumulative_ack(1);
+        assert_eq!(
+            inner.mtu, MTU_BASE,
+            "an old-path probe is no new-path proof"
+        );
+    }
+
+    /// C `SHOULD_READ` (udx.c:1682): nothing is read after the peer's END.
+    #[test]
+    fn data_after_end_is_dropped() {
+        let (mut inner, _) = inner_with_rtt(100);
+        let mut events = Vec::new();
+        inner.receive_data(0, Vec::new(), FLAG_END, &mut events);
+        inner.receive_data(1, b"late".to_vec(), FLAG_DATA, &mut events);
+        inner.receive_data(3, b"later".to_vec(), FLAG_DATA, &mut events);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], StreamEvent::End));
+        assert!(inner.recv_buf.is_empty() && inner.recv_ranges.is_empty());
+        assert_eq!(inner.next_remote_seq, 1);
+    }
+
+    /// C: an empty write rides on the next packet sent and completes with it.
+    #[test]
+    fn empty_write_completes_with_the_next_packet() {
+        let (mut inner, _) = inner_with_rtt(100);
+        let (tx, mut rx) = oneshot::channel();
+        inner.push_write(WriteBuf {
+            data: Vec::new(),
+            sent: 0,
+            end: false,
+            done: Some(tx),
+        });
+        assert!(
+            inner.take_send_batch().0.is_empty(),
+            "nothing to send alone"
+        );
+        write(&mut inner, 1);
+        assert_eq!(inner.take_send_batch().0.len(), 1);
+        let (completed, _) = inner.on_cumulative_ack(1);
+        assert_eq!(completed.len(), 1);
+        completed.into_iter().flatten().for_each(|tx| {
+            let _ = tx.send(Ok(()));
+        });
+        assert!(matches!(rx.try_recv(), Ok(Ok(()))));
+    }
+
+    /// C `udx_tlp_timeout` sends a new packet when one waits, ignoring the
+    /// window.
+    #[test]
+    fn loss_probe_sends_new_data_when_there_is_some() {
+        let (mut inner, _) = inner_with_rtt(100);
+        inner.congestion.cwnd = 1;
+        write(&mut inner, 2);
+        assert_eq!(inner.take_send_batch().0.len(), 1);
+        inner.tlp_permitted = true;
+        assert!(inner.take_loss_probe().is_some());
+        assert!(!inner.tlp_is_retrans);
+        assert_eq!(inner.tlp_end_seq, 1);
+        assert_eq!(inner.outgoing.len(), 2);
     }
 }

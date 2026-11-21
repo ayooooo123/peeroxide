@@ -36,6 +36,7 @@
 //! control connections).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -59,6 +60,9 @@ use crate::secret_stream::SecretStream;
 
 static NEXT_RELAY_STREAM_ID: AtomicU32 = AtomicU32::new(1);
 
+const RELAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const RELAY_CONTROL_MAX_FRAME_LEN: usize = 64 * 1024;
+
 fn next_relay_stream_id() -> u32 {
     NEXT_RELAY_STREAM_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -72,9 +76,9 @@ pub struct RelayServiceConfig {
     /// How often to sweep expired (timed-out) pending pairings.
     pub sweep_interval: Duration,
     /// Firewall state advertised to connecting peers in the noise reply.
-    /// A relay is expected to run reachably, so this defaults to
-    /// `FIREWALL_UNKNOWN` (matches Node's default — the relay doesn't
-    /// participate in NAT classification for its own control connections).
+    /// A relay is expected to run reachably, but Peeroxide defaults to
+    /// `FIREWALL_UNKNOWN` because it does not classify its control connections.
+    /// Node returns `FIREWALL_OPEN` when it knows the relay address.
     pub firewall: u64,
 }
 
@@ -174,9 +178,8 @@ pub fn run_relay_server(
         matched_rx,
     ));
 
-    // Background task: periodically sweep pending pairings that timed out
-    // and sessions idle past `idle_session_timeout` (peeroxide-only — see
-    // BlindRelayServerConfig::idle_session_timeout).
+    // Background task: periodically sweep expired pending pairings and idle
+    // sessions that do not own a pairing.
     let sweep_relay = relay.clone();
     let sweep_interval = config.sweep_interval;
     tokio::spawn(async move {
@@ -325,6 +328,10 @@ async fn handle_handshake(
         return;
     };
 
+    let Some(session_id) = relay.try_accept_session() else {
+        tracing::warn!("relay: rejecting handshake — at max_sessions capacity");
+        return;
+    };
     let runtime_handle = Arc::clone(runtime_handle);
     let dht = dht.clone();
     let relay = relay.clone();
@@ -332,23 +339,36 @@ async fn handle_handshake(
     let remote_pk = nw_result.remote_public_key;
 
     tokio::spawn(async move {
-        match finalize_relay_connection(
-            runtime_handle,
-            &dht,
-            local_stream_id,
-            &remote_udx,
-            &nw_result,
+        match finalize_with_timeout(
+            RELAY_HANDSHAKE_TIMEOUT,
+            finalize_relay_connection(
+                runtime_handle,
+                &dht,
+                local_stream_id,
+                &remote_udx,
+                &nw_result,
+            ),
         )
         .await
         {
             Ok(mux) => {
-                run_relay_session(relay, mux, remote_pk, matched_tx).await;
+                run_relay_session(relay, mux, remote_pk, matched_tx, session_id).await;
             }
             Err(e) => {
                 tracing::debug!(err = %e, "relay: connection finalize failed");
+                relay.release_session(session_id);
             }
         }
     });
+}
+
+async fn finalize_with_timeout<T>(
+    timeout: Duration,
+    future: impl Future<Output = Result<T, HyperDhtError>>,
+) -> Result<T, HyperDhtError> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| HyperDhtError::StreamEstablishment("relay handshake timed out".into()))?
 }
 
 /// Finalize the accepted control connection: bind the raw UDX stream the
@@ -386,7 +406,8 @@ async fn finalize_relay_connection(
         noise_result.remote_public_key,
     )
     .await
-    .map_err(HyperDhtError::SecretStream)?;
+    .map_err(HyperDhtError::SecretStream)?
+    .with_max_frame_len(RELAY_CONTROL_MAX_FRAME_LEN);
 
     let (mux, run) = Mux::new(ss);
     tokio::spawn(run);
@@ -398,6 +419,7 @@ async fn run_relay_session(
     mux: Mux,
     remote_public_key: [u8; 32],
     matched_tx: mpsc::UnboundedSender<MatchedPairing>,
+    session_id: u64,
 ) {
     let channel = match mux
         .create_channel(
@@ -410,16 +432,14 @@ async fn run_relay_session(
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(err = %e, "relay: failed to open blind-relay channel");
+            relay.release_session(session_id);
             return;
         }
     };
 
-    let Some(mut session) = BlindRelaySession::new(relay, channel) else {
-        tracing::warn!("relay: rejecting session — at max_sessions capacity");
-        return;
-    };
-
+    let mut session = BlindRelaySession::from_reserved(relay.clone(), channel, session_id);
     if session.wait_opened().await.is_err() {
+        relay.release_session(session_id);
         return;
     }
 
@@ -528,4 +548,38 @@ async fn bridge_one_pairing(
         });
 
     Ok((first_stream, second_stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::{HyperDhtError, finalize_with_timeout};
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn half_open_relay_handshake_is_dropped_on_timeout() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&dropped));
+        let pending = async move {
+            let _guard = guard;
+            std::future::pending::<Result<(), HyperDhtError>>().await
+        };
+
+        assert!(
+            finalize_with_timeout(Duration::from_millis(1), pending)
+                .await
+                .is_err()
+        );
+        assert!(dropped.load(Ordering::Relaxed));
+    }
 }

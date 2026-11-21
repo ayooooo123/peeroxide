@@ -19,7 +19,6 @@ use tokio::sync::mpsc;
 
 const HOLEPUNCH_MSG: &[u8] = &[0];
 const HOLEPUNCH_TTL: u32 = 5;
-const DEFAULT_TTL: u32 = 64;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -32,6 +31,7 @@ pub enum SocketPoolError {
 
 pub type Result<T> = std::result::Result<T, SocketPoolError>;
 
+#[derive(Clone)]
 pub struct SocketPool {
     host: String,
 }
@@ -39,6 +39,11 @@ pub struct SocketPool {
 impl SocketPool {
     pub fn new(host: String) -> Self {
         Self { host }
+    }
+
+    /// The host every acquired socket binds to.
+    pub(crate) fn host(&self) -> &str {
+        &self.host
     }
 
     pub async fn acquire(&self, runtime: &UdxRuntime) -> Result<SocketRef> {
@@ -72,14 +77,13 @@ async fn route_messages(
                 tracing::debug!(addr = %dgram.addr, len = dgram.data.len(), "socket_pool: holepunch probe received");
                 let _ = hp_tx.send(HolepunchEvent { addr: dgram.addr });
             }
-            InboundClass::DhtResponse => {
-                tracing::trace!(addr = %dgram.addr, len = dgram.data.len(), "socket_pool: DHT response forwarded");
+            InboundClass::DhtResponse | InboundClass::DhtRequest => {
+                tracing::trace!(addr = %dgram.addr, len = dgram.data.len(), "socket_pool: DHT message forwarded");
                 let _ = dht_tx.send(dgram);
             }
             InboundClass::UdxFrame | InboundClass::Drop => {
-                // UDX frames are handled by libudx's own demux before fallback
-                // datagrams reach this lane; DHT requests are not expected on
-                // a holepunch socket; both are silently dropped.
+                // UDX frames are handled by libudx's own demux before
+                // fallback datagrams reach this lane.
             }
         }
     }
@@ -122,10 +126,20 @@ impl SocketRef {
         self.dht_reply_rx.take()
     }
 
+    /// Send one holepunch probe. With `low_ttl` the probe leaves with TTL 5
+    /// and the socket's previous TTL is restored right after, as C libudx
+    /// restores `socket->ttl` after a per-send TTL, so later
+    /// packets (a stream landed on this socket) keep the normal TTL.
     pub fn send_holepunch(&self, addr: SocketAddr, low_ttl: bool) -> Result<()> {
-        let ttl = if low_ttl { HOLEPUNCH_TTL } else { DEFAULT_TTL };
+        if !low_ttl {
+            self.socket.send_to(HOLEPUNCH_MSG, addr)?;
+            return Ok(());
+        }
+        let ttl = self.socket.ttl()?;
+        self.socket.set_ttl(HOLEPUNCH_TTL)?;
+        let sent = self.socket.send_to(HOLEPUNCH_MSG, addr);
         self.socket.set_ttl(ttl)?;
-        self.socket.send_to(HOLEPUNCH_MSG, addr)?;
+        sent?;
         Ok(())
     }
 
@@ -144,13 +158,16 @@ pub(crate) enum InboundClass {
     Holepunch,
     UdxFrame,
     DhtResponse,
+    DhtRequest,
     Drop,
 }
 
 /// Classify an inbound datagram on a holepunch socket. UDX frames are
 /// libudx's responsibility (demuxed before they reach this lane) so they
-/// are dropped defensively; `decode_message` parses the rest, forwarding
-/// only well-formed `Message::Response` datagrams.
+/// are dropped defensively; `decode_message` parses the rest. Requests
+/// count too: hyperdht's socket pool hands every non-holepunch message to
+/// the DHT (`socket-pool.js` `_onmessage`), so a round addressed to a
+/// puncher socket is answered.
 pub(crate) fn classify_inbound(buf: &[u8]) -> InboundClass {
     if buf.len() <= 1 {
         return InboundClass::Holepunch;
@@ -160,6 +177,7 @@ pub(crate) fn classify_inbound(buf: &[u8]) -> InboundClass {
     }
     match crate::messages::decode_message(buf) {
         Ok(crate::messages::Message::Response(_)) => InboundClass::DhtResponse,
+        Ok(crate::messages::Message::Request(_)) => InboundClass::DhtRequest,
         _ => InboundClass::Drop,
     }
 }
@@ -213,6 +231,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(datagram.data, b"still live");
+    }
+
+    #[tokio::test]
+    async fn low_ttl_probe_restores_the_socket_ttl() {
+        let runtime = UdxRuntime::new().unwrap();
+        let pool = SocketPool::new("127.0.0.1".into());
+        let holder = pool.acquire(&runtime).await.unwrap();
+        let before = holder.socket.ttl().unwrap();
+        assert_ne!(before, HOLEPUNCH_TTL);
+        holder
+            .send_holepunch("127.0.0.1:9".parse().unwrap(), true)
+            .unwrap();
+        assert_eq!(holder.socket.ttl().unwrap(), before);
     }
 
     #[test]

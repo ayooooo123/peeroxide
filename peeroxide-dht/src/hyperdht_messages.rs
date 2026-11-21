@@ -29,6 +29,9 @@ pub const MUTABLE_GET: u64 = 7;
 pub const IMMUTABLE_PUT: u64 = 8;
 /// Command ID for immutable get requests.
 pub const IMMUTABLE_GET: u64 = 9;
+/// Command ID for plugin requests (hyperdht 6.36.0). No plugin is registered here, so a
+/// request gets no reply, as in hyperdht when the named plugin is missing.
+pub const PLUGIN: u64 = 10;
 
 // ── Handshake routing modes ─────────────────────────────────────────────────
 
@@ -123,6 +126,7 @@ const FLAG_PEER: u64 = 0x1;
 const FLAG_REFRESH: u64 = 0x2;
 const FLAG_SIGNATURE: u64 = 0x4;
 const FLAG_BUMP: u64 = 0x8;
+const FLAG_LOOKUP: u64 = 0x10;
 
 #[derive(Debug, Clone)]
 /// Wire message for announcing a peer on the DHT.
@@ -135,6 +139,9 @@ pub struct AnnounceMessage {
     pub signature: Option<[u8; 64]>,
     /// Bump counter used to force re-announcement.
     pub bump: u64,
+    /// Ask the storing node to return its lookup reply in the ANNOUNCE
+    /// reply (flag bit 16, hyperdht `messages.js` `announce.lookup`).
+    pub lookup: bool,
 }
 
 /// Pre-encodes an [`AnnounceMessage`] to calculate the required buffer size.
@@ -163,7 +170,8 @@ pub fn encode_announce(state: &mut State, m: &AnnounceMessage) -> Result<()> {
         } else {
             0
         })
-        | (if m.bump != 0 { FLAG_BUMP } else { 0 });
+        | (if m.bump != 0 { FLAG_BUMP } else { 0 })
+        | (if m.lookup { FLAG_LOOKUP } else { 0 });
     encode_uint(state, flags);
     if let Some(peer) = &m.peer {
         encode_hyper_peer(state, peer)?;
@@ -208,6 +216,7 @@ pub fn decode_announce(state: &mut State) -> Result<AnnounceMessage> {
         refresh,
         signature,
         bump,
+        lookup: flags & FLAG_LOOKUP != 0,
     })
 }
 
@@ -258,7 +267,8 @@ pub fn encode_lookup_raw_reply(state: &mut State, m: &LookupRawReply) -> Result<
 
 /// Decodes a [`LookupRawReply`] from the compact-encoding buffer.
 pub fn decode_lookup_raw_reply(state: &mut State) -> Result<LookupRawReply> {
-    let count = decode_uint(state)? as usize;
+    // A peer is at least 33 bytes (key + empty relay array).
+    let count = decode_array_len(state, 33)?;
     let mut peers = Vec::with_capacity(count);
     for _ in 0..count {
         peers.push(decode_hyper_peer(state)?);
@@ -448,6 +458,21 @@ pub fn decode_mutable_signable_from_bytes(buf: &[u8]) -> Result<MutableSignable>
     decode_mutable_signable(&mut state)
 }
 
+// ── array length guard ──────────────────────────────────────────────────────
+
+/// Decode an array length and reject a count above compact-encoding's
+/// 1 Mi cap or above what the bytes left can hold at `min_item` bytes per
+/// element, so a hostile count never sizes an allocation or a loop.
+fn decode_array_len(state: &mut State, min_item: usize) -> Result<usize> {
+    let len = decode_uint(state)?;
+    if len > 1_048_576 || len > (state.remaining() / min_item) as u64 {
+        return Err(EncodingError::ArrayTooLarge(
+            usize::try_from(len).unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(len as usize)
+}
+
 // ── ipv4 peer array helpers ─────────────────────────────────────────────────
 
 fn preencode_ipv4_peer_array(state: &mut State, peers: &[Ipv4Peer]) {
@@ -464,10 +489,7 @@ fn encode_ipv4_peer_array(state: &mut State, peers: &[Ipv4Peer]) -> Result<()> {
 }
 
 fn decode_ipv4_peer_array(state: &mut State) -> Result<Vec<Ipv4Peer>> {
-    let len = decode_uint(state)? as usize;
-    if len > 1_048_576 {
-        return Err(EncodingError::ArrayTooLarge(len));
-    }
+    let len = decode_array_len(state, 6)?;
     let mut peers = Vec::with_capacity(len);
     for _ in 0..len {
         let (host, port) = compact_encoding::decode_ipv4_address(state)?;
@@ -490,10 +512,7 @@ fn encode_ipv6_peer_array(state: &mut State, peers: &[Ipv4Peer]) -> Result<()> {
 }
 
 fn decode_ipv6_peer_array(state: &mut State) -> Result<Vec<Ipv4Peer>> {
-    let len = decode_uint(state)? as usize;
-    if len > 1_048_576 {
-        return Err(EncodingError::ArrayTooLarge(len));
-    }
+    let len = decode_array_len(state, 18)?;
     let mut peers = Vec::with_capacity(len);
     for _ in 0..len {
         let (host, port) = compact_encoding::decode_ipv6_address(state)?;
@@ -712,10 +731,7 @@ fn encode_relay_info_array(state: &mut State, arr: &[RelayInfo]) -> Result<()> {
 }
 
 fn decode_relay_info_array(state: &mut State) -> Result<Vec<RelayInfo>> {
-    let len = decode_uint(state)? as usize;
-    if len > 1_048_576 {
-        return Err(EncodingError::ArrayTooLarge(len));
-    }
+    let len = decode_array_len(state, 12)?;
     let mut arr = Vec::with_capacity(len);
     for _ in 0..len {
         arr.push(decode_relay_info(state)?);
@@ -892,7 +908,9 @@ const NP_FLAG_RELAY_ADDRESSES: u64 = 64;
 
 /// Pre-encodes a [`NoisePayload`] to calculate the required buffer size.
 pub fn preencode_noise_payload(state: &mut State, m: &NoisePayload) {
-    state.end += 4; // version + flags + error + firewall (each 1 byte for small values)
+    state.end += 2; // version + flags (both below 128)
+    preencode_uint(state, m.error);
+    preencode_uint(state, m.firewall);
     if let Some(hp) = &m.holepunch {
         preencode_holepunch_info(state, hp);
     }
@@ -1090,7 +1108,10 @@ const HP_FLAG_REMOTE_TOKEN: u64 = 32;
 
 /// Pre-encodes a [`HolepunchPayload`] to calculate the required buffer size.
 pub fn preencode_holepunch_payload(state: &mut State, m: &HolepunchPayload) {
-    state.end += 4; // flags + error + firewall + round
+    state.end += 1; // flags (below 64)
+    preencode_uint(state, m.error);
+    preencode_uint(state, m.firewall);
+    preencode_uint(state, m.round);
     if let Some(addrs) = &m.addresses {
         preencode_ipv4_peer_array(state, addrs);
     }
@@ -1255,6 +1276,7 @@ mod tests {
             refresh: None,
             signature: None,
             bump: 0,
+            lookup: false,
         };
         let bytes = encode_announce_to_bytes(&m).unwrap();
         assert_eq!(bytes, vec![0x00]); // flags = 0
@@ -1272,6 +1294,7 @@ mod tests {
             refresh: None,
             signature: None,
             bump: 0,
+            lookup: false,
         };
         let bytes = encode_announce_to_bytes(&m).unwrap();
         assert_eq!(bytes[0], 0x01); // flag peer
@@ -1290,14 +1313,16 @@ mod tests {
             refresh: Some([0xbb; 32]),
             signature: Some([0xcc; 64]),
             bump: 42,
+            lookup: true,
         };
         let bytes = encode_announce_to_bytes(&m).unwrap();
-        assert_eq!(bytes[0], 0x0f); // all 4 flags
+        assert_eq!(bytes[0], 0x1f); // all 5 flags
         let decoded = decode_announce_from_bytes(&bytes).unwrap();
         assert_eq!(decoded.peer.unwrap().public_key, [0xaa; 32]);
         assert_eq!(decoded.refresh, Some([0xbb; 32]));
         assert_eq!(decoded.signature, Some([0xcc; 64]));
         assert_eq!(decoded.bump, 42);
+        assert!(decoded.lookup);
     }
 
     #[test]
@@ -1307,6 +1332,7 @@ mod tests {
             refresh: None,
             signature: None,
             bump: 100,
+            lookup: false,
         };
         let bytes = encode_announce_to_bytes(&m).unwrap();
         assert_eq!(bytes[0], 0x08); // FLAG_BUMP
@@ -1339,6 +1365,34 @@ mod tests {
         assert_eq!(decoded.peers[0].public_key, [0xaa; 32]);
         assert_eq!(decoded.peers[1].public_key, [0xbb; 32]);
         assert_eq!(decoded.bump, 7);
+    }
+
+    #[test]
+    fn lookup_raw_reply_with_huge_count_is_a_decode_error() {
+        // count = u64::MAX as a compact uint: 0xff marker + 8 bytes.
+        let bytes = [0xff; 9];
+        assert!(decode_lookup_raw_reply_from_bytes(&bytes).is_err());
+        // count = 2^32 (below 2^53, so any uint decoder accepts it) is
+        // rejected before it sizes an allocation.
+        let bytes = [0xff, 0, 0, 0, 0, 0x01, 0, 0, 0];
+        assert!(decode_lookup_raw_reply_from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn abort_payload_with_large_round_encodes() {
+        let m = HolepunchPayload {
+            error: ERROR_ABORTED,
+            firewall: FIREWALL_UNKNOWN,
+            round: 300,
+            connected: false,
+            punching: false,
+            addresses: None,
+            remote_address: None,
+            token: None,
+            remote_token: None,
+        };
+        let bytes = encode_holepunch_payload_to_bytes(&m).unwrap();
+        assert_eq!(decode_holepunch_payload_from_bytes(&bytes).unwrap(), m);
     }
 
     #[test]

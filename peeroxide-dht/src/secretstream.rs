@@ -17,7 +17,10 @@ use chacha20::hchacha;
 use poly1305::Poly1305;
 use poly1305::universal_hash::{KeyInit, UniversalHash};
 use rand::{TryRngCore, rngs::OsRng};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
 use tracing::debug;
 
 pub const KEYBYTES: usize = 32;
@@ -194,7 +197,7 @@ fn secretstream_decrypt(
 
     // Verify MAC
     let computed_mac = compute_mac(&poly_key, aad, &tag_block, encrypted_msg);
-    if computed_mac != received_mac {
+    if computed_mac.ct_eq(received_mac).unwrap_u8() == 0 {
         return Err(SecretstreamError::DecryptionFailed);
     }
 
@@ -223,6 +226,7 @@ fn should_rekey(tag: u8, nonce: &[u8; 12]) -> bool {
     rekey_bit || counter_zero
 }
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Push {
     key: [u8; KEYBYTES],
     nonce: [u8; 12],
@@ -277,6 +281,7 @@ impl Push {
     }
 }
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Pull {
     key: [u8; KEYBYTES],
     nonce: [u8; 12],

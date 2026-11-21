@@ -59,19 +59,39 @@ pub fn alloc_stream_id() -> u32 {
     next_stream_id()
 }
 
-/// Matches Node.js `isBogon` from the `bogon` package — returns true for
-/// loopback, link-local, private RFC-1918, and other reserved ranges.
-fn is_addr_private(host: &str) -> bool {
+/// bogon `isPrivate`: loopback, RFC 1918, link-local and carrier-grade NAT.
+/// An unparsable host is not private, so it is never dialled as a neighbour.
+fn is_private(host: &str) -> bool {
     let Ok(ip) = host.parse::<std::net::Ipv4Addr>() else {
-        return true;
+        return false;
     };
+    let [a, b, ..] = ip.octets();
     ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_unspecified()
-        || ip.is_documentation()
-        || ip.octets()[0] == 100 && ip.octets()[1] >= 64 && ip.octets()[1] <= 127 // CGN
+        || (a == 100 && (64..=127).contains(&b))
+}
+
+/// bogon `isReserved`: "this" network, IETF and test nets, benchmarking,
+/// multicast and the reserved/broadcast range.
+fn is_reserved(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    a == 0
+        || (a == 192 && b == 0 && (c == 0 || c == 2))
+        || (a == 198 && (18..=19).contains(&b))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224
+}
+
+/// bogon `isBogon` (`isPrivate || isReserved`), used where hyperdht picks
+/// the first public address (`connect.js` `getFirstRemoteAddress`). An
+/// unparsable host counts as a bogon.
+fn is_bogon(host: &str) -> bool {
+    let Ok(ip) = host.parse::<std::net::Ipv4Addr>() else {
+        return true;
+    };
+    is_private(host) || is_reserved(ip)
 }
 
 /// Determines whether a direct connection should be attempted instead of holepunching.
@@ -90,6 +110,42 @@ pub fn should_direct_connect(
     same_host: bool,
 ) -> bool {
     !relayed || firewall == FIREWALL_OPEN || !remote_holepunchable || same_host
+}
+
+/// The address a direct connect dials. Node `connect.js:543-545`: a
+/// handshake that reached the server directly dials the exact address it
+/// was sent to (`node`). Otherwise (`holepunch()`): the server's first
+/// public address (`getFirstRemoteAddress`), else the server address.
+fn direct_dial_address(
+    relayed: bool,
+    advertised: &[Ipv4Peer],
+    node: &Ipv4Peer,
+    server_address: &Ipv4Peer,
+) -> Ipv4Peer {
+    if !relayed {
+        return node.clone();
+    }
+    advertised
+        .iter()
+        .find(|a| !is_bogon(&a.host))
+        .cloned()
+        .unwrap_or_else(|| server_address.clone())
+}
+
+/// The server address the LAN ping tries (`connect.js:252-256`): among
+/// the non-reserved addresses it advertised, the one sharing the most
+/// leading octets with one of `mine`, else the first.
+fn lan_dial_address(advertised: &[Ipv4Peer], mine: &[Ipv4Peer]) -> Option<Ipv4Peer> {
+    let candidates: Vec<Ipv4Peer> = advertised
+        .iter()
+        .filter(|a| {
+            a.host
+                .parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| !is_reserved(ip))
+        })
+        .cloned()
+        .collect();
+    crate::holepuncher::match_address(mine, &candidates).or_else(|| candidates.first().cloned())
 }
 
 #[derive(Debug, Error)]
@@ -164,6 +220,30 @@ pub enum HyperDhtError {
     /// The [`HyperDhtServer`] has been closed or its accept task is gone.
     #[error("server closed")]
     ServerClosed,
+    /// No commit request (ANNOUNCE, PUT) succeeded. dht-rpc rejects the
+    /// query with `Too few nodes responded` in this case.
+    #[error("too few nodes responded")]
+    TooFewNodesResponded,
+    /// Our puncher found no punch strategy for this pair of NATs
+    /// (hyperdht `REMOTE_NOT_HOLEPUNCHABLE`).
+    #[error("remote not holepunchable")]
+    RemoteNotHolepunchable,
+    /// Probe rounds ended with our NAT class or the remote's still unknown
+    /// (hyperdht `HOLEPUNCH_PROBE_TIMEOUT`).
+    #[error("holepunch probe timed out")]
+    HolepunchProbeTimeout,
+    /// Both NATs map each destination to a new port, so no punch strategy
+    /// can work (hyperdht `HOLEPUNCH_DOUBLE_RANDOMIZED_NATS`).
+    #[error("holepunch double randomized NATs")]
+    HolepunchDoubleRandomizedNats,
+    /// A holepunch round's reply carried a non-zero error code
+    /// (hyperdht `REMOTE_ABORTED`).
+    #[error("remote aborted with error code {0}")]
+    RemoteAborted(u64),
+    /// The punch round's reply said the remote is not punching
+    /// (hyperdht `REMOTE_NOT_HOLEPUNCHING`).
+    #[error("remote not holepunching")]
+    RemoteNotHolepunching,
 }
 
 // ── Server events (forwarded to listen() subscribers) ────────────────────────
@@ -571,7 +651,12 @@ impl Default for ConnectOpts {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+/// Keep-alive interval for every connection's secret stream, hyperdht's
+/// `connectionKeepAlive` default (5000 ms).
+pub const DEFAULT_CONNECTION_KEEP_ALIVE: std::time::Duration =
+    std::time::Duration::from_millis(5000);
+
+#[derive(Debug, Clone)]
 /// Configuration for a HyperDHT instance.
 #[non_exhaustive]
 pub struct HyperDhtConfig {
@@ -579,6 +664,22 @@ pub struct HyperDhtConfig {
     pub dht: DhtConfig,
     /// Persistent storage settings for stored records.
     pub persistent: PersistentConfig,
+    /// Interval of the empty keep-alive message every connection made by
+    /// `connect` or accepted by a server sends when it wrote nothing for
+    /// that long ([`SecretStream::set_keep_alive`]). `None` turns it off
+    /// (Node `connectionKeepAlive: false`). Default
+    /// [`DEFAULT_CONNECTION_KEEP_ALIVE`].
+    pub connection_keep_alive: Option<std::time::Duration>,
+}
+
+impl Default for HyperDhtConfig {
+    fn default() -> Self {
+        Self {
+            dht: DhtConfig::default(),
+            persistent: PersistentConfig::default(),
+            connection_keep_alive: Some(DEFAULT_CONNECTION_KEEP_ALIVE),
+        }
+    }
 }
 
 impl HyperDhtConfig {
@@ -593,7 +694,7 @@ impl HyperDhtConfig {
                 bootstrap: DEFAULT_BOOTSTRAP.iter().map(|s| (*s).to_string()).collect(),
                 ..DhtConfig::default()
             },
-            persistent: PersistentConfig::default(),
+            ..Self::default()
         }
     }
 }
@@ -752,6 +853,8 @@ pub struct HyperDhtHandle {
     /// Abort handles for every raw stream this DHT created
     /// (Node `HyperDHT#rawStreams`).
     raw_streams: Arc<Mutex<Vec<libudx::UdxStreamAbort>>>,
+    /// [`HyperDhtConfig::connection_keep_alive`].
+    connection_keep_alive: Option<std::time::Duration>,
 }
 
 impl HyperDhtHandle {
@@ -825,89 +928,88 @@ impl HyperDhtHandle {
         key_pair: &KeyPair,
         relay_addresses: &[Ipv4Peer],
     ) -> Result<AnnounceResult, HyperDhtError> {
+        // dht-rpc runs our commit callback instead of re-sending the
+        // LOOKUP, so the query itself does not commit.
         let replies = self
             .dht
             .query(UserQueryParams {
                 target,
                 command: LOOKUP,
                 value: None,
-                commit: true,
+                commit: false,
                 concurrency: None,
             })
             .await?;
 
-        let mut closest_nodes = Vec::new();
-        let mut accepted_relays: Vec<RelayInfo> = Vec::new();
+        let closest_nodes: Vec<Ipv4Peer> = replies.iter().map(|r| r.from.clone()).collect();
+        // Stored record uses caller-provided relays verbatim, matching
+        // Node `_requestAnnounce`: `ann.peer.relayAddresses = relayAddresses || []`.
+        // Closest-ack accumulation lives only in handle-state
+        // (`current_relay_addresses` below) for *subsequent* announces
+        // to consume — it is NEVER written into a stored peer record.
+        // Do not "fix" this by re-adding per-record accumulation; the
+        // TOPIC-close nodes don't hold FE for `hash(pk)`, so advertising
+        // them as PEER_HANDSHAKE relays yields "empty reply".
+        let peer = HyperPeer {
+            public_key: key_pair.public_key,
+            relay_addresses: relay_addresses.iter().take(3).cloned().collect(),
+        };
+        let peer_encoded = encode_hyper_peer_to_bytes(&peer)?;
 
+        let mut commits = Vec::new();
+        let mut committed: Vec<&QueryReply> = Vec::new();
         for reply in &replies {
-            closest_nodes.push(reply.from.clone());
-
-            let token = match &reply.token {
-                Some(t) => *t,
-                None => continue,
+            let (Some(token), Some(node_id)) = (reply.token, reply.from_id) else {
+                continue;
             };
-            let node_id = match &reply.from_id {
-                Some(id) => *id,
-                None => continue,
-            };
-
-            // Stored record uses caller-provided relays verbatim, matching
-            // Node `_requestAnnounce`: `ann.peer.relayAddresses = relayAddresses || []`.
-            // Closest-ack accumulation lives only in handle-state
-            // (`current_relay_addresses` below) for *subsequent* announces
-            // to consume — it is NEVER written into a stored peer record.
-            // Do not "fix" this by re-adding per-record accumulation; the
-            // TOPIC-close nodes don't hold FE for `hash(pk)`, so advertising
-            // them as PEER_HANDSHAKE relays yields "empty reply".
-            let record_relays: Vec<Ipv4Peer> = relay_addresses.iter().take(3).cloned().collect();
-
-            let peer = HyperPeer {
-                public_key: key_pair.public_key,
-                relay_addresses: record_relays,
-            };
-
-            let peer_encoded = encode_hyper_peer_to_bytes(&peer)?;
             let signable =
                 ann_signable(&target, &token, &node_id, &peer_encoded, &[], &NS_ANNOUNCE);
             let signature = sign_detached(&signable, &key_pair.secret_key);
 
             let ann = AnnounceMessage {
-                peer: Some(peer),
+                peer: Some(peer.clone()),
                 refresh: None,
                 signature: Some(signature),
                 bump: 0,
+                // hyperdht `announce`: ask again for peers when the lookup
+                // reply had none, in case some arrived in between.
+                lookup: reply.value.is_none(),
             };
-            let ann_bytes = encode_announce_to_bytes(&ann)?;
-
-            let _ = self
-                .dht
-                .request(
-                    UserRequestParams {
-                        token: Some(token),
-                        command: ANNOUNCE,
-                        target: Some(target),
-                        value: Some(ann_bytes),
-                        timeout_ms: None,
-                        retries: None,
-                    },
-                    &reply.from.host,
-                    reply.from.port,
-                )
-                .await;
-
-            // Accumulate this acker into handle-state relay list (Node
-            // `Announcer._commit`: `if (relayAddresses.length < 3)
-            // relayAddresses.push({ host: msg.from.host, port: msg.from.port })`
-            // and `relays.push({ relayAddress: msg.from, peerAddress: msg.to })`).
-            // We push only once per accepted reply and cap at 3. Dedup is
-            // implicit — each `reply.from` is a distinct DHT node.
-            if accepted_relays.len() < 3 {
-                accepted_relays.push(RelayInfo {
-                    relay_address: reply.from.clone(),
-                    peer_address: reply.to.clone(),
-                });
-            }
+            commits.push((
+                reply.from.clone(),
+                UserRequestParams {
+                    token: Some(token),
+                    command: ANNOUNCE,
+                    target: Some(target),
+                    value: Some(encode_announce_to_bytes(&ann)?),
+                    timeout_ms: None,
+                    retries: None,
+                },
+            ));
+            committed.push(reply);
         }
+
+        let results = commit_concurrently(&self.dht, commits).await;
+        if !results
+            .iter()
+            .any(|r| matches!(r, Ok(res) if res.error == 0))
+        {
+            return Err(HyperDhtError::TooFewNodesResponded);
+        }
+
+        // Node `Announcer._commit` adds a node to the relays only after its
+        // ANNOUNCE resolved: `relays.push({ relayAddress: msg.from,
+        // peerAddress: msg.to })`, capped at 3.
+        let accepted_relays: Vec<RelayInfo> = committed
+            .iter()
+            .zip(&results)
+            .filter(|(_, r)| matches!(r, Ok(res) if res.error == 0))
+            .take(3)
+            .map(|(reply, _)| RelayInfo {
+                relay_address: reply.from.clone(),
+                peer_address: reply.to.clone(),
+            })
+            .collect();
 
         // Only update handle-state `current_relay_addresses` when announcing
         // on `hash(public_key)` (self-announce). Topic-announces also produce
@@ -1020,6 +1122,7 @@ impl HyperDhtHandle {
                 refresh: None,
                 signature: Some(signature),
                 bump: 0,
+                lookup: false,
             };
             let ann_bytes = encode_announce_to_bytes(&ann)?;
 
@@ -1055,24 +1158,18 @@ impl HyperDhtHandle {
                 target,
                 command: IMMUTABLE_GET,
                 value: None,
-                commit: true,
+                commit: false,
                 concurrency: None,
             })
             .await?;
 
-        let mut closest_nodes = Vec::new();
-
-        for reply in &replies {
-            closest_nodes.push(reply.from.clone());
-
-            let token = match &reply.token {
-                Some(t) => *t,
-                None => continue,
-            };
-
-            let _ = self
-                .dht
-                .request(
+        let closest_nodes: Vec<Ipv4Peer> = replies.iter().map(|r| r.from.clone()).collect();
+        let commits = replies
+            .iter()
+            .filter_map(|reply| {
+                let token = reply.token?;
+                Some((
+                    reply.from.clone(),
                     UserRequestParams {
                         token: Some(token),
                         command: IMMUTABLE_PUT,
@@ -1081,10 +1178,15 @@ impl HyperDhtHandle {
                         timeout_ms: None,
                         retries: None,
                     },
-                    &reply.from.host,
-                    reply.from.port,
-                )
-                .await;
+                ))
+            })
+            .collect();
+        let results = commit_concurrently(&self.dht, commits).await;
+        if !results
+            .iter()
+            .any(|r| matches!(r, Ok(res) if res.error == 0))
+        {
+            return Err(HyperDhtError::TooFewNodesResponded);
         }
 
         Ok(ImmutablePutResult {
@@ -1165,25 +1267,18 @@ impl HyperDhtHandle {
                 target,
                 command: MUTABLE_GET,
                 value: Some(seq_bytes),
-                commit: true,
+                commit: false,
                 concurrency: None,
             })
             .await?;
 
-        let mut closest_nodes = Vec::new();
-        let mut commit_timeouts: u32 = 0;
-
-        for reply in &replies {
-            closest_nodes.push(reply.from.clone());
-
-            let token = match &reply.token {
-                Some(t) => *t,
-                None => continue,
-            };
-
-            if let Err(DhtError::RequestFailed(_)) = self
-                .dht
-                .request(
+        let closest_nodes: Vec<Ipv4Peer> = replies.iter().map(|r| r.from.clone()).collect();
+        let commits = replies
+            .iter()
+            .filter_map(|reply| {
+                let token = reply.token?;
+                Some((
+                    reply.from.clone(),
                     UserRequestParams {
                         token: Some(token),
                         command: MUTABLE_PUT,
@@ -1192,14 +1287,20 @@ impl HyperDhtHandle {
                         timeout_ms: None,
                         retries: None,
                     },
-                    &reply.from.host,
-                    reply.from.port,
-                )
-                .await
-            {
-                commit_timeouts += 1;
-            }
+                ))
+            })
+            .collect();
+        let results = commit_concurrently(&self.dht, commits).await;
+        if !results
+            .iter()
+            .any(|r| matches!(r, Ok(res) if res.error == 0))
+        {
+            return Err(HyperDhtError::TooFewNodesResponded);
         }
+        let commit_timeouts = results
+            .iter()
+            .filter(|r| matches!(r, Err(DhtError::RequestFailed(_))))
+            .count() as u32;
 
         Ok(MutablePutResult {
             public_key: *public_key,
@@ -1399,8 +1500,9 @@ impl HyperDhtHandle {
     /// [`Self::remote_address`] (if any) is prepended, then the local
     /// IPv4 interface addresses from
     /// [`Holepuncher::local_addresses`](crate::holepuncher::Holepuncher::local_addresses)
-    /// are appended. Order matters: the receiver iterates this list
-    /// sequentially and LAN-special-cases on its side.
+    /// are appended once [`Self::validate_local_addresses`] passes them.
+    /// Order matters: the receiver iterates this list sequentially and
+    /// LAN-special-cases on its side.
     pub async fn noise_addresses4(&self, port: u16) -> Vec<crate::messages::Ipv4Peer> {
         let mut out = Vec::new();
         if let Ok(Some(remote)) = self.remote_address().await {
@@ -1410,16 +1512,22 @@ impl HyperDhtHandle {
             Ok(Some(socket)) => socket.local_addr().await.ok(),
             _ => None,
         };
-        match bound.map(|addr| addr.ip()) {
-            Some(std::net::IpAddr::V4(ip)) if !ip.is_unspecified() => {
-                out.push(Ipv4Peer {
-                    host: ip.to_string(),
-                    port,
-                });
-            }
-            _ => out.extend(crate::holepuncher::Holepuncher::local_addresses(port)),
-        }
+        let local = match bound.map(|addr| addr.ip()) {
+            Some(std::net::IpAddr::V4(ip)) if !ip.is_unspecified() => vec![Ipv4Peer {
+                host: ip.to_string(),
+                port,
+            }],
+            _ => crate::holepuncher::Holepuncher::local_addresses(port),
+        };
+        out.extend(self.validate_local_addresses(local).await);
         out
+    }
+
+    /// hyperdht `validateLocalAddresses`: the addresses whose host a fresh
+    /// socket can bind and hear its own packet on within 500 ms. Each
+    /// host's verdict is cached for the life of the node.
+    pub async fn validate_local_addresses(&self, addresses: Vec<Ipv4Peer>) -> Vec<Ipv4Peer> {
+        self.dht.validate_local_addresses(addresses).await
     }
 
     /// Returns the current firewall classification (one of the
@@ -1579,179 +1687,70 @@ impl HyperDhtHandle {
         runtime: &UdxRuntime,
         opts: ConnectOpts,
     ) -> Result<PeerConnection, HyperDhtError> {
+        let hs = self
+            .start_handshake(key_pair, &remote_public_key, runtime, &opts)
+            .await?;
         let mut last_err = HyperDhtError::NoRelayNodes;
-        let mut tried: Vec<(String, u16)> = Vec::new();
+        let mut tried: Vec<Ipv4Peer> = Vec::new();
 
-        // Phase 1: Optimistic pre-connect through provided relay addresses.
-        for relay in relay_addresses {
-            tried.push((relay.host.clone(), relay.port));
-            match self
-                .connect_through_node(key_pair, &remote_public_key, relay, runtime, &opts)
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    tracing::debug!(relay = %format!("{}:{}", relay.host, relay.port), err = %e, "pre-connect relay attempt failed");
-                    last_err = e;
-                }
-            }
+        // Node `findAndConnect`: every candidate gets the same handshake,
+        // up to 3 at once while relay hints are tried and 2 afterwards; the
+        // first valid reply wins and only that one is punched.
+        if let Some(won) = self
+            .race_handshakes(&hs, relay_addresses.to_vec(), 3, &mut tried, &mut last_err)
+            .await
+        {
+            return self.finish_connect(key_pair, hs, won, runtime, &opts).await;
         }
 
-        let target = hash(&remote_public_key);
-
-        // Phase 2: FIND_PEER on hash(pk). Responders are FE-holders (they
-        // returned a stored peer record under this target). Their `reply.from`
-        // address is a verified PEER_HANDSHAKE forwarder. This mirrors Node's
-        // `findAndConnect` which does `dht.findPeer(c.target)` and tries each
-        // `data.from`.
-        let peer_replies = self.query_find_peer(target).await.unwrap_or_else(|e| {
-            tracing::debug!(err = %e, "connect_with_nodes: FIND_PEER query failed");
+        // FIND_PEER responders hold the forward entry; the relays named in
+        // their records come next.
+        let peer_replies = self.query_find_peer(hs.target).await.unwrap_or_else(|e| {
+            tracing::debug!(err = %e, "connect: FIND_PEER query failed");
             Vec::new()
         });
-        tracing::debug!(
-            reply_count = peer_replies.len(),
-            "connect_with_nodes: FIND_PEER completed"
-        );
-
+        let mut candidates: Vec<Ipv4Peer> = peer_replies
+            .iter()
+            .filter(|r| r.value.is_some())
+            .map(|r| r.from.clone())
+            .collect();
         for reply in &peer_replies {
-            if reply.value.is_none() {
-                continue;
-            }
-            if tried
-                .iter()
-                .any(|(h, p)| h == &reply.from.host && *p == reply.from.port)
+            if let Some(peer) = reply
+                .value
+                .as_deref()
+                .and_then(|v| decode_hyper_peer_from_bytes(v).ok())
             {
-                continue;
-            }
-            tried.push((reply.from.host.clone(), reply.from.port));
-            tracing::debug!(
-                relay = %format!("{}:{}", reply.from.host, reply.from.port),
-                "connect_with_nodes: trying FE-holder"
-            );
-            match self
-                .connect_through_node(key_pair, &remote_public_key, &reply.from, runtime, &opts)
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    tracing::debug!(
-                        relay = %format!("{}:{}", reply.from.host, reply.from.port),
-                        err = %e,
-                        "FE-holder relay attempt failed"
-                    );
-                    last_err = e;
-                }
+                candidates.extend(peer.relay_addresses);
             }
         }
-
-        for reply in &peer_replies {
-            if let Some(value) = &reply.value {
-                if let Ok(peer) = decode_hyper_peer_from_bytes(value) {
-                    for relay in &peer.relay_addresses {
-                        if tried
-                            .iter()
-                            .any(|(h, p)| h == &relay.host && *p == relay.port)
-                        {
-                            continue;
-                        }
-                        tried.push((relay.host.clone(), relay.port));
-                        match self
-                            .connect_through_node(
-                                key_pair,
-                                &remote_public_key,
-                                relay,
-                                runtime,
-                                &opts,
-                            )
-                            .await
-                        {
-                            Ok(result) => return Ok(result),
-                            Err(e) => {
-                                tracing::debug!(
-                                    relay = %format!("{}:{}", relay.host, relay.port),
-                                    err = %e,
-                                    "peer-record relay attempt failed"
-                                );
-                                last_err = e;
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(won) = self
+            .race_handshakes(&hs, candidates, 2, &mut tried, &mut last_err)
+            .await
+        {
+            return self.finish_connect(key_pair, hs, won, runtime, &opts).await;
         }
 
-        // Phase 3: Fallback to FIND_NODE walk for closer nodes the DHT routing
-        // table reaches but that didn't return an FE record (e.g. mid-refresh).
-        let table_size = self.dht.table_size().await.unwrap_or(0);
-        tracing::debug!(
-            table_size,
-            "connect_with_nodes: routing table size before FIND_NODE"
-        );
+        // Rust fallback: nodes close to the target that did not return a
+        // record (e.g. mid-refresh).
         let node_replies = self
             .dht
-            .find_node(target)
+            .find_node(hs.target)
             .await
             .map_err(HyperDhtError::Dht)?;
-        tracing::debug!(
-            reply_count = node_replies.len(),
-            "connect_with_nodes: FIND_NODE completed"
-        );
-
         if relay_addresses.is_empty() && peer_replies.is_empty() && node_replies.is_empty() {
             return Err(HyperDhtError::PeerNotFound);
         }
-
         let mut candidates: Vec<Ipv4Peer> = Vec::new();
         for reply in &node_replies {
             candidates.push(reply.from.clone());
-            for cn in &reply.closer_nodes {
-                if !candidates
-                    .iter()
-                    .any(|c| c.host == cn.host && c.port == cn.port)
-                {
-                    candidates.push(cn.clone());
-                }
-            }
+            candidates.extend(reply.closer_nodes.iter().cloned());
         }
-        tracing::debug!(
-            candidate_count = candidates.len(),
-            "connect_with_nodes: total FIND_NODE candidates (replies + closer_nodes)"
-        );
-
-        for (i, candidate) in candidates.iter().enumerate() {
-            let skip = tried
-                .iter()
-                .any(|(h, p)| h == &candidate.host && *p == candidate.port);
-            tracing::debug!(
-                i,
-                candidate = %format!("{}:{}", candidate.host, candidate.port),
-                skip,
-                "connect_with_nodes: candidate check"
-            );
-            if skip {
-                continue;
-            }
-            tried.push((candidate.host.clone(), candidate.port));
-            tracing::debug!(
-                candidate = %format!("{}:{}", candidate.host, candidate.port),
-                "connect_with_nodes: trying node candidate"
-            );
-            match self
-                .connect_through_node(key_pair, &remote_public_key, candidate, runtime, &opts)
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    tracing::debug!(
-                        relay = %format!("{}:{}", candidate.host, candidate.port),
-                        err = %e,
-                        "find_node candidate attempt failed"
-                    );
-                    last_err = e;
-                }
-            }
+        if let Some(won) = self
+            .race_handshakes(&hs, candidates, 2, &mut tried, &mut last_err)
+            .await
+        {
+            return self.finish_connect(key_pair, hs, won, runtime, &opts).await;
         }
-
         Err(last_err)
     }
 
@@ -1772,27 +1771,28 @@ impl HyperDhtHandle {
             host: target_addr.ip().to_string(),
             port: target_addr.port(),
         };
-        self.connect_through_node(
-            key_pair,
-            &remote_public_key,
-            &relay,
-            runtime,
-            &ConnectOpts::default(),
-        )
-        .await
+        let opts = ConnectOpts::default();
+        let hs = self
+            .start_handshake(key_pair, &remote_public_key, runtime, &opts)
+            .await?;
+        let mut last_err = HyperDhtError::NoRelayNodes;
+        let won = self
+            .race_handshakes(&hs, vec![relay], 1, &mut Vec::new(), &mut last_err)
+            .await
+            .ok_or(last_err)?;
+        self.finish_connect(key_pair, hs, won, runtime, &opts).await
     }
 
-    async fn connect_through_node(
+    /// Build the one Noise handshake every candidate node receives
+    /// (Node `connectThroughNode` sends the same `c.request` to each).
+    async fn start_handshake(
         &self,
         key_pair: &KeyPair,
         remote_public_key: &[u8; 32],
-        relay: &Ipv4Peer,
         runtime: &UdxRuntime,
         opts: &ConnectOpts,
-    ) -> Result<PeerConnection, HyperDhtError> {
+    ) -> Result<ClientHandshake, HyperDhtError> {
         let target = hash(remote_public_key);
-
-        // Phase 1: Noise IK handshake via PEER_HANDSHAKE relay
         let mut nw = NoiseWrap::new_initiator(key_pair.to_noise_keypair(), *remote_public_key);
 
         let (local_stream_id, local_stream) = runtime.create_random_stream().await?;
@@ -1802,25 +1802,49 @@ impl HyperDhtHandle {
         // interface addresses. Mirrors Node `lib/connect.js:420-437`. The
         // receiver sequentially probes this list and applies its own
         // LAN-special-case filtering — see `hyperdht/lib/server.js:426`.
-        let client_addresses4 = match self.dht.local_port().await {
-            Ok(p) => self.noise_addresses4(p).await,
-            Err(_) => vec![],
-        };
+        // Node `connectThroughNode`: our address only when the DHT says it
+        // is reachable (`dht.remoteAddress()` is null while firewalled), and
+        // local interfaces only with `localConnection`. A firewalled client
+        // that advertised its reflexive 127.0.0.1/LAN address made a
+        // hyperdht 6.30 server pick its LAN shortcut, which stages no puncher
+        // and answers no holepunch round.
+        let reachable = self.dht.reachable().await.unwrap_or(false);
+        let remote = self.remote_address().await.ok().flatten();
+        let mut client_addresses4 = Vec::new();
+        if opts.local_connection {
+            if let Ok(port) = self.dht.local_port().await {
+                client_addresses4 = self.noise_addresses4(port).await;
+            }
+            if !reachable {
+                client_addresses4.retain(|a| Some(a) != remote.as_ref());
+            }
+        } else if reachable {
+            client_addresses4.extend(remote.clone());
+        }
 
         // Node `connect.js:455`: a client-chosen relay rides in the handshake
         // with a fresh pairing token.
         let relay_token: Option<[u8; 32]> = opts.relay_through.map(|_| random());
+        // `connect.js:441`: OPEN when `dht.remoteAddress()` is known, which
+        // it is only for a reachable node.
+        let open = reachable && remote.is_some();
 
         let local_payload = NoisePayload {
             version: 1,
             error: 0,
-            firewall: FIREWALL_UNKNOWN,
+            firewall: if open {
+                FIREWALL_OPEN
+            } else {
+                FIREWALL_UNKNOWN
+            },
             holepunch: None,
             addresses4: client_addresses4,
             addresses6: vec![],
             udx: Some(UdxInfo {
                 version: 1,
-                reusable_socket: true,
+                // No socket route table exists yet, so a cached route to
+                // this socket would be dead (hyperdht `socket-pool.js`).
+                reusable_socket: false,
                 id: u64::from(local_stream_id),
                 seq: 0,
             }),
@@ -1837,44 +1861,130 @@ impl HyperDhtHandle {
         };
 
         let noise_bytes = nw.send(&local_payload)?;
-        let handshake_value = Router::encode_client_handshake(noise_bytes, None, None)?;
+        let value = Router::encode_client_handshake(noise_bytes, None, None)?;
+        Ok(ClientHandshake {
+            nw,
+            value,
+            target,
+            local_stream_id,
+            local_stream,
+            relay_token,
+            open,
+        })
+    }
 
-        let resp = self
-            .dht
-            .request(
-                UserRequestParams {
+    /// Send the handshake to `candidates`, `concurrency` at a time (Node's
+    /// `Semaphore`), and return the first node whose reply passes the
+    /// router check. Every other attempt is cancelled.
+    async fn race_handshakes(
+        &self,
+        hs: &ClientHandshake,
+        candidates: Vec<Ipv4Peer>,
+        concurrency: usize,
+        tried: &mut Vec<Ipv4Peer>,
+        last_err: &mut HyperDhtError,
+    ) -> Option<HandshakeWin> {
+        let mut pending = candidates.into_iter();
+        let mut running = tokio::task::JoinSet::new();
+        loop {
+            while running.len() < concurrency {
+                let Some(node) = pending.next() else { break };
+                if tried.contains(&node) {
+                    continue;
+                }
+                tried.push(node.clone());
+                let dht = self.dht.clone();
+                let params = UserRequestParams {
                     token: None,
                     command: PEER_HANDSHAKE,
-                    target: Some(target),
-                    value: Some(handshake_value),
+                    target: Some(hs.target),
+                    value: Some(hs.value.clone()),
                     timeout_ms: Some(10000),
                     retries: Some(0),
-                },
-                &relay.host,
-                relay.port,
-            )
-            .await?;
-
-        if resp.error != 0 {
-            return Err(HyperDhtError::HandshakeFailed(format!(
-                "error code {}",
-                resp.error
-            )));
+                };
+                running.spawn(async move {
+                    let resp = dht.request(params, &node.host, node.port).await;
+                    (node, resp)
+                });
+            }
+            let (node, resp) = match running.join_next().await? {
+                Ok(done) => done,
+                Err(_) => continue,
+            };
+            let checked = resp.map_err(HyperDhtError::from).and_then(|resp| {
+                if resp.error != 0 {
+                    return Err(HyperDhtError::HandshakeFailed(format!(
+                        "error code {}",
+                        resp.error
+                    )));
+                }
+                let value = resp
+                    .value
+                    .ok_or_else(|| HyperDhtError::HandshakeFailed("empty reply".into()))?;
+                let router = self
+                    .router
+                    .lock()
+                    .map_err(|_| HyperDhtError::ChannelClosed)?;
+                let hs_result =
+                    router.validate_handshake_reply(&value, &node, &resp.from, &resp.to)?;
+                drop(router);
+                // Each reply opens its own copy of the initiator state, so a
+                // reply that fails Noise only fails its own attempt (npm
+                // shares one state, so a bogus reply spoils the rest).
+                let mut nw = hs.nw.clone();
+                let payload = nw.recv(&hs_result.noise)?;
+                Ok(HandshakeWin {
+                    node: node.clone(),
+                    hs_result,
+                    nw,
+                    payload,
+                })
+            });
+            match checked {
+                Ok(win) => {
+                    running.abort_all();
+                    return Some(win);
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        node = %format!("{}:{}", node.host, node.port),
+                        err = %err,
+                        "handshake candidate failed"
+                    );
+                    *last_err = err;
+                }
+            }
         }
+    }
 
-        let reply_value = resp
-            .value
-            .ok_or_else(|| HyperDhtError::HandshakeFailed("empty reply".into()))?;
+    /// The rest of Node's `connectThroughNode` + `holepunch` once one
+    /// candidate answered: open the Noise reply and race the direct path
+    /// (and a relay, if any) for the stream.
+    async fn finish_connect(
+        &self,
+        key_pair: &KeyPair,
+        hs: ClientHandshake,
+        won: HandshakeWin,
+        runtime: &UdxRuntime,
+        opts: &ConnectOpts,
+    ) -> Result<PeerConnection, HyperDhtError> {
+        let ClientHandshake {
+            nw: _,
+            target,
+            local_stream_id,
+            local_stream,
+            relay_token,
+            open,
+            ..
+        } = hs;
+        let HandshakeWin {
+            node,
+            hs_result,
+            nw,
+            payload: remote_payload,
+        } = won;
+        let relay = &node;
 
-        let hs_result = {
-            let router = self
-                .router
-                .lock()
-                .map_err(|_| HyperDhtError::ChannelClosed)?;
-            router.validate_handshake_reply(&reply_value, relay, &resp.from, &resp.to)?
-        };
-
-        let remote_payload = nw.recv(&hs_result.noise)?;
         let nw_result = nw.finalize()?;
 
         if remote_payload.error != 0 {
@@ -1900,7 +2010,22 @@ impl HyperDhtHandle {
             (None, Some((public_key, token))) => Some((public_key, token, true)),
             (None, None) => None,
         };
-        let raced = RacedStream::new(local_stream);
+        let raced = RacedStream::with_keep_alive(local_stream, self.connection_keep_alive);
+        // `connect.js:243-245`: an OPEN client of a relayed, punching server
+        // waits for the server to dial it (the server dials every OPEN
+        // client) instead of punching.
+        let server_dial = if open
+            && hs_result.relayed
+            && remote_payload.firewall != FIREWALL_OPEN
+            && remote_payload
+                .holepunch
+                .as_ref()
+                .is_some_and(|hp| !hp.relays.is_empty())
+        {
+            Some(self.arm_server_dial(&raced, remote_id).await?)
+        } else {
+            None
+        };
         let direct = DirectDial {
             dht: self.clone(),
             hs_result,
@@ -1912,6 +2037,7 @@ impl HyperDhtHandle {
             remote_id,
             local_connection: opts.local_connection,
             has_relay: relay_through.is_some(),
+            server_dial,
         };
 
         let Some((relay_pk, token, initiator)) = relay_through else {
@@ -1976,6 +2102,28 @@ impl HyperDhtHandle {
     }
 }
 
+/// The candidate whose reply passed both the router check and Noise, with
+/// the initiator state that opened it.
+struct HandshakeWin {
+    node: Ipv4Peer,
+    hs_result: crate::router::HandshakeResult,
+    nw: NoiseWrap,
+    payload: NoisePayload,
+}
+
+/// The client's one Noise handshake, shared by every candidate node.
+struct ClientHandshake {
+    nw: NoiseWrap,
+    /// Encoded PEER_HANDSHAKE request value.
+    value: Vec<u8>,
+    target: [u8; 32],
+    local_stream_id: u32,
+    local_stream: libudx::UdxStream,
+    relay_token: Option<[u8; 32]>,
+    /// We told the server we are OPEN (`c.firewall`).
+    open: bool,
+}
+
 /// Everything the client's direct path needs after the handshake, owned so
 /// it can run beside the relay (Node `holepunch(c, opts)`).
 struct DirectDial {
@@ -1990,6 +2138,9 @@ struct DirectDial {
     remote_id: u32,
     local_connection: bool,
     has_relay: bool,
+    /// Packets from a server dialling us (we said OPEN), from the hook on
+    /// our DHT sockets; `None` when we punch instead.
+    server_dial: Option<mpsc::UnboundedReceiver<(UdxSocket, SocketAddr)>>,
 }
 
 impl DirectDial {
@@ -2005,30 +2156,22 @@ impl DirectDial {
             remote_id,
             local_connection,
             has_relay,
+            server_dial,
         } = self;
         let this = &dht;
         let relay = &node;
 
-        // Skip holepunching when the remote peer is directly reachable.
-        // Node.js (connect.js) checks:
-        //   payload.firewall === FIREWALL.OPEN  -- server says it's open
-        //   (relayed && !remoteHolepunchable)   -- relayed but server has no HP relays
-        //   same NAT (own remote addr matches server's reflexive)  -- LAN shortcut
-        // In any of those cases, connect directly using the server address from the handshake.
+        // Node `holepunch`: dial at once when the server is open, or when
+        // the handshake was relayed but the server cannot punch.
         let remote_holepunchable = remote_payload
             .holepunch
             .as_ref()
             .is_some_and(|hp| !hp.relays.is_empty());
 
-        // Use this handshake's reflexive address, not a sample from another relay/egress.
-        let same_host =
-            local_connection && hs_result.client_address.host == hs_result.server_address.host;
-
         tracing::debug!(
             relayed = hs_result.relayed,
             firewall = remote_payload.firewall,
             remote_holepunchable,
-            same_host,
             server_address = %format!("{}:{}", hs_result.server_address.host, hs_result.server_address.port),
             "handshake complete, deciding connection path"
         );
@@ -2037,39 +2180,15 @@ impl DirectDial {
             hs_result.relayed,
             remote_payload.firewall,
             remote_holepunchable,
-            same_host,
+            false,
         ) {
-            // Pick the dial target. When same-host is true (both peers
-            // share a NAT), prefer a private/loopback address from the
-            // remote's advertised list, since the public IP often can't be
-            // reached from inside the same NAT (no NAT hairpin). Otherwise
-            // prefer a non-private public address, falling back to the
-            // FE-holder's-tagged server address. Mirrors Node
-            // `lib/connect.js::holepunch` LAN-shortcut.
-            let connect_addr = if same_host {
-                remote_payload
-                    .addresses4
-                    .iter()
-                    .find(|a| is_addr_private(&a.host))
-                    .cloned()
-                    .or_else(|| {
-                        remote_payload
-                            .addresses4
-                            .iter()
-                            .find(|a| !is_addr_private(&a.host))
-                            .cloned()
-                    })
-                    .unwrap_or_else(|| hs_result.server_address.clone())
-            } else {
-                remote_payload
-                    .addresses4
-                    .iter()
-                    .find(|a| !is_addr_private(&a.host))
-                    .cloned()
-                    .unwrap_or_else(|| hs_result.server_address.clone())
-            };
+            let connect_addr = direct_dial_address(
+                hs_result.relayed,
+                &remote_payload.addresses4,
+                relay,
+                &hs_result.server_address,
+            );
             tracing::debug!(
-                same_host,
                 connect_addr = %format!("{}:{}", connect_addr.host, connect_addr.port),
                 server_address = %format!("{}:{}", hs_result.server_address.host, hs_result.server_address.port),
                 advertised = ?remote_payload.addresses4.iter().map(|a| format!("{}:{}", a.host, a.port)).collect::<Vec<_>>(),
@@ -2085,23 +2204,81 @@ impl DirectDial {
             });
         }
 
-        // Phase 2: Holepunch rounds via PEER_HOLEPUNCH relay
+        if let Some(mut seen) = server_dial {
+            /// `connect.js:244`: `passiveConnectTimeout`.
+            const PASSIVE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+            return match tokio::time::timeout(PASSIVE_CONNECT_TIMEOUT, seen.recv()).await {
+                Ok(Some((socket, addr))) => Ok(Landing {
+                    socket,
+                    remote_id,
+                    addr,
+                    relay: None,
+                }),
+                _ => Err(HyperDhtError::HolepunchAborted),
+            };
+        }
+
+        // Node `connect.js:248-276`: behind the same public host, ping the
+        // server's LAN address while the punch runs; whichever answers
+        // first carries the stream. A LAN ping that fails is not fatal.
+        let server_socket = this.server_socket().await?;
+        let lan_addr =
+            if local_connection && hs_result.client_address.host == hs_result.server_address.host {
+                let mine = match &server_socket {
+                    Some(socket) => match socket.local_addr().await {
+                        Ok(addr) if addr.ip() == std::net::Ipv4Addr::LOCALHOST => vec![Ipv4Peer {
+                            host: addr.ip().to_string(),
+                            port: addr.port(),
+                        }],
+                        Ok(addr) => crate::holepuncher::Holepuncher::local_addresses(addr.port()),
+                        Err(_) => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+                lan_dial_address(&remote_payload.addresses4, &mine)
+            } else {
+                None
+            };
+        let lan_ping = async {
+            let addr = lan_addr?;
+            this.dht.ping(&addr.host, addr.port).await.ok()?;
+            Some(addr)
+        };
+        tokio::pin!(lan_ping);
+        let mut lan_pending = true;
+
         let server_address = hs_result.server_address.clone();
-        let hp_result = this
-            .run_holepunch_rounds(
-                &nw_result,
-                &remote_payload,
-                relay,
-                &target,
-                &server_address,
-                runtime,
-                local_stream_id,
-                has_relay,
-            )
-            .await?;
+        let punch = this.run_holepunch_rounds(
+            &nw_result,
+            &remote_payload,
+            relay,
+            &target,
+            &server_address,
+            runtime,
+            local_stream_id,
+            has_relay,
+        );
+        tokio::pin!(punch);
+        let hp_result = loop {
+            tokio::select! {
+                lan = &mut lan_ping, if lan_pending => {
+                    lan_pending = false;
+                    if let Some(addr) = lan {
+                        tracing::debug!(addr = %format!("{}:{}", addr.host, addr.port), "LAN ping won");
+                        return Ok(Landing {
+                            socket: socket_or_new(server_socket, runtime).await?,
+                            remote_id,
+                            addr: to_socket_addr(&addr)?,
+                            relay: None,
+                        });
+                    }
+                }
+                punched = &mut punch => break punched?,
+            }
+        };
         let socket = match hp_result.udx_socket.clone() {
             Some(s) => s,
-            None => socket_or_new(this.server_socket().await?, runtime).await?,
+            None => socket_or_new(server_socket, runtime).await?,
         };
         Ok(Landing {
             socket,
@@ -2113,6 +2290,39 @@ impl DirectDial {
 }
 
 impl HyperDhtHandle {
+    /// Hear a server dialling us on either DHT socket (npm's raw stream
+    /// `firewall` hook sees every socket of its UDX instance).
+    async fn arm_server_dial(
+        &self,
+        raced: &Arc<RacedStream>,
+        remote_id: u32,
+    ) -> Result<mpsc::UnboundedReceiver<(UdxSocket, SocketAddr)>, HyperDhtError> {
+        let socket = self
+            .server_socket()
+            .await?
+            .ok_or_else(|| HyperDhtError::StreamEstablishment("no DHT server socket".into()))?;
+        let listen = self.listen_socket().await.ok().flatten();
+        let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+        let pending = Arc::downgrade(raced);
+        raced.with_stream(|stream| {
+            stream.set_firewall_hook(&socket, remote_id, move |socket, port, ip| {
+                let addr = SocketAddr::new(ip, port);
+                if pending
+                    .upgrade()
+                    .is_some_and(|raced| !raced.is_relay_traffic(addr))
+                {
+                    let _ = seen_tx.send((socket.clone(), addr));
+                }
+                true
+            })?;
+            if let Some(listen) = &listen {
+                stream.listen_on(listen)?;
+            }
+            Ok(())
+        })?;
+        Ok(seen_rx)
+    }
+
     /// Dialling the relay is itself a connect; boxing it here (not inline)
     /// keeps the connect future's type from recursing.
     fn connect_boxed<'a>(
@@ -2202,6 +2412,8 @@ impl HyperDhtHandle {
         })
     }
 
+    /// Node `holepunch(c, opts)` from the puncher on: `probeRound`, then
+    /// `roundPunch`, then wait for the puncher to land a probe.
     #[allow(clippy::too_many_arguments)]
     async fn run_holepunch_rounds(
         &self,
@@ -2209,69 +2421,35 @@ impl HyperDhtHandle {
         remote_payload: &NoisePayload,
         relay: &Ipv4Peer,
         target: &[u8; 32],
-        _server_address: &Ipv4Peer,
+        server_address: &Ipv4Peer,
         runtime: &UdxRuntime,
         local_stream_id: u32,
         has_relay: bool,
     ) -> Result<ConnectResult, HyperDhtError> {
-        // Node-shaped multi-round client holepunch loop.
-        //
-        // The previous (legacy) implementation sent exactly two PEER_HOLEPUNCH
-        // messages — a probe (`punching=false`) and an immediate punch
-        // (`punching=true`) — then waited for the local Holepuncher to emit a
-        // Connected event. That does not match Node's `lib/connect.js`
-        // semantics and fails against passive Node servers (and against our
-        // own swarm-side passive holepunch server).
-        //
-        // The flow below mirrors Node:
-        //   1. Up to `HOLEPUNCH_MAX_PROBE_ROUNDS` probe rounds, each with
-        //      `punching=false`. After every reply we feed the new info into
-        //      the Holepuncher via `update_remote(...)` and ask `analyze(false)`
-        //      whether the local NAT state is stable enough to punch.
-        //   2. A reply is only treated as "verified" when its `remote_token`
-        //      echoes the token we sent on the same round — only the
-        //      legitimate server could echo our random token through the
-        //      encrypted FE-holder relay.
-        //   3. Once we have at least one verified remote address AND
-        //      `analyze(false)` is true we send a single final
-        //      `punching=true` round, then race the local `puncher.punch()`
-        //      against incoming `HolepunchEvent::Connected`/`Aborted` events,
-        //      bounded by `HOLEPUNCH_TOTAL_DEADLINE`.
-        //   4. `reply.error` is decoded each round: `ERROR_NONE` continues,
-        //      `ERROR_TRY_LATER` is retried in the next probe round,
-        //      `ERROR_ABORTED` returns `HolepunchAborted`, anything else
-        //      returns `HolepunchFailed`.
-
-        /// Maximum wall-clock time spent in the full holepunch flow (probes +
-        /// final punch + waiting for Connected).
+        /// Rust bound on the whole punch, rounds and landing included.
         const HOLEPUNCH_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-        /// Maximum number of `punching=false` probe rounds before we either
-        /// transition to the final punch round or give up.
-        const HOLEPUNCH_MAX_PROBE_ROUNDS: u32 = 3;
 
-        let sp = SecurePayload::new(nw_result.holepunch_secret);
-        let pool = SocketPool::new("0.0.0.0".into());
+        // hyperdht's socket pool binds to the DHT host (`index.js` `SocketPool`).
+        let host = match self.server_socket().await {
+            Ok(Some(socket)) => socket.local_addr().await.ok().map(|a| a.ip().to_string()),
+            _ => None,
+        };
+        let pool = SocketPool::new(host.unwrap_or_else(|| "0.0.0.0".into()));
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-
-        let hp_id = remote_payload.holepunch.as_ref().map_or(0, |hp| hp.id);
-
+        // The puncher's NAT starts OPEN on a reachable node, as hyperdht
+        // builds it with `dht.firewalled` (`holepuncher.js:19`).
+        let firewalled = !self.dht.reachable().await.unwrap_or(false);
         let mut puncher = Holepuncher::new(
             &pool,
             runtime,
-            true,
+            firewalled,
             true,
             remote_payload.firewall,
             event_tx,
         )
         .await
         .map_err(|_| HyperDhtError::HolepunchFailed)?;
-
-        // Seed the puncher's NAT classifier with reflexive samples from the
-        // puncher socket's own UDP binding BEFORE punch() runs. Without this
-        // the puncher.nat stays UNKNOWN (Phase 3's only sample source was
-        // PEER_HOLEPUNCH replies, all from the same FE-holder, which Nat::add
-        // dedupes after the first hit) and coerce_firewall would have to lie.
-        // See Node lib/holepuncher.js:13-20 + lib/nat.js:25-79.
+        // `holepuncher.js:20`: sample the puncher socket's own mapping.
         let added = puncher.auto_sample(&self.dht).await;
         tracing::debug!(
             added,
@@ -2279,326 +2457,416 @@ impl HyperDhtHandle {
             "initiator auto_sample"
         );
 
-        // Holepunch payload `addresses` list: prefer the puncher's
-        // autoSample-derived reflexive samples (`puncher.nat.addresses`)
-        // and fall back to local LAN interface enumeration when those are
-        // empty. Mirrors Node `hyperdht/lib/holepuncher.js:221-227` (the
-        // receiver iterates `remoteAddresses` to drive `_consistentProbe`).
-        let local_punch_addrs: Vec<Ipv4Peer> = match puncher.primary_socket() {
-            Some(sr) => match sr.socket.local_addr().await {
-                Ok(addr) => puncher.punch_addresses(addr.port()),
+        // Every exit below drops `punch`, which destroys the puncher.
+        let mut punch = ClientPunch {
+            dht: self,
+            sp: SecurePayload::new(nw_result.holepunch_secret),
+            hp_id: remote_payload.holepunch.as_ref().map_or(0, |hp| hp.id),
+            target: *target,
+            round: 0,
+            puncher,
+            has_relay,
+            deadline: tokio::time::Instant::now() + HOLEPUNCH_TOTAL_DEADLINE,
+        };
+        let server_relay = pick_server_relay(remote_payload, relay, server_address);
+        let (token, peer_address) = punch.probe_round(server_address, &server_relay).await?;
+        // `connect.js:310-317`: through the same relay, the server's newer
+        // socket is where the punch round goes.
+        let mut server_address = server_address.clone();
+        if server_relay.relay_address == *relay && peer_address != server_address {
+            server_address = peer_address;
+            punch.puncher.open_session(&server_address);
+        }
+        punch
+            .round_punch(&server_address, token, relay, &server_relay)
+            .await?;
+        let deadline = punch.deadline;
+        let puncher = &mut punch.puncher;
+
+        // `roundPunch`: `if (!(await c.puncher.punch())) throw
+        // REMOTE_NOT_HOLEPUNCHABLE()`; the connection lands through the
+        // puncher's probe hook (Connected) or the puncher gives up (Aborted).
+        let punch_fut = puncher.punch(&pool, runtime);
+        tokio::pin!(punch_fut);
+        let mut punch_done = false;
+        let deadline_sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_sleep);
+        loop {
+            tokio::select! {
+                ev = event_rx.recv() => {
+                    match ev {
+                        Some(HolepunchEvent::Connected { addr, socket }) => {
+                            tracing::info!(
+                                target: "peeroxide::_events::holepunch::connected",
+                                from = %addr,
+                                "punch successful"
+                            );
+                            let connected_addr = Ipv4Peer {
+                                host: addr.ip().to_string(),
+                                port: addr.port(),
+                            };
+                            return Ok(ConnectResult {
+                                remote_public_key: nw_result.remote_public_key,
+                                server_address: connected_addr.clone(),
+                                client_address: connected_addr,
+                                is_relayed: true,
+                                noise: nw_result.clone(),
+                                local_stream_id,
+                                remote_udx: remote_payload.udx.clone(),
+                                udx_socket: Some(socket),
+                            });
+                        }
+                        Some(HolepunchEvent::Aborted) | None => {
+                            tracing::info!(
+                                target: "peeroxide::_events::holepunch::aborted",
+                                "punch aborted"
+                            );
+                            return Err(HyperDhtError::HolepunchAborted);
+                        }
+                    }
+                }
+                punched = punch_fut.as_mut(), if !punch_done => {
+                    if !punched {
+                        return Err(HyperDhtError::RemoteNotHolepunchable);
+                    }
+                    punch_done = true;
+                    tracing::debug!("local punch loop completed, awaiting Connected event");
+                }
+                _ = deadline_sleep.as_mut() => {
+                    tracing::debug!("punch deadline elapsed");
+                    return Err(HyperDhtError::HolepunchFailed);
+                }
+            }
+        }
+    }
+}
+
+/// A relay node and the address it forwards a holepunch round to
+/// (`connect.js` `serverRelay`).
+struct RelayPair {
+    relay_address: Ipv4Peer,
+    peer_address: Ipv4Peer,
+}
+
+/// Node `pickServerRelay`: the server's announce relay we already went
+/// through, else its first one. A server without relays (not
+/// holepunchable, never punched by `connect`) falls back to our relay.
+fn pick_server_relay(
+    remote_payload: &NoisePayload,
+    client_relay: &Ipv4Peer,
+    server_address: &Ipv4Peer,
+) -> RelayPair {
+    let relays = remote_payload
+        .holepunch
+        .as_ref()
+        .map_or(&[][..], |hp| hp.relays.as_slice());
+    relays
+        .iter()
+        .find(|r| r.relay_address == *client_relay)
+        .or_else(|| relays.first())
+        .map_or_else(
+            || RelayPair {
+                relay_address: client_relay.clone(),
+                peer_address: server_address.clone(),
+            },
+            |r| RelayPair {
+                relay_address: r.relay_address.clone(),
+                peer_address: r.peer_address.clone(),
+            },
+        )
+}
+
+/// One opened PEER_HOLEPUNCH reply (`connect.js` `updateHolepunch`).
+struct RoundReply {
+    try_later: bool,
+    from: Ipv4Peer,
+    to: Ipv4Peer,
+    peer_address: Ipv4Peer,
+    payload: HolepunchPayload,
+}
+
+/// The client's holepunch state across rounds (the `c` of `connect.js`).
+struct ClientPunch<'a> {
+    dht: &'a HyperDhtHandle,
+    sp: SecurePayload,
+    hp_id: u64,
+    target: [u8; 32],
+    /// `c.round`: one counter for every round we send.
+    round: u64,
+    puncher: Holepuncher,
+    /// `c.relayToken`: a relay can carry us while the punch waits.
+    has_relay: bool,
+    deadline: tokio::time::Instant,
+}
+
+impl ClientPunch<'_> {
+    /// A round payload with our current NAT view; `round` is `c.round++`.
+    async fn payload(
+        &mut self,
+        punching: bool,
+        remote_address: Option<Ipv4Peer>,
+        token: Option<[u8; 32]>,
+        remote_token: Option<[u8; 32]>,
+    ) -> HolepunchPayload {
+        let round = self.round;
+        self.round += 1;
+        let addresses = match self.puncher.socket() {
+            Some(socket) => match socket.local_addr().await {
+                Ok(addr) => self.puncher.advertised_addresses(addr.port()).await,
                 Err(_) => Vec::new(),
             },
             None => Vec::new(),
         };
+        HolepunchPayload {
+            error: ERROR_NONE,
+            firewall: self.puncher.nat.firewall,
+            round,
+            connected: false,
+            punching,
+            addresses: Some(addresses),
+            remote_address,
+            token,
+            remote_token,
+        }
+    }
 
-        let deadline = tokio::time::Instant::now() + HOLEPUNCH_TOTAL_DEADLINE;
+    /// Node `updateHolepunch`: send one round from the puncher socket
+    /// through `relay` and feed the reply to the puncher.
+    async fn update_holepunch(
+        &mut self,
+        peer_address: &Ipv4Peer,
+        relay: &Ipv4Peer,
+        payload: HolepunchPayload,
+    ) -> Result<RoundReply, HyperDhtError> {
+        let socket = self
+            .puncher
+            .socket()
+            .ok_or(HyperDhtError::HolepunchFailed)?;
+        // Node `peerHolepunch`: the relay forwards to `peerAddress`.
+        let value = Router::encode_client_holepunch(
+            self.hp_id,
+            self.sp.encrypt(&payload)?,
+            Some(peer_address.clone()),
+        )?;
+        let resp = self
+            .dht
+            .dht
+            .request_via_socket(
+                UserRequestParams {
+                    token: None,
+                    command: PEER_HOLEPUNCH,
+                    target: Some(self.target),
+                    value: Some(value),
+                    timeout_ms: None,
+                    retries: None,
+                },
+                relay.clone(),
+                socket,
+            )
+            .await?;
+        if resp.error != 0 {
+            return Err(HyperDhtError::HolepunchFailed);
+        }
+        let hp = self
+            .dht
+            .router
+            .lock()
+            .map_err(|_| HyperDhtError::ChannelClosed)?
+            .validate_holepunch_reply(
+                resp.value.as_deref().unwrap_or_default(),
+                relay,
+                &resp.from,
+                &resp.to,
+            )?;
+        let remote = self.sp.decrypt(&hp.payload)?;
+        let reply = |payload| RoundReply {
+            try_later: false,
+            from: hp.from.clone(),
+            to: hp.to.clone(),
+            peer_address: hp.peer_address.clone(),
+            payload,
+        };
+        if remote.error == ERROR_TRY_LATER && self.has_relay && payload.punching {
+            return Ok(RoundReply {
+                try_later: true,
+                ..reply(remote)
+            });
+        }
+        if remote.error != ERROR_NONE {
+            return Err(HyperDhtError::RemoteAborted(remote.error));
+        }
+        let echoed = remote.remote_token.is_some() && remote.remote_token == payload.token;
+        self.puncher.update_remote(
+            remote.punching,
+            remote.firewall,
+            remote.addresses.as_deref().unwrap_or_default(),
+            echoed.then_some(peer_address.host.as_str()),
+        );
+        Ok(reply(remote))
+    }
 
-        // State carried between probe rounds.
-        let mut cached_reply_token: Option<[u8; 32]> = None;
-        let mut verified_remote_addr: Option<Ipv4Peer> = None;
-        let mut last_round: u64 = 0;
-
-        for round in 0u64..=u64::from(HOLEPUNCH_MAX_PROBE_ROUNDS) {
-            last_round = round;
-
-            // Fresh outbound token per round; the reply must echo this back
-            // in `remote_token` for us to consider the host verified.
-            let our_outbound_token: [u8; 32] = rand::random();
-
-            let probe_payload = HolepunchPayload {
-                error: ERROR_NONE,
-                firewall: puncher.nat.firewall,
-                round,
-                connected: false,
-                punching: false,
-                addresses: Some(local_punch_addrs.clone()),
-                remote_address: None,
-                token: Some(our_outbound_token),
-                remote_token: cached_reply_token,
-            };
-
-            let encrypted_probe = sp.encrypt(&probe_payload)?;
-            let hp_value = Router::encode_client_holepunch(hp_id, encrypted_probe, None)?;
-
-            tracing::debug!(round, hp_id, "probe sent");
-
-            let hp_resp = self
-                .dht
-                .request(
-                    UserRequestParams {
-                        token: None,
-                        command: PEER_HOLEPUNCH,
-                        target: Some(*target),
-                        value: Some(hp_value),
-                        timeout_ms: None,
-                        retries: None,
-                    },
-                    &relay.host,
-                    relay.port,
+    /// Node `probeRound`: learn the server's NAT and token, rerolling an
+    /// unstable puncher socket. Returns the server's token and the address
+    /// the relay forwarded to.
+    async fn probe_round(
+        &mut self,
+        server_address: &Ipv4Peer,
+        server_relay: &RelayPair,
+    ) -> Result<(Option<[u8; 32]>, Ipv4Peer), HyperDhtError> {
+        let mut retry = true;
+        loop {
+            // A low-TTL packet opens our NAT toward the server first.
+            self.puncher.open_session(server_address);
+            let payload = self
+                .payload(false, Some(server_address.clone()), None, None)
+                .await;
+            let reply = self
+                .update_holepunch(
+                    &server_relay.peer_address,
+                    &server_relay.relay_address,
+                    payload,
                 )
                 .await?;
+            // Our own mapping as the relay saw it, never the server's.
+            self.puncher.nat.add(&reply.to, &reply.from);
+            // (`connect.js:627-636` reads `reply.payload.address`, a field
+            // the payload does not have, so its second openSession never
+            // runs.)
 
-            if hp_resp.error != 0 {
-                puncher.destroy();
-                return Err(HyperDhtError::HolepunchFailed);
-            }
-
-            let Some(reply_value) = &hp_resp.value else {
-                puncher.destroy();
-                return Err(HyperDhtError::HolepunchFailed);
-            };
-
-            let hp_result = {
-                let router = self
-                    .router
-                    .lock()
-                    .map_err(|_| HyperDhtError::ChannelClosed)?;
-                router.validate_holepunch_reply(reply_value, relay, &hp_resp.from, relay)?
-            };
-
-            let reply_hp = sp.decrypt(&hp_result.payload)?;
-
-            match reply_hp.error {
-                ERROR_NONE => {}
-                ERROR_TRY_LATER => {
-                    tracing::debug!(round, "reply ERROR_TRY_LATER, continuing");
-                    cached_reply_token = reply_hp.token;
-                    continue;
-                }
-                ERROR_ABORTED => {
-                    puncher.destroy();
-                    return Err(HyperDhtError::HolepunchAborted);
-                }
-                other => {
-                    tracing::warn!(round, error = other, "holepunch reply server error");
-                    puncher.destroy();
-                    return Err(HyperDhtError::HolepunchFailed);
-                }
-            }
-
-            // Mirror Node `connect.js:612-616`: feed NAT sampler.
-            puncher.nat.add(&hp_result.peer_address, &hp_resp.from);
-
-            // Token-echo verification: only consider the host verified if
-            // the reply echoes back our outbound token in `remote_token`.
-            let token_matches = reply_hp.remote_token == Some(our_outbound_token);
-            let verified_host = if token_matches {
-                Some(hp_result.peer_address.host.as_str())
-            } else {
-                None
-            };
-
-            tracing::debug!(
-                round,
-                punching = reply_hp.punching,
-                firewall = reply_hp.firewall,
-                addresses = reply_hp.addresses.as_ref().map_or(0, |a| a.len()),
-                verified = token_matches,
-                "probe reply"
-            );
-
-            if let Some(addrs) = &reply_hp.addresses {
-                puncher.update_remote(reply_hp.punching, reply_hp.firewall, addrs, verified_host);
-            }
-
-            if token_matches {
-                verified_remote_addr = Some(hp_result.peer_address.clone());
-            }
-            cached_reply_token = reply_hp.token;
-
-            // Match Node `connect.js:630-634`: 1s grace on UNKNOWN firewall.
-            if reply_hp.firewall == FIREWALL_UNKNOWN {
+            // Give a server that does not know its NAT yet a moment.
+            if self.puncher.remote_firewall == FIREWALL_UNKNOWN {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
 
-            // Synchronous early-exit: if BOTH local NAT is settled (sampled
-            // enough to classify) AND remote firewall is settled AND we have
-            // a verified remote address, we can short-circuit the remaining
-            // probe rounds. We deliberately avoid `puncher.analyze(false).await`
-            // here because that awaits `nat.analyzing()` which can't resolve
-            // until `NAT_MIN_SAMPLES` samples have accumulated — calling it
-            // mid-loop would deadlock the loop's own sample-accumulation work.
-            // The post-loop `analyze(true)` provides the authoritative wait.
-            if verified_remote_addr.is_some()
-                && puncher.nat.is_settled()
-                && reply_hp.firewall != FIREWALL_UNKNOWN
-            {
-                tracing::info!(
-                    target: "peeroxide::_events::holepunch::nat_settled",
-                    round,
-                    "NAT settled + verified remote, transitioning to final punch round"
-                );
-                break;
+            let mut stable = self.analyze(false).await;
+            if !stable {
+                // Reroll the socket (mobile NATs); a stable new one probes again.
+                stable = self.analyze(true).await;
+                if stable {
+                    retry = false;
+                    continue;
+                }
             }
+            if (self.puncher.remote_firewall == FIREWALL_UNKNOWN || reply.payload.token.is_none())
+                && retry
+            {
+                retry = false;
+                continue;
+            }
+            if self.puncher.remote_firewall == FIREWALL_UNKNOWN
+                || self.puncher.nat.firewall == FIREWALL_UNKNOWN
+            {
+                return self
+                    .abort(server_relay, HyperDhtError::HolepunchProbeTimeout)
+                    .await;
+            }
+            if self.puncher.remote_firewall >= crate::hyperdht_messages::FIREWALL_RANDOM
+                && self.puncher.nat.firewall >= crate::hyperdht_messages::FIREWALL_RANDOM
+            {
+                return self
+                    .abort(server_relay, HyperDhtError::HolepunchDoubleRandomizedNats)
+                    .await;
+            }
+            return Ok((reply.payload.token, reply.peer_address));
         }
+    }
 
-        // shortcut: verified probe rounds may proceed with UNKNOWN local NAT;
-        // require settled sampling here when porting Node's analyze/reopen gate.
+    /// `puncher.analyze`, bounded by our deadline.
+    async fn analyze(&mut self, allow_reopen: bool) -> bool {
+        tokio::time::timeout_at(self.deadline, self.puncher.analyze(allow_reopen))
+            .await
+            .unwrap_or(false)
+    }
 
-        let Some(verified_addr) = verified_remote_addr else {
-            tracing::warn!(
-                target: "peeroxide::_events::holepunch::failed_no_verified_addr",
-                "no verified remote address after probe rounds"
-            );
-            puncher.destroy();
-            return Err(HyperDhtError::HolepunchFailed);
+    /// Node `abort`: tell the server we gave up, then fail with `err`.
+    async fn abort<T>(
+        &mut self,
+        server_relay: &RelayPair,
+        err: HyperDhtError,
+    ) -> Result<T, HyperDhtError> {
+        let round = self.round;
+        self.round += 1;
+        let payload = HolepunchPayload {
+            error: ERROR_ABORTED,
+            firewall: FIREWALL_UNKNOWN,
+            round,
+            connected: false,
+            punching: false,
+            addresses: None,
+            remote_address: None,
+            token: None,
+            remote_token: None,
         };
+        let _ = self
+            .update_holepunch(
+                &server_relay.peer_address,
+                &server_relay.relay_address,
+                payload,
+            )
+            .await;
+        self.puncher.destroy();
+        Err(err)
+    }
 
-        let mut final_round = last_round;
+    /// Node `roundPunch`: wait for the random-punch budget, then send the
+    /// one `punching` round.
+    async fn round_punch(
+        &mut self,
+        server_address: &Ipv4Peer,
+        remote_token: Option<[u8; 32]>,
+        client_relay: &Ipv4Peer,
+        server_relay: &RelayPair,
+    ) -> Result<(), HyperDhtError> {
+        // We gossip our final NAT view now; keep it fixed.
+        self.puncher.nat.freeze();
+        let token = self.sp.token(&server_address.host);
+        let mut delayed = false;
         loop {
-            while !puncher.reserve_random_punch() {
-                if !puncher.retry_random_punch(has_relay, deadline).await {
-                    puncher.destroy();
+            while !self.puncher.reserve_random_punch() {
+                // Without a relay to carry us, waiting is pointless.
+                if !self.has_relay {
+                    return Err(HyperDhtError::HolepunchAborted);
+                }
+                if !delayed {
+                    delayed = true;
+                    let payload = self.payload(false, None, Some(token), remote_token).await;
+                    self.update_holepunch(server_address, client_relay, payload)
+                        .await?;
+                }
+                if !self
+                    .puncher
+                    .retry_random_punch(self.has_relay, self.deadline)
+                    .await
+                {
                     return Err(HyperDhtError::HolepunchAborted);
                 }
             }
-
-            // ── Final punch round (single round with punching=true) ─────────────
-            final_round = final_round.saturating_add(1);
-            let final_outbound_token: [u8; 32] = rand::random();
-            let punch_payload = HolepunchPayload {
-                error: ERROR_NONE,
-                firewall: puncher.nat.firewall,
-                round: final_round,
-                connected: false,
-                punching: true,
-                addresses: Some(local_punch_addrs.clone()),
-                remote_address: Some(verified_addr.clone()),
-                token: Some(final_outbound_token),
-                remote_token: cached_reply_token,
+            // A delayed punch goes through the server's chosen relay.
+            let (peer, relay) = if delayed {
+                (&server_relay.peer_address, &server_relay.relay_address)
+            } else {
+                (server_address, client_relay)
             };
-
-            let encrypted_punch = sp.encrypt(&punch_payload)?;
-            let hp_punch_value = Router::encode_client_holepunch(hp_id, encrypted_punch, None)?;
-
-            tracing::info!(
-                target: "peeroxide::_events::holepunch::final_punch_sent",
-                round = final_round,
-                verified_addr = %format!("{}:{}", verified_addr.host, verified_addr.port),
-                "final punch sent, waiting for Connected event"
-            );
-
-            let punch_resp = self
-                .dht
-                .request(
-                    UserRequestParams {
-                        token: None,
-                        command: PEER_HOLEPUNCH,
-                        target: Some(*target),
-                        value: Some(hp_punch_value),
-                        timeout_ms: None,
-                        retries: None,
-                    },
-                    &relay.host,
-                    relay.port,
-                )
-                .await?;
-
-            if let Some(reply_value) = &punch_resp.value {
-                let hp_result = {
-                    let router = self
-                        .router
-                        .lock()
-                        .map_err(|_| HyperDhtError::ChannelClosed)?;
-                    router.validate_holepunch_reply(reply_value, relay, &punch_resp.from, relay)?
-                };
-
-                if let Ok(reply_hp) = sp.decrypt(&hp_result.payload) {
-                    if reply_hp.error == ERROR_TRY_LATER {
-                        if !puncher.retry_random_punch(has_relay, deadline).await {
-                            puncher.destroy();
-                            return Err(HyperDhtError::HolepunchAborted);
-                        }
-                        continue;
-                    }
-                    if reply_hp.error != ERROR_NONE {
-                        puncher.destroy();
-                        return Err(HyperDhtError::HolepunchAborted);
-                    }
-                    let verified_host = if reply_hp.remote_token == Some(final_outbound_token) {
-                        Some(hp_result.peer_address.host.as_str())
-                    } else {
-                        None
-                    };
-                    if let Some(addrs) = &reply_hp.addresses {
-                        puncher.update_remote(
-                            reply_hp.punching,
-                            reply_hp.firewall,
-                            addrs,
-                            verified_host,
-                        );
-                    }
-                }
+            let payload = self
+                .payload(true, None, (!delayed).then_some(token), remote_token)
+                .await;
+            let reply = self.update_holepunch(peer, relay, payload).await?;
+            if !reply.try_later {
+                break;
             }
-            break;
-        }
-
-        // Spawn the local punch loop and race it against Connected / Aborted
-        // events and the global deadline. The pinned `punch_fut` mutably
-        // borrows `puncher` for the duration of the inner scope; on timeout
-        // we exit the scope so the borrow is released before we call
-        // `puncher.destroy()`.
-
-        let timed_out = {
-            let punch_fut = puncher.punch(&pool, runtime);
-            tokio::pin!(punch_fut);
-            let mut punch_done = false;
-            let deadline_sleep = tokio::time::sleep_until(deadline);
-            tokio::pin!(deadline_sleep);
-
-            loop {
-                tokio::select! {
-                    ev = event_rx.recv() => {
-                        match ev {
-                            Some(HolepunchEvent::Connected { addr, socket }) => {
-                                tracing::info!(
-                                    target: "peeroxide::_events::holepunch::connected",
-                                    from = %addr,
-                                    "punch successful"
-                                );
-                                let connected_addr = Ipv4Peer {
-                                    host: addr.ip().to_string(),
-                                    port: addr.port(),
-                                };
-                                return Ok(ConnectResult {
-                                    remote_public_key: nw_result.remote_public_key,
-                                    server_address: connected_addr.clone(),
-                                    client_address: connected_addr,
-                                    is_relayed: true,
-                                    noise: nw_result.clone(),
-                                    local_stream_id,
-                                    remote_udx: remote_payload.udx.clone(),
-                                    udx_socket: Some(socket),
-                                });
-                            }
-                            Some(HolepunchEvent::Aborted) | None => {
-                                tracing::info!(
-                                    target: "peeroxide::_events::holepunch::aborted",
-                                    "punch aborted"
-                                );
-                                return Err(HyperDhtError::HolepunchAborted);
-                            }
-                        }
-                    }
-                    _ = punch_fut.as_mut(), if !punch_done => {
-                        punch_done = true;
-                        tracing::debug!("local punch loop completed, awaiting Connected event");
-                    }
-                    _ = deadline_sleep.as_mut() => {
-                        break true;
-                    }
-                }
+            if !self
+                .puncher
+                .retry_random_punch(self.has_relay, self.deadline)
+                .await
+            {
+                return Err(HyperDhtError::HolepunchAborted);
             }
-        };
-
-        if timed_out {
-            tracing::debug!("punch deadline elapsed");
-            puncher.destroy();
-            return Err(HyperDhtError::HolepunchFailed);
+            delayed = true;
         }
-
-        unreachable!("holepunch select loop exited without return or timeout");
+        if !self.puncher.remote_holepunching {
+            return Err(HyperDhtError::RemoteNotHolepunching);
+        }
+        Ok(())
     }
 }
 
@@ -2624,16 +2892,28 @@ struct RacedStream {
     /// Where relayed packets come from, so a hook firing for them is not
     /// mistaken for a direct landing (Node `isRelay`).
     relay_addr: Mutex<Option<SocketAddr>>,
+    /// Keep-alive interval of the landed connection (Node `keepAlive:
+    /// dht.connectionKeepAlive`).
+    keep_alive: Option<std::time::Duration>,
 }
 
 impl RacedStream {
+    #[cfg(test)]
     fn new(stream: libudx::UdxStream) -> Arc<Self> {
+        Self::with_keep_alive(stream, None)
+    }
+
+    fn with_keep_alive(
+        stream: libudx::UdxStream,
+        keep_alive: Option<std::time::Duration>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             remote: stream.remote_handle(),
             abort: stream.abort_handle(),
             stream: Mutex::new(Some(stream)),
             relay: Mutex::new(None),
             relay_addr: Mutex::new(None),
+            keep_alive,
         })
     }
 
@@ -2690,15 +2970,9 @@ impl RacedStream {
         stream
             .connect(&landing.socket, landing.remote_id, landing.addr)
             .await?;
-        let ss = SecretStream::from_session(
-            is_initiator,
-            stream.into_async_stream(),
-            noise.tx,
-            noise.rx,
-            noise.handshake_hash,
-            noise.remote_public_key,
-        )
-        .await?;
+        let ss =
+            secret_stream_from_session(is_initiator, stream.into_async_stream(), noise).await?;
+        ss.set_keep_alive(self.keep_alive);
         Ok(Some(PeerConnection::with_remote_addr(
             ss,
             noise.remote_public_key,
@@ -2732,6 +3006,31 @@ impl RacedStream {
             control.abort();
         });
     }
+}
+
+/// A peer that completed the Noise handshake but never sends its
+/// secret-stream header must not pin a stream and a task forever. Node has
+/// no such bound; 15 s matches its relay pairing timeout.
+async fn secret_stream_from_session(
+    is_initiator: bool,
+    raw: libudx::UdxAsyncStream,
+    noise: &NoiseWrapResult,
+) -> Result<SecretStream<libudx::UdxAsyncStream>, HyperDhtError> {
+    const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    tokio::time::timeout(
+        HEADER_TIMEOUT,
+        SecretStream::from_session(
+            is_initiator,
+            raw,
+            noise.tx,
+            noise.rx,
+            noise.handshake_hash,
+            noise.remote_public_key,
+        ),
+    )
+    .await
+    .map_err(|_| HyperDhtError::StreamEstablishment("secret stream header timed out".into()))?
+    .map_err(HyperDhtError::from)
 }
 
 async fn socket_or_new(
@@ -2813,15 +3112,11 @@ pub async fn establish_stream_with_socket(
     stream.connect(&socket, remote_id, addr).await?;
 
     let async_stream = stream.into_async_stream();
-    let ss = SecretStream::from_session(
-        result.noise.is_initiator,
-        async_stream,
-        result.noise.tx,
-        result.noise.rx,
-        result.noise.handshake_hash,
-        result.noise.remote_public_key,
-    )
-    .await?;
+    let ss =
+        secret_stream_from_session(result.noise.is_initiator, async_stream, &result.noise).await?;
+    // `establish_stream` is the low-level half of Node `dht.connect()`,
+    // which gives every stream the default `connectionKeepAlive`.
+    ss.set_keep_alive(Some(DEFAULT_CONNECTION_KEEP_ALIVE));
     tracing::debug!("SecretStream established");
 
     Ok(PeerConnection {
@@ -2958,7 +3253,23 @@ impl HyperDhtServer {
     }
 
     /// Start accepting connections for `key_pair` (Node `server.listen()`).
+    /// Returns after the first announce finished.
     pub async fn listen(&mut self, key_pair: &KeyPair) -> Result<(), HyperDhtError> {
+        self.listen_inner(key_pair, true).await
+    }
+
+    /// [`Self::listen`], but the first announce runs in the background:
+    /// this returns once the routes are registered, so an actor never waits
+    /// on a DHT round trip.
+    pub async fn listen_in_background(&mut self, key_pair: &KeyPair) -> Result<(), HyperDhtError> {
+        self.listen_inner(key_pair, false).await
+    }
+
+    async fn listen_inner(
+        &mut self,
+        key_pair: &KeyPair,
+        wait_first_announce: bool,
+    ) -> Result<(), HyperDhtError> {
         if self.key_pair.is_some() {
             return Err(HyperDhtError::AlreadyListening);
         }
@@ -3002,7 +3313,7 @@ impl HyperDhtServer {
             port: local.port(),
         });
         if !self.suspended {
-            self.start_announcing().await;
+            self.start_announcing(wait_first_announce).await;
         }
         Ok(())
     }
@@ -3036,8 +3347,19 @@ impl HyperDhtServer {
         Ok(())
     }
 
-    /// Resume answering handshakes (Node `server.resume()`).
+    /// Resume answering handshakes (Node `server.resume()`). Returns after
+    /// the first announce finished.
     pub async fn resume(&mut self) -> Result<(), HyperDhtError> {
+        self.resume_inner(true).await
+    }
+
+    /// [`Self::resume`], but the first announce runs in the background: this
+    /// returns once handshakes are answered again.
+    pub async fn resume_in_background(&mut self) -> Result<(), HyperDhtError> {
+        self.resume_inner(false).await
+    }
+
+    async fn resume_inner(&mut self, wait_first_announce: bool) -> Result<(), HyperDhtError> {
         if !self.suspended {
             return Ok(());
         }
@@ -3047,7 +3369,7 @@ impl HyperDhtServer {
             .map_err(|_| HyperDhtError::ServerClosed)?;
         reply_rx.await.map_err(|_| HyperDhtError::ServerClosed)?;
         self.suspended = false;
-        self.start_announcing().await;
+        self.start_announcing(wait_first_announce).await;
         Ok(())
     }
 
@@ -3071,25 +3393,31 @@ impl HyperDhtServer {
         self.connections.close();
     }
 
-    async fn start_announcing(&mut self) {
+    async fn start_announcing(&mut self, wait_first: bool) {
         let (Some(target), Some(key_pair)) = (self.target, self.key_pair.clone()) else {
             return;
         };
         let dht = self.dht.clone();
-        let first = dht.announce(target, &key_pair, &[]).await;
-        let empty = first
-            .as_ref()
-            .map_or(true, |result| result.closest_nodes.is_empty());
+        let announce = move |dht: HyperDhtHandle, key_pair: KeyPair| async move {
+            dht.announce(target, &key_pair, &[])
+                .await
+                .map_or(true, |result| result.closest_nodes.is_empty())
+        };
+        let first = if wait_first {
+            Some(announce(dht.clone(), key_pair.clone()).await)
+        } else {
+            None
+        };
         // HyperDHT must refresh server records before they expire.
         self.announce_task = Some(tokio::spawn(async move {
-            let mut empty = empty;
+            let mut empty = match first {
+                Some(empty) => empty,
+                None => announce(dht.clone(), key_pair.clone()).await,
+            };
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(if empty { 3 } else { 300 }))
                     .await;
-                empty = dht
-                    .announce(target, &key_pair, &[])
-                    .await
-                    .map_or(true, |result| result.closest_nodes.is_empty());
+                empty = announce(dht.clone(), key_pair.clone()).await;
             }
         }));
     }
@@ -3181,6 +3509,10 @@ struct ServerPassivePunch {
     remote_id: u32,
     noise_result: NoiseWrapResult,
     round: u64,
+    /// The puncher's own NAT class, reported in our punch replies
+    /// (`server.js:621,648` `p.nat.firewall`); kept after `punch()` takes
+    /// the puncher.
+    firewall: u64,
     addresses: Vec<Ipv4Peer>,
     has_relay: bool,
     abort: tokio::task::JoinHandle<()>,
@@ -3250,7 +3582,8 @@ async fn stage_server_punch(
     // The passive side's punch-landed signal is the firewall hook below, not
     // the puncher's Connected event.
     let (hp_tx, _hp_rx) = mpsc::unbounded_channel::<HolepunchEvent>();
-    let puncher = Holepuncher::new(&pool, runtime, true, false, remote_firewall, hp_tx)
+    let firewalled = !dht.reachable().await.unwrap_or(false);
+    let puncher = Holepuncher::new(&pool, runtime, firewalled, false, remote_firewall, hp_tx)
         .await
         .map_err(|e| HyperDhtError::StreamEstablishment(format!("puncher setup: {e}")))?;
     let mut probe = ServerProbe(Some(puncher));
@@ -3305,7 +3638,8 @@ async fn stage_server_punch(
 
     // Advertise the puncher's reachable addresses (Node
     // `holepuncher.js:221-227`), seeded before `punch()` can move the puncher.
-    let addresses = puncher.punch_addresses(puncher_port);
+    let addresses = puncher.advertised_addresses(puncher_port).await;
+    let firewall = puncher.nat.firewall;
     let same_host = addresses.iter().any(|a| a.host == client_host);
 
     Ok(ServerPassivePunch {
@@ -3318,6 +3652,7 @@ async fn stage_server_punch(
         remote_id,
         noise_result: noise_result.clone(),
         round: 0,
+        firewall,
         addresses,
         has_relay: false,
         abort,
@@ -3331,7 +3666,6 @@ async fn server_punch_round(
     state: &mut ServerPassivePunch,
     msg: &HolepunchMessage,
     peer_address: &Ipv4Peer,
-    server_firewall: u64,
 ) -> Option<ServerReply> {
     let remote_hp = state.payload.decrypt(&msg.payload).ok()?;
 
@@ -3355,15 +3689,9 @@ async fn server_punch_round(
             &addrs,
             Some(peer_address.host.as_str()),
         );
-        state.addresses = puncher.punch_addresses(
-            state
-                .socket
-                .local_addr()
-                .await
-                .ok()
-                .map(|a| a.port())
-                .unwrap_or(0),
-        );
+        let port = state.socket.local_addr().await.ok().map_or(0, |a| a.port());
+        state.addresses = puncher.advertised_addresses(port).await;
+        state.firewall = puncher.nat.firewall;
     }
 
     if remote_hp.round > state.round {
@@ -3420,7 +3748,7 @@ async fn server_punch_round(
             } else {
                 ERROR_NONE
             },
-            firewall: server_firewall,
+            firewall: state.firewall,
             round: remote_hp.round,
             connected: false,
             punching: remote_hp.punching && !try_later,
@@ -3650,17 +3978,9 @@ async fn run_hyperdht_server(
                     let reply = if suspended || event_target != target {
                         None
                     } else {
-                        let firewall = dht.firewalled().await.unwrap_or(config.firewall);
                         match punches.get_mut(&msg.id) {
                             Some(state) => {
-                                server_punch_round(
-                                    &runtime,
-                                    state,
-                                    &msg,
-                                    &peer_address,
-                                    firewall,
-                                )
-                                .await
+                                server_punch_round(&runtime, state, &msg, &peer_address).await
                             }
                             None => None,
                         }
@@ -3821,6 +4141,13 @@ async fn accept_server_handshake(
 
     let socket = dht.server_socket().await.ok().flatten()?;
     let port = socket.local_addr().await.ok()?.port();
+    // dht-rpc `firewalled` decides OPEN versus UNKNOWN in the payload
+    // (`server.js:388`); the NAT class stays inside the puncher.
+    let reachable = dht
+        .dht()
+        .reachable()
+        .await
+        .unwrap_or(config.firewall == FIREWALL_OPEN);
     let firewall = dht.firewalled().await.unwrap_or(config.firewall);
 
     let (local_stream_id, local_stream) = runtime.create_random_stream().await.ok()?;
@@ -3829,7 +4156,7 @@ async fn accept_server_handshake(
 
     // Node advertises a holepunch session only while it cannot be dialled
     // directly (`ourRemoteAddr ? null : { id, relays }`).
-    let holepunch = (firewall != FIREWALL_OPEN).then(|| HolepunchInfo {
+    let holepunch = (!reachable).then(|| HolepunchInfo {
         id: holepunch_id,
         relays: dht.current_relays(),
     });
@@ -3848,13 +4175,17 @@ async fn accept_server_handshake(
     let reply_payload = NoisePayload {
         version: 1,
         error: ERROR_NONE,
-        firewall,
+        firewall: if reachable {
+            FIREWALL_OPEN
+        } else {
+            FIREWALL_UNKNOWN
+        },
         holepunch,
         addresses4,
         addresses6: vec![],
         udx: Some(UdxInfo {
             version: 1,
-            reusable_socket: true,
+            reusable_socket: false,
             id: u64::from(local_stream_id),
             seq: 0,
         }),
@@ -3884,20 +4215,23 @@ async fn accept_server_handshake(
         return Some(accepted);
     };
     let remote_id = u32::try_from(remote_udx.id).ok()?;
-    let raced = RacedStream::new(local_stream);
-    // Node dials a client that reached us directly or reports itself open
-    // (`hs.onsocket`); an open server told a firewalled client it is open
-    // and waits on the DHT socket for its dial (`prepunching`). A client we
-    // dial needs no relay (`server.js:420-429`); for the rest the relay
-    // runs beside the punch from here on (`_relayConnection`).
-    let dial = peer_address.is_none() || remote_payload.firewall == FIREWALL_OPEN;
+    let raced = RacedStream::with_keep_alive(local_stream, dht.connection_keep_alive);
+    // Node dials a relayed client that reports itself open (`hs.onsocket`);
+    // an open server told a firewalled client it is open and waits on the
+    // DHT socket for its dial (`prepunching`). A client that reached us
+    // directly dials the exact socket its handshake went to (`connect.js`
+    // non-relayed `onsocket`); npm's server also dials it from that socket.
+    // We do not know which of our two sockets that was, so we wait for the
+    // client's dial on both instead. A direct or open client needs no relay
+    // (`server.js:420-429`); for the rest the relay runs beside the punch
+    // from here on (`_relayConnection`).
+    let direct = peer_address.is_none();
+    let dial = !direct && remote_payload.firewall == FIREWALL_OPEN;
 
     // A relayed handshake from a firewalled client cannot be dialled: a
     // firewalled server stages the passive punch now and advertises its
     // stream id, exactly as Node's `_addHandshake` does before replying.
-    let passive = peer_address.is_some()
-        && remote_payload.firewall != FIREWALL_OPEN
-        && firewall != FIREWALL_OPEN;
+    let passive = peer_address.is_some() && remote_payload.firewall != FIREWALL_OPEN && !reachable;
     if passive {
         match stage_server_punch(
             runtime,
@@ -3929,6 +4263,11 @@ async fn accept_server_handshake(
         } else {
             let (seen_tx, seen_rx) = mpsc::unbounded_channel();
             let pending = Arc::downgrade(&raced);
+            // npm's raw stream hears every socket of its UDX instance: a
+            // client that reached us directly dials the socket its handshake
+            // went to (`connect.js` non-relayed `onsocket`), which for a
+            // firewalled node is the listen socket, not the reply socket.
+            let listen = dht.listen_socket().await.ok().flatten();
             raced
                 .with_stream(|stream| {
                     stream.set_firewall_hook(&socket, remote_id, move |socket, port, ip| {
@@ -3941,6 +4280,9 @@ async fn accept_server_handshake(
                         }
                         true
                     })?;
+                    if let Some(listen) = &listen {
+                        stream.listen_on(listen)?;
+                    }
                     Ok(())
                 })
                 .ok()?;
@@ -3957,7 +4299,7 @@ async fn accept_server_handshake(
     }
 
     accepted.relay = relay
-        .filter(|_| !dial)
+        .filter(|_| !dial && !direct)
         .map(|(public_key, token, initiator)| {
             Box::new(RelayStart {
                 raced: Arc::clone(&raced),
@@ -4048,144 +4390,56 @@ fn encode_server_handshake_reply(
     .ok()
 }
 
-/// Build the reply to a server-side `PEER_HOLEPUNCH` and start punching when
-/// the remote asked for it. Shared by [`run_server`] and the
-/// [`HyperDhtServer`] accept loop.
-async fn passive_holepunch_reply(
-    dht: &DhtHandle,
-    runtime: &UdxRuntime,
-    pool: &SocketPool,
-    firewall: u64,
-    msg: &HolepunchMessage,
-    peer_address: &Ipv4Peer,
-    secret: [u8; 32],
-) -> Option<Vec<u8>> {
-    let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let result = build_passive_holepunch_reply(
-        firewall,
-        pool,
-        runtime,
-        peer_address,
-        secret,
-        &msg.payload,
-        msg.id,
-        event_tx,
-        Some(dht),
-    )
-    .await
-    .ok()?;
+// ── Deprecated legacy server ──────────────────────────────────────────────────
 
-    if result.remote_hp.punching && !result.puncher.destroyed {
-        let pool_clone = SocketPool::new("0.0.0.0".into());
-        let mut puncher = result.puncher;
-        tokio::spawn(async move {
-            if let Ok(rt) = UdxRuntime::new() {
-                puncher.punch(&pool_clone, &rt).await;
-            }
-        });
-    }
-
-    Some(result.reply_bytes)
-}
-
-// ── Server-side event handler ─────────────────────────────────────────────────
-
-/// Per-server state for pending handshake and holepunch exchanges.
+/// Formerly the per-server state of [`run_server`]; it holds nothing now.
+#[deprecated(note = "use `HyperDhtServer` (`HyperDhtHandle::create_server`)")]
 pub struct ServerSession {
-    /// Cached holepunch secrets indexed by remote public key.
-    holepunch_secrets: std::collections::HashMap<[u8; 32], ServerPeerState>,
+    _private: (),
 }
 
-#[allow(dead_code)]
-struct ServerPeerState {
-    holepunch_secret: [u8; 32],
-    remote_public_key: [u8; 32],
-    client_address: Ipv4Peer,
-    local_stream_id: u32,
-    remote_udx: Option<UdxInfo>,
-}
-
-/// Run the server-side request loop for peer handshakes and holepunches.
+/// Answer PEER_HANDSHAKE events with a Noise reply, and nothing more.
+///
+/// It advertises no addresses, stages no holepunch (every PEER_HOLEPUNCH
+/// gets no reply), opens no stream and keeps no per-peer state, so no
+/// connection ever results. Use [`HyperDhtServer`]
+/// ([`HyperDhtHandle::create_server`]), which does all of that.
+#[deprecated(note = "use `HyperDhtServer` (`HyperDhtHandle::create_server`)")]
 pub async fn run_server(
     mut event_rx: mpsc::UnboundedReceiver<ServerEvent>,
     config: ServerConfig,
-    runtime: UdxRuntime,
-    dht: DhtHandle,
+    _runtime: UdxRuntime,
+    _dht: DhtHandle,
 ) {
-    let mut session = ServerSession {
-        holepunch_secrets: std::collections::HashMap::new(),
-    };
-    let pool = SocketPool::new("0.0.0.0".into());
-
     while let Some(event) = event_rx.recv().await {
         match event {
             ServerEvent::PeerHandshake {
                 msg,
                 from,
-                peer_address: _,
-                target,
                 reply_tx,
+                ..
             } => {
-                let reply =
-                    handle_server_handshake(&config, &mut session, msg, &from, target.as_ref());
+                let reply = legacy_handshake_reply(&config, &msg, &from);
                 let _ = reply_tx.send(reply.map(Into::into));
             }
-            ServerEvent::PeerHolepunch {
-                msg,
-                from: _,
-                peer_address,
-                target: _,
-                reply_tx,
-            } => {
-                let holepunch_secret = session.holepunch_secrets.values().find_map(|state| {
-                    let sp = SecurePayload::new(state.holepunch_secret);
-                    if sp.decrypt(&msg.payload).is_ok() {
-                        Some(state.holepunch_secret)
-                    } else {
-                        None
-                    }
-                });
-                let reply = match holepunch_secret {
-                    Some(secret) => {
-                        passive_holepunch_reply(
-                            &dht,
-                            &runtime,
-                            &pool,
-                            config.firewall,
-                            &msg,
-                            &peer_address,
-                            secret,
-                        )
-                        .await
-                    }
-                    None => None,
-                };
-                let _ = reply_tx.send(reply.map(Into::into));
+            ServerEvent::PeerHolepunch { reply_tx, .. } => {
+                let _ = reply_tx.send(None);
             }
         }
     }
 }
 
-fn handle_server_handshake(
+/// The Noise reply [`run_server`] sends: our firewall and a stream id.
+fn legacy_handshake_reply(
     config: &ServerConfig,
-    session: &mut ServerSession,
-    msg: HandshakeMessage,
+    msg: &HandshakeMessage,
     from: &Ipv4Peer,
-    _target: Option<&NodeId>,
 ) -> Option<Vec<u8>> {
     let mut nw = NoiseWrap::new_responder(config.key_pair.to_noise_keypair());
-
-    let remote_payload = match nw.recv(&msg.noise) {
-        Ok(p) => p,
-        Err(_) => return None,
-    };
-
+    let remote_payload = nw.recv(&msg.noise).ok()?;
     if remote_payload.error != 0 {
         return None;
     }
-
-    let local_stream_id = next_stream_id();
-
     let reply_payload = NoisePayload {
         version: 1,
         error: 0,
@@ -4195,44 +4449,22 @@ fn handle_server_handshake(
         addresses6: vec![],
         udx: Some(UdxInfo {
             version: 1,
-            reusable_socket: true,
-            id: u64::from(local_stream_id),
+            reusable_socket: false,
+            id: u64::from(next_stream_id()),
             seq: 0,
         }),
         secret_stream: Some(SecretStreamInfo { version: 1 }),
         relay_through: None,
         relay_addresses: None,
     };
-
-    let noise_reply = match nw.send(&reply_payload) {
-        Ok(b) => b,
-        Err(_) => return None,
-    };
-
-    let nw_result = match nw.finalize() {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
-
-    session.holepunch_secrets.insert(
-        nw_result.remote_public_key,
-        ServerPeerState {
-            holepunch_secret: nw_result.holepunch_secret,
-            remote_public_key: nw_result.remote_public_key,
-            client_address: from.clone(),
-            local_stream_id,
-            remote_udx: remote_payload.udx.clone(),
-        },
-    );
-
-    let reply_msg = HandshakeMessage {
+    let noise = nw.send(&reply_payload).ok()?;
+    crate::hyperdht_messages::encode_handshake_to_bytes(&HandshakeMessage {
         mode: crate::hyperdht_messages::MODE_REPLY,
-        noise: noise_reply,
+        noise,
         peer_address: Some(from.clone()),
         relay_address: None,
-    };
-
-    crate::hyperdht_messages::encode_handshake_to_bytes(&reply_msg).ok()
+    })
+    .ok()
 }
 
 /// Result returned by [`build_passive_holepunch_reply`].
@@ -4268,9 +4500,20 @@ pub async fn build_passive_holepunch_reply(
     let sp = SecurePayload::new(holepunch_secret);
     let remote_hp = sp.decrypt(incoming_payload)?;
 
-    let mut puncher = Holepuncher::new(pool, runtime, true, false, remote_hp.firewall, event_tx)
-        .await
-        .map_err(|_| HyperDhtError::HolepunchFailed)?;
+    let firewalled = match dht {
+        Some(dht) => !dht.reachable().await.unwrap_or(false),
+        None => true,
+    };
+    let mut puncher = Holepuncher::new(
+        pool,
+        runtime,
+        firewalled,
+        false,
+        remote_hp.firewall,
+        event_tx,
+    )
+    .await
+    .map_err(|_| HyperDhtError::HolepunchFailed)?;
 
     if let Some(addrs) = &remote_hp.addresses {
         puncher.update_remote(
@@ -4319,7 +4562,13 @@ pub async fn build_passive_holepunch_reply(
         } else {
             ERROR_NONE
         },
-        firewall: config_firewall,
+        // The puncher's own class once sampled (`server.js:621`);
+        // `config_firewall` only when the caller skipped sampling.
+        firewall: if dht.is_some() {
+            puncher.nat.firewall
+        } else {
+            config_firewall
+        },
         round: remote_hp.round,
         connected: false,
         punching: remote_hp.punching && !try_later,
@@ -4364,6 +4613,7 @@ pub async fn spawn(
 > {
     let (dht_join, dht_handle) = crate::rpc::spawn(runtime, config.dht).await?;
     let persistent_config = config.persistent;
+    let connection_keep_alive = config.connection_keep_alive;
 
     let request_rx = dht_handle
         .subscribe_requests()
@@ -4433,6 +4683,7 @@ pub async fn spawn(
         admin_tx,
         current_relays: Arc::new(Mutex::new(Vec::new())),
         raw_streams: Arc::new(Mutex::new(Vec::new())),
+        connection_keep_alive,
     };
     Ok((join, handle, server_rx))
 }
@@ -4446,6 +4697,8 @@ async fn run_request_handler(
     mut admin_rx: mpsc::UnboundedReceiver<AdminRequest>,
 ) {
     let mut storage = Persistent::new(config);
+    // xache runs its gc every two thirds of `maxAge` (20 min).
+    let mut router_gc = tokio::time::interval(std::time::Duration::from_secs(800));
 
     loop {
         let mut req = tokio::select! {
@@ -4458,6 +4711,12 @@ async fn run_request_handler(
                     AdminRequest::LocalRecord { target, record } => {
                         storage.set_local_record(&target, record);
                     }
+                }
+                continue;
+            }
+            _ = router_gc.tick() => {
+                if let Ok(mut r) = router.lock() {
+                    r.gc();
                 }
                 continue;
             }
@@ -4895,7 +5154,10 @@ fn handle_peer_holepunch(
                                     Some(reply.value),
                                     &req.from,
                                     inbound_tid,
-                                    reply.socket,
+                                    // dht-rpc `req.relay(.., { socket })`
+                                    // defaults to the socket the round
+                                    // arrived on.
+                                    reply.socket.or_else(|| req.inbound_socket()),
                                 ) {
                                     tracing::debug!(err = %e, "relay_with_tid send failed");
                                 }
@@ -4926,6 +5188,29 @@ fn handle_peer_holepunch(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// dht-rpc `_endAfterCommit`: send every commit at once and return each
+/// result in input order. The caller treats a reply whose error code is
+/// nonzero as a failure, as `dht.request` rejects on it.
+async fn commit_concurrently(
+    dht: &DhtHandle,
+    commits: Vec<(Ipv4Peer, UserRequestParams)>,
+) -> Vec<Result<crate::rpc::ResponseData, DhtError>> {
+    let mut set = tokio::task::JoinSet::new();
+    let n = commits.len();
+    for (i, (to, params)) in commits.into_iter().enumerate() {
+        let dht = dht.clone();
+        set.spawn(async move { (i, dht.request(params, &to.host, to.port).await) });
+    }
+    let mut results: Vec<Result<crate::rpc::ResponseData, DhtError>> =
+        (0..n).map(|_| Err(DhtError::ChannelClosed)).collect();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((i, res)) = joined {
+            results[i] = res;
+        }
+    }
+    results
+}
 
 fn encode_compact_uint(v: u64) -> Vec<u8> {
     let mut state = crate::compact_encoding::State::new();
@@ -5036,7 +5321,7 @@ mod tests {
                 port: 0,
                 ..DhtConfig::default()
             },
-            persistent: PersistentConfig::default(),
+            ..HyperDhtConfig::default()
         };
         let (join, handle, _server_rx) = spawn(&runtime, config).await.expect("spawn");
         handle.destroy().await.expect("destroy");
@@ -5052,7 +5337,7 @@ mod tests {
                 port: 0,
                 ..DhtConfig::default()
             },
-            persistent: PersistentConfig::default(),
+            ..HyperDhtConfig::default()
         };
         let (join, handle, _rx) = spawn(&runtime, config).await.expect("spawn");
         let (sent, received) = handle.wire_stats();
@@ -5362,7 +5647,8 @@ mod tests {
         let (_task, bootstrap, _events) = spawn(&runtime, local(vec![], false))
             .await
             .expect("bootstrap");
-        let address = format!("127.0.0.1:{}", bootstrap.local_port().await.unwrap());
+        let bootstrap_port = bootstrap.local_port().await.unwrap();
+        let address = format!("127.0.0.1:{bootstrap_port}");
         let (_task, dht, _events) = spawn(&runtime, local(vec![address], true))
             .await
             .expect("server");
@@ -5380,6 +5666,19 @@ mod tests {
             incoming,
         );
         server.listen(&keys).await.expect("listen");
+        // The announce query's timeouts drop the dead node from the table
+        // (dht-rpc `_ontimeout`); put it back so staging samples a node that
+        // never answers.
+        dht.dht().insert_node_for_test(crate::routing_table::Node {
+            id: rand::random(),
+            host: "127.0.0.1".into(),
+            port: bootstrap_port,
+            token: None,
+            added_tick: 0,
+            seen_tick: 0,
+            pinged_tick: 0,
+            down_hints: 0,
+        });
         let make_message = |with_stream: bool| {
             let client = KeyPair::generate();
             let mut noise = NoiseWrap::new_initiator(client.to_noise_keypair(), keys.public_key);
@@ -5505,7 +5804,7 @@ mod tests {
             state.has_relay = has_relay;
             state.reply_socket = Some(state.socket.clone());
             let address = state.socket.local_addr().await.unwrap();
-            let reply = server_punch_round(&runtime, &mut state, &message, &peer, FIREWALL_RANDOM)
+            let reply = server_punch_round(&runtime, &mut state, &message, &peer)
                 .await
                 .unwrap();
             let message =
@@ -5616,7 +5915,6 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: 1234,
             },
-            FIREWALL_UNKNOWN,
         )
         .await
         .expect("abort reply");
@@ -5819,6 +6117,1061 @@ mod tests {
         assert_eq!(cfg.dht.bootstrap[2], DEFAULT_BOOTSTRAP[2]);
         assert_eq!(cfg.dht.port, 0);
         assert!(cfg.dht.firewalled);
+    }
+
+    fn lan_peer(host: &str, port: u16) -> Ipv4Peer {
+        Ipv4Peer {
+            host: host.into(),
+            port,
+        }
+    }
+
+    #[test]
+    fn direct_dial_uses_the_handshake_address_when_not_relayed() {
+        let node = lan_peer("192.168.1.20", 49737);
+        let advertised = [lan_peer("8.8.8.8", 49737), node.clone()];
+        let addr = direct_dial_address(false, &advertised, &node, &advertised[0]);
+        assert_eq!((addr.host.as_str(), addr.port), ("192.168.1.20", 49737));
+    }
+
+    #[test]
+    fn lan_pick_never_dials_an_unparsable_host() {
+        let advertised = [lan_peer("not-an-ip", 1), lan_peer("10.0.0.5", 2)];
+        let addr = lan_dial_address(&advertised, &[]).unwrap();
+        assert_eq!(addr.host, "10.0.0.5");
+    }
+
+    #[test]
+    fn lan_pick_prefers_the_closest_subnet_and_skips_reserved() {
+        let advertised = [
+            lan_peer("224.0.0.1", 1),
+            lan_peer("10.0.0.5", 2),
+            lan_peer("192.168.1.9", 3),
+        ];
+        let mine = [lan_peer("192.168.1.20", 4)];
+        assert_eq!(lan_dial_address(&advertised, &mine).unwrap().port, 3);
+        assert_eq!(lan_dial_address(&advertised, &[]).unwrap().port, 2);
+    }
+
+    fn client_noise(secret: [u8; 32]) -> NoiseWrapResult {
+        NoiseWrapResult {
+            remote_public_key: [1; 32],
+            tx: [2; 32],
+            rx: [3; 32],
+            handshake_hash: [4; 64],
+            holepunch_secret: secret,
+            is_initiator: true,
+        }
+    }
+
+    fn holepunchable_server_payload() -> NoisePayload {
+        NoisePayload {
+            version: 1,
+            error: ERROR_NONE,
+            firewall: FIREWALL_UNKNOWN,
+            holepunch: Some(HolepunchInfo {
+                id: 1,
+                relays: vec![],
+            }),
+            addresses4: vec![],
+            addresses6: vec![],
+            udx: Some(UdxInfo {
+                version: 1,
+                reusable_socket: false,
+                id: 7,
+                seq: 0,
+            }),
+            secret_stream: Some(SecretStreamInfo { version: 1 }),
+            relay_through: None,
+            relay_addresses: None,
+        }
+    }
+
+    fn firewalled_local_config() -> HyperDhtConfig {
+        HyperDhtConfig {
+            dht: DhtConfig {
+                bootstrap: vec![],
+                host: "127.0.0.1".into(),
+                firewalled: true,
+                ..DhtConfig::default()
+            },
+            ..HyperDhtConfig::default()
+        }
+    }
+
+    /// A DHT node relaying PEER_HOLEPUNCH for a CONSISTENT server at
+    /// `server`: it echoes the client's token, reports the client's
+    /// reflexive address as 127.0.0.1 at the advertised puncher port, and
+    /// hands every decrypted client payload to the test.
+    async fn fake_holepunch_relay(
+        secret: [u8; 32],
+        server: Ipv4Peer,
+    ) -> (
+        Ipv4Peer,
+        mpsc::UnboundedReceiver<HolepunchPayload>,
+        JoinHandle<()>,
+    ) {
+        fake_holepunch_relay_with(secret, server, |_, _| {}).await
+    }
+
+    /// [`fake_holepunch_relay`] whose reply to each client payload passes
+    /// through `tweak` first.
+    async fn fake_holepunch_relay_with(
+        secret: [u8; 32],
+        server: Ipv4Peer,
+        tweak: fn(&HolepunchPayload, &mut HolepunchPayload),
+    ) -> (
+        Ipv4Peer,
+        mpsc::UnboundedReceiver<HolepunchPayload>,
+        JoinHandle<()>,
+    ) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let sp = SecurePayload::new(secret);
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                let Ok(crate::messages::Message::Request(req)) =
+                    crate::messages::decode_message(&buf[..n])
+                else {
+                    continue;
+                };
+                let Some(Ok(msg)) = req
+                    .value
+                    .as_deref()
+                    .map(crate::hyperdht_messages::decode_holepunch_msg_from_bytes)
+                else {
+                    continue;
+                };
+                // A relay forwards a client's round to its `peerAddress`.
+                if msg.peer_address.as_ref() != Some(&server) {
+                    continue;
+                }
+                let Ok(hp) = sp.decrypt(&msg.payload) else {
+                    continue;
+                };
+                let puncher_port = hp
+                    .addresses
+                    .as_ref()
+                    .and_then(|a| a.first())
+                    .map_or(from.port(), |a| a.port);
+                let _ = tx.send(hp.clone());
+                let mut reply = HolepunchPayload {
+                    error: ERROR_NONE,
+                    firewall: FIREWALL_CONSISTENT,
+                    round: hp.round,
+                    connected: false,
+                    punching: hp.punching,
+                    addresses: Some(vec![server.clone()]),
+                    remote_address: None,
+                    token: Some([7; 32]),
+                    remote_token: hp.token,
+                };
+                tweak(&hp, &mut reply);
+                let value = encode_holepunch_msg_to_bytes(&HolepunchMessage {
+                    mode: MODE_REPLY,
+                    id: msg.id,
+                    payload: sp.encrypt(&reply).unwrap(),
+                    peer_address: Some(server.clone()),
+                })
+                .unwrap();
+                let resp = crate::messages::Response {
+                    tid: req.tid,
+                    to: lan_peer("127.0.0.1", puncher_port),
+                    id: None,
+                    token: None,
+                    closer_nodes: vec![],
+                    error: 0,
+                    value: Some(value),
+                };
+                let bytes = crate::messages::encode_response_to_bytes(&resp).unwrap();
+                let _ = socket.send_to(&bytes, from).await;
+            }
+        });
+        (lan_peer("127.0.0.1", port), rx, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_reply_samples_our_reflexive_address_not_the_servers() {
+        let runtime = UdxRuntime::new().unwrap();
+        let (_task, dht, _events) = spawn(&runtime, firewalled_local_config()).await.unwrap();
+        // Two loopback nodes give the puncher's sampler two hits of its own
+        // mapping; the probe reply's `to` must be the third.
+        let mut nodes = Vec::new();
+        for _ in 0..2 {
+            let (task, node) = crate::rpc::spawn(
+                &runtime,
+                DhtConfig {
+                    bootstrap: vec![],
+                    host: "127.0.0.1".into(),
+                    ephemeral: Some(true),
+                    firewalled: false,
+                    ..DhtConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            dht.dht().insert_node_for_test(crate::routing_table::Node {
+                id: rand::random(),
+                host: "127.0.0.1".into(),
+                port: node.local_port().await.unwrap(),
+                token: None,
+                added_tick: 0,
+                seen_tick: 0,
+                pinged_tick: 0,
+                down_hints: 0,
+            });
+            nodes.push((task, node));
+        }
+        let secret = [5; 32];
+        let server = lan_peer("127.0.0.1", 9);
+        let (relay, mut payloads, relay_task) = fake_holepunch_relay(secret, server.clone()).await;
+        let client = {
+            let dht = dht.clone();
+            let runtime = UdxRuntime::shared(runtime.handle());
+            tokio::spawn(async move {
+                dht.run_holepunch_rounds(
+                    &client_noise(secret),
+                    &holepunchable_server_payload(),
+                    &relay,
+                    &[0; 32],
+                    &server,
+                    &runtime,
+                    1,
+                    false,
+                )
+                .await
+            })
+        };
+        let wait = std::time::Duration::from_secs(10);
+        let first = tokio::time::timeout(wait, payloads.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.round, 0);
+        let second = tokio::time::timeout(wait, payloads.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.firewall, FIREWALL_CONSISTENT,
+            "the reply's `to` (our mapping) must settle the sampler, not the server's address"
+        );
+        client.abort();
+        relay_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unknown_nat_rerolls_then_fails_with_probe_timeout() {
+        let runtime = UdxRuntime::new().unwrap();
+        let (_task, dht, _events) = spawn(&runtime, firewalled_local_config()).await.unwrap();
+        let secret = [5; 32];
+        let server = lan_peer("127.0.0.1", 9);
+        let (relay, mut payloads, relay_task) = fake_holepunch_relay(secret, server.clone()).await;
+        // No sampling nodes: our class stays UNKNOWN through every socket
+        // reroll, so `probeRound` aborts with HOLEPUNCH_PROBE_TIMEOUT.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dht.run_holepunch_rounds(
+                &client_noise(secret),
+                &holepunchable_server_payload(),
+                &relay,
+                &[0; 32],
+                &server,
+                &runtime,
+                1,
+                false,
+            ),
+        )
+        .await
+        .expect("a failed punch must not wait for the 30 s deadline");
+        assert!(matches!(result, Err(HyperDhtError::HolepunchProbeTimeout)));
+        // Finding 17: the server is told to drop its staged punch at once.
+        let mut last = None;
+        while let Ok(payload) = payloads.try_recv() {
+            last = Some(payload);
+        }
+        let last = last.expect("rounds reached the relay");
+        assert_eq!(
+            last.error, ERROR_ABORTED,
+            "the last round is the ABORTED payload"
+        );
+        relay_task.abort();
+    }
+
+    /// `n` loopback DHT nodes in `dht`'s table, so the puncher's sampler
+    /// sees a consistent mapping.
+    async fn sampling_nodes(
+        runtime: &UdxRuntime,
+        dht: &HyperDhtHandle,
+        n: usize,
+    ) -> Vec<(JoinHandle<Result<(), DhtError>>, DhtHandle)> {
+        let mut nodes = Vec::new();
+        for _ in 0..n {
+            let (task, node) = crate::rpc::spawn(
+                runtime,
+                DhtConfig {
+                    bootstrap: vec![],
+                    host: "127.0.0.1".into(),
+                    ephemeral: Some(true),
+                    firewalled: false,
+                    ..DhtConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            dht.dht().insert_node_for_test(crate::routing_table::Node {
+                id: rand::random(),
+                host: "127.0.0.1".into(),
+                port: node.local_port().await.unwrap(),
+                token: None,
+                added_tick: 0,
+                seen_tick: 0,
+                pinged_tick: 0,
+                down_hints: 0,
+            });
+            nodes.push((task, node));
+        }
+        nodes
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_error_in_the_punch_reply_is_remote_aborted_without_an_abort_round() {
+        let runtime = UdxRuntime::new().unwrap();
+        let (_task, dht, _events) = spawn(&runtime, firewalled_local_config()).await.unwrap();
+        let _nodes = sampling_nodes(&runtime, &dht, 3).await;
+        let secret = [5; 32];
+        let server = lan_peer("127.0.0.1", 9);
+        // TRY_LATER without a relay is an error like any other (Node
+        // `updateHolepunch`).
+        let (relay, mut payloads, relay_task) =
+            fake_holepunch_relay_with(secret, server.clone(), |hp, reply| {
+                if hp.punching {
+                    reply.error = ERROR_TRY_LATER;
+                }
+            })
+            .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dht.run_holepunch_rounds(
+                &client_noise(secret),
+                &holepunchable_server_payload(),
+                &relay,
+                &[0; 32],
+                &server,
+                &runtime,
+                1,
+                false,
+            ),
+        )
+        .await
+        .expect("rounds finished");
+        assert!(
+            matches!(result, Err(HyperDhtError::RemoteAborted(ERROR_TRY_LATER))),
+            "{result:?}"
+        );
+        let mut sent = Vec::new();
+        while let Ok(payload) = payloads.try_recv() {
+            sent.push(payload);
+        }
+        assert!(
+            sent.last().is_some_and(|p| p.punching),
+            "the punch round was the last"
+        );
+        assert!(
+            sent.iter().all(|p| p.error == ERROR_NONE),
+            "no ABORTED round"
+        );
+        relay_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_that_never_learns_its_nat_gets_two_probe_rounds() {
+        let runtime = UdxRuntime::new().unwrap();
+        let (_task, dht, _events) = spawn(&runtime, firewalled_local_config()).await.unwrap();
+        let _nodes = sampling_nodes(&runtime, &dht, 3).await;
+        let secret = [5; 32];
+        let server = lan_peer("127.0.0.1", 9);
+        let (relay, mut payloads, relay_task) =
+            fake_holepunch_relay_with(secret, server.clone(), |_, reply| {
+                reply.firewall = FIREWALL_UNKNOWN;
+            })
+            .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dht.run_holepunch_rounds(
+                &client_noise(secret),
+                &holepunchable_server_payload(),
+                &relay,
+                &[0; 32],
+                &server,
+                &runtime,
+                1,
+                false,
+            ),
+        )
+        .await
+        .expect("rounds finished");
+        assert!(
+            matches!(result, Err(HyperDhtError::HolepunchProbeTimeout)),
+            "{result:?}"
+        );
+        let mut sent = Vec::new();
+        while let Ok(payload) = payloads.try_recv() {
+            sent.push((payload.round, payload.error, payload.punching));
+        }
+        // Node `probeRound(.., retry = true)` then once more, then `abort`.
+        assert_eq!(
+            sent,
+            vec![
+                (0, ERROR_NONE, false),
+                (1, ERROR_NONE, false),
+                (2, ERROR_ABORTED, false)
+            ]
+        );
+        relay_task.abort();
+    }
+
+    /// A DHT node that reports a fresh port for every packet from the first
+    /// socket (other than `dht_port`) that pings it, and the true port for
+    /// every other socket: that first socket looks RANDOM, the rest
+    /// CONSISTENT. With `first` unset every socket but `dht_port` looks
+    /// RANDOM.
+    async fn fake_sampling_node(
+        dht_port: u16,
+        first: Option<Arc<Mutex<Option<u16>>>>,
+    ) -> (u16, JoinHandle<()>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                let Ok(crate::messages::Message::Request(req)) =
+                    crate::messages::decode_message(&buf[..n])
+                else {
+                    continue;
+                };
+                let lie = from.port() != dht_port
+                    && first.as_ref().is_none_or(|first| {
+                        *first.lock().unwrap().get_or_insert(from.port()) == from.port()
+                    });
+                let seen = if lie {
+                    rand::random_range(1024..=65535)
+                } else {
+                    from.port()
+                };
+                let resp = crate::messages::Response {
+                    tid: req.tid,
+                    to: lan_peer("127.0.0.1", seen),
+                    id: Some(crate::peer::peer_id("127.0.0.1", port)),
+                    token: None,
+                    closer_nodes: vec![],
+                    error: 0,
+                    value: None,
+                };
+                let bytes = crate::messages::encode_response_to_bytes(&resp).unwrap();
+                let _ = socket.send_to(&bytes, from).await;
+            }
+        });
+        (port, task)
+    }
+
+    /// Three [`fake_sampling_node`]s in `dht`'s table.
+    async fn fake_sampling_nodes(
+        dht: &HyperDhtHandle,
+        first: Option<Arc<Mutex<Option<u16>>>>,
+    ) -> Vec<JoinHandle<()>> {
+        let dht_port = dht.local_port().await.unwrap();
+        let mut nodes = Vec::new();
+        for _ in 0..3 {
+            let (port, task) = fake_sampling_node(dht_port, first.clone()).await;
+            dht.dht().insert_node_for_test(crate::routing_table::Node {
+                id: rand::random(),
+                host: "127.0.0.1".into(),
+                port,
+                token: None,
+                added_tick: 0,
+                seen_tick: 0,
+                pinged_tick: 0,
+                down_hints: 0,
+            });
+            nodes.push(task);
+        }
+        nodes
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_lan_address_does_not_stop_the_punch() {
+        let runtime = UdxRuntime::new().unwrap();
+        let (_task, dht, _events) = spawn(&runtime, firewalled_local_config()).await.unwrap();
+        let _nodes = sampling_nodes(&runtime, &dht, 3).await;
+        // The server's puncher: answers every probe.
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = lan_peer("127.0.0.1", echo.local_addr().unwrap().port());
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+                if n == 1 {
+                    let _ = echo.send_to(&[0], from).await;
+                }
+            }
+        });
+        // The LAN address the server advertised: bound, never answers.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let lan = lan_peer("127.0.0.1", silent.local_addr().unwrap().port());
+        let secret = [5; 32];
+        let (relay, _payloads, relay_task) = fake_holepunch_relay(secret, server.clone()).await;
+        let mut remote_payload = holepunchable_server_payload();
+        remote_payload.holepunch = Some(HolepunchInfo {
+            id: 1,
+            relays: vec![RelayInfo {
+                relay_address: relay.clone(),
+                peer_address: server.clone(),
+            }],
+        });
+        remote_payload.addresses4 = vec![lan];
+        // Both peers behind the same public host.
+        let dial = DirectDial {
+            dht: dht.clone(),
+            hs_result: crate::router::HandshakeResult {
+                noise: vec![],
+                relayed: true,
+                server_address: server.clone(),
+                client_address: lan_peer("127.0.0.1", 1),
+            },
+            remote_payload,
+            nw_result: client_noise(secret),
+            node: relay,
+            target: [0; 32],
+            local_stream_id: 1,
+            remote_id: 7,
+            local_connection: true,
+            has_relay: false,
+            server_dial: None,
+        };
+        let landing = tokio::time::timeout(std::time::Duration::from_secs(10), dial.run(&runtime))
+            .await
+            .expect("dial finished")
+            .expect("the punch lands");
+        assert_eq!(landing.addr, to_socket_addr(&server).unwrap());
+        echo_task.abort();
+        relay_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probes_go_through_the_servers_relay_when_ours_is_not_one() {
+        let runtime = UdxRuntime::new().unwrap();
+        let (_task, dht, _events) = spawn(&runtime, firewalled_local_config()).await.unwrap();
+        let _nodes = sampling_nodes(&runtime, &dht, 3).await;
+        let secret = [5; 32];
+        // The server as its announce relay sees it, and as our handshake
+        // node saw it.
+        let seen_by_relay = lan_peer("127.0.0.1", 9);
+        let server = lan_peer("127.0.0.1", 10);
+        let (server_relay, mut at_server_relay, a_task) =
+            fake_holepunch_relay(secret, seen_by_relay.clone()).await;
+        // Not one of the server's relays: a JS server (`server.js:543-554`
+        // `isServerRelay`) sends its token only through its own relays.
+        let (our_relay, mut at_our_relay, b_task) =
+            fake_holepunch_relay_with(secret, server.clone(), |_, reply| reply.token = None).await;
+        let mut remote_payload = holepunchable_server_payload();
+        remote_payload.holepunch = Some(HolepunchInfo {
+            id: 1,
+            relays: vec![RelayInfo {
+                relay_address: server_relay,
+                peer_address: seen_by_relay,
+            }],
+        });
+        let client = {
+            let dht = dht.clone();
+            let runtime = UdxRuntime::shared(runtime.handle());
+            tokio::spawn(async move {
+                dht.run_holepunch_rounds(
+                    &client_noise(secret),
+                    &remote_payload,
+                    &our_relay,
+                    &[0; 32],
+                    &server,
+                    &runtime,
+                    1,
+                    false,
+                )
+                .await
+            })
+        };
+        let wait = std::time::Duration::from_secs(10);
+        let punch = tokio::time::timeout(wait, at_our_relay.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            punch.punching,
+            "only the punch round goes through our relay"
+        );
+        assert_eq!(
+            punch.remote_token,
+            Some([7; 32]),
+            "the server's token, from the probe through its relay"
+        );
+        assert!(punch.token.is_some(), "our token, for the server to echo");
+        let probe = at_server_relay
+            .try_recv()
+            .expect("the probe used the server's relay");
+        assert!(!probe.punching);
+        assert!(
+            at_server_relay.try_recv().is_err(),
+            "one probe: it had the token"
+        );
+        client.abort();
+        a_task.abort();
+        b_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_puncher_socket_answers_dht_requests() {
+        let runtime = UdxRuntime::new().unwrap();
+        let (_task, dht, _events) = spawn(&runtime, firewalled_local_config()).await.unwrap();
+        let pool = SocketPool::new("127.0.0.1".into());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut puncher = Holepuncher::new(&pool, &runtime, true, true, FIREWALL_UNKNOWN, tx)
+            .await
+            .unwrap();
+        // Hooks the socket up to the DHT, as for every puncher.
+        puncher.auto_sample(dht.dht()).await;
+        let port = puncher.socket().unwrap().local_addr().await.unwrap().port();
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let request = crate::messages::encode_request_to_bytes(&crate::messages::Request {
+            tid: 4242,
+            to: lan_peer("127.0.0.1", port),
+            id: None,
+            token: None,
+            internal: true,
+            command: crate::messages::Command::Ping as u64,
+            target: None,
+            value: None,
+        })
+        .unwrap();
+        probe.send_to(&request, ("127.0.0.1", port)).await.unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), probe.recv_from(&mut buf))
+                .await
+                .expect("hyperdht's pool sockets hand requests to the DHT")
+                .unwrap();
+        let Ok(crate::messages::Message::Response(resp)) =
+            crate::messages::decode_message(&buf[..n])
+        else {
+            panic!("not a response");
+        };
+        assert_eq!(resp.tid, 4242);
+        // dht-rpc replies on the socket the request arrived on.
+        assert_eq!(from.port(), port, "the reply left the puncher socket");
+        puncher.destroy();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_local_addresses_that_hear_themselves_are_advertised() {
+        let runtime = UdxRuntime::new().unwrap();
+        let (_task, dht, _events) = spawn(&runtime, firewalled_local_config()).await.unwrap();
+        // 192.0.2.1 (TEST-NET-1) is no interface of ours: binding it fails.
+        let candidates = vec![lan_peer("127.0.0.1", 1), lan_peer("192.0.2.1", 2)];
+        let valid = dht.validate_local_addresses(candidates.clone()).await;
+        assert_eq!(valid, vec![lan_peer("127.0.0.1", 1)]);
+        // The verdict per host is cached: no second probe round.
+        let started = std::time::Instant::now();
+        assert_eq!(dht.validate_local_addresses(candidates).await, valid);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        let port = dht.local_port().await.unwrap();
+        assert_eq!(
+            dht.noise_addresses4(port).await,
+            vec![lan_peer("127.0.0.1", port)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn random_nats_on_both_sides_abort_as_double_randomized() {
+        let runtime = UdxRuntime::new().unwrap();
+        let (_task, dht, _events) = spawn(&runtime, firewalled_local_config()).await.unwrap();
+        // Every puncher socket, rerolls included, looks RANDOM.
+        let nodes = fake_sampling_nodes(&dht, None).await;
+        let secret = [5; 32];
+        let server = lan_peer("127.0.0.1", 9);
+        let (relay, mut payloads, relay_task) =
+            fake_holepunch_relay_with(secret, server.clone(), |_, reply| {
+                reply.firewall = crate::hyperdht_messages::FIREWALL_RANDOM;
+            })
+            .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dht.run_holepunch_rounds(
+                &client_noise(secret),
+                &holepunchable_server_payload(),
+                &relay,
+                &[0; 32],
+                &server,
+                &runtime,
+                1,
+                false,
+            ),
+        )
+        .await
+        .expect("rounds finished");
+        assert!(
+            matches!(result, Err(HyperDhtError::HolepunchDoubleRandomizedNats)),
+            "{result:?}"
+        );
+        let mut sent = Vec::new();
+        while let Ok(payload) = payloads.try_recv() {
+            sent.push((payload.error, payload.punching));
+        }
+        // One probe, then Node `abort`.
+        assert_eq!(sent, vec![(ERROR_NONE, false), (ERROR_ABORTED, false)]);
+        relay_task.abort();
+        for task in nodes {
+            task.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rerolled_socket_probes_again_before_the_punch() {
+        let runtime = UdxRuntime::new().unwrap();
+        let (_task, dht, _events) = spawn(&runtime, firewalled_local_config()).await.unwrap();
+        let nodes = fake_sampling_nodes(&dht, Some(Arc::new(Mutex::new(None)))).await;
+        let secret = [5; 32];
+        let server = lan_peer("127.0.0.1", 9);
+        // A RANDOM server and our RANDOM first socket: unstable, so the
+        // puncher rerolls to a socket the nodes see as CONSISTENT.
+        let (relay, mut payloads, relay_task) =
+            fake_holepunch_relay_with(secret, server.clone(), |_, reply| {
+                reply.firewall = crate::hyperdht_messages::FIREWALL_RANDOM;
+            })
+            .await;
+        let client = {
+            let dht = dht.clone();
+            let runtime = UdxRuntime::shared(runtime.handle());
+            tokio::spawn(async move {
+                dht.run_holepunch_rounds(
+                    &client_noise(secret),
+                    &holepunchable_server_payload(),
+                    &relay,
+                    &[0; 32],
+                    &server,
+                    &runtime,
+                    1,
+                    false,
+                )
+                .await
+            })
+        };
+        let wait = std::time::Duration::from_secs(10);
+        let first_probe = tokio::time::timeout(wait, payloads.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (first_probe.punching, first_probe.firewall),
+            (false, crate::hyperdht_messages::FIREWALL_RANDOM)
+        );
+        let next = tokio::time::timeout(wait, payloads.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Node re-runs `probeRound` from the new socket before `roundPunch`.
+        assert_eq!(
+            (next.round, next.punching, next.firewall),
+            (1, false, FIREWALL_CONSISTENT)
+        );
+        client.abort();
+        relay_task.abort();
+        for task in nodes {
+            task.abort();
+        }
+    }
+
+    /// A DHT node that answers every request with a token and its real id,
+    /// but rejects ANNOUNCE with error 1.
+    async fn fake_rejecting_node() -> (String, JoinHandle<()>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                let Ok(crate::messages::Message::Request(req)) =
+                    crate::messages::decode_message(&buf[..n])
+                else {
+                    continue;
+                };
+                let resp = crate::messages::Response {
+                    tid: req.tid,
+                    to: lan_peer("127.0.0.1", from.port()),
+                    id: Some(crate::peer::peer_id("127.0.0.1", port)),
+                    token: Some([9; 32]),
+                    closer_nodes: vec![],
+                    error: u64::from(req.command == ANNOUNCE),
+                    value: None,
+                };
+                let bytes = crate::messages::encode_response_to_bytes(&resp).unwrap();
+                let _ = socket.send_to(&bytes, from).await;
+            }
+        });
+        (format!("127.0.0.1:{port}"), task)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fast_bogus_handshake_reply_does_not_beat_the_honest_one() {
+        let runtime = UdxRuntime::new().unwrap();
+        let open = || HyperDhtConfig {
+            dht: DhtConfig {
+                bootstrap: vec![],
+                host: "127.0.0.1".into(),
+                ephemeral: Some(false),
+                firewalled: false,
+                ..DhtConfig::default()
+            },
+            ..HyperDhtConfig::default()
+        };
+        let (_s, server_dht, events) = spawn(&runtime, open()).await.unwrap();
+        let (_c, client, _ce) = spawn(&runtime, open()).await.unwrap();
+        let keys = KeyPair::generate();
+        let mut server = server_dht.create_server(
+            &runtime,
+            ServerConfig::new(keys.clone(), FIREWALL_UNKNOWN),
+            events,
+        );
+        server.listen(&keys).await.unwrap();
+        let honest = lan_peer("127.0.0.1", server_dht.local_port().await.unwrap());
+
+        // Answers every request at once with a well-formed REPLY whose
+        // Noise message is garbage.
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bogus = lan_peer("127.0.0.1", socket.local_addr().unwrap().port());
+        let liar = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                let Ok(crate::messages::Message::Request(req)) =
+                    crate::messages::decode_message(&buf[..n])
+                else {
+                    continue;
+                };
+                let value = encode_handshake_to_bytes(&HandshakeMessage {
+                    mode: MODE_REPLY,
+                    noise: vec![7; 96],
+                    peer_address: None,
+                    relay_address: None,
+                })
+                .unwrap();
+                let resp = crate::messages::Response {
+                    tid: req.tid,
+                    to: lan_peer("127.0.0.1", from.port()),
+                    id: None,
+                    token: None,
+                    closer_nodes: vec![],
+                    error: 0,
+                    value: Some(value),
+                };
+                let bytes = crate::messages::encode_response_to_bytes(&resp).unwrap();
+                let _ = socket.send_to(&bytes, from).await;
+            }
+        });
+
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.connect_with_nodes(
+                &KeyPair::generate(),
+                keys.public_key,
+                &[bogus, honest.clone()],
+                &runtime,
+            ),
+        )
+        .await
+        .expect("connect finished")
+        .expect("connect through the honest node");
+        assert_eq!(conn.remote_public_key, keys.public_key);
+        assert_eq!(conn.remote_addr.map(|a| a.port()), Some(honest.port));
+        liar.abort();
+        server.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_client_waits_for_the_server_to_dial_it() {
+        let runtime = UdxRuntime::new().unwrap();
+        let node = |bootstrap: Vec<String>, firewalled: bool| HyperDhtConfig {
+            dht: DhtConfig {
+                bootstrap,
+                host: "127.0.0.1".into(),
+                firewalled,
+                quick_firewall: false,
+                ephemeral: Some(firewalled),
+                ..DhtConfig::default()
+            },
+            ..HyperDhtConfig::default()
+        };
+        let (_b1t, b1, _) = spawn(&runtime, node(vec![], false)).await.unwrap();
+        let boot = vec![format!("127.0.0.1:{}", b1.local_port().await.unwrap())];
+        let (_b2t, b2, _) = spawn(&runtime, node(boot.clone(), false)).await.unwrap();
+        let (_b3t, b3, _) = spawn(&runtime, node(boot.clone(), false)).await.unwrap();
+        b2.bootstrapped().await.unwrap();
+        b3.bootstrapped().await.unwrap();
+
+        let (_st, server_dht, events) = spawn(&runtime, node(boot.clone(), true)).await.unwrap();
+        server_dht.fully_bootstrapped().await.unwrap();
+        let keys = KeyPair::generate();
+        let mut server = server_dht.create_server(
+            &runtime,
+            ServerConfig::new(keys.clone(), FIREWALL_UNKNOWN),
+            events,
+        );
+        server.listen(&keys).await.unwrap();
+
+        // A reachable client whose address the DHT knows says OPEN.
+        let (_ct, client, _) = spawn(&runtime, node(boot, false)).await.unwrap();
+        client.fully_bootstrapped().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while client.remote_address().await.unwrap().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the client learns its address");
+
+        let opts = ConnectOpts {
+            local_connection: false,
+            ..ConnectOpts::default()
+        };
+        let wait = std::time::Duration::from_secs(15);
+        let mut conn = tokio::time::timeout(
+            wait,
+            client.connect_with_options(&KeyPair::generate(), keys.public_key, &[], &runtime, opts),
+        )
+        .await
+        .expect("connect finished")
+        .expect("the server's dial connects us");
+        // The stream came from the server's DHT socket (its dial), not from
+        // a puncher socket.
+        let dialled_from = server_dht
+            .server_socket()
+            .await
+            .unwrap()
+            .unwrap()
+            .local_addr()
+            .await
+            .unwrap()
+            .port();
+        assert_eq!(conn.remote_addr.map(|a| a.port()), Some(dialled_from));
+        let mut accepted = tokio::time::timeout(wait, server.accept())
+            .await
+            .expect("server accepted")
+            .expect("a connection");
+        conn.stream.write(b"open").await.unwrap();
+        let got = tokio::time::timeout(wait, accepted.stream.read())
+            .await
+            .expect("data arrived")
+            .unwrap();
+        assert_eq!(got.as_deref(), Some(&b"open"[..]));
+        server.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_direct_handshake_to_either_dht_socket_connects() {
+        let runtime = UdxRuntime::new().unwrap();
+        // Firewalled, so requests leave the client socket and the node
+        // listens on its server socket: two sockets, two ports.
+        let (_s, server_dht, events) = spawn(&runtime, firewalled_local_config()).await.unwrap();
+        let (_c, client, _ce) = spawn(&runtime, firewalled_local_config()).await.unwrap();
+        let keys = KeyPair::generate();
+        let mut server = server_dht.create_server(
+            &runtime,
+            ServerConfig::new(keys.clone(), FIREWALL_UNKNOWN),
+            events,
+        );
+        server.listen(&keys).await.unwrap();
+        let mut ports = Vec::new();
+        for socket in [
+            server_dht.server_socket().await.unwrap(),
+            server_dht.listen_socket().await.unwrap(),
+        ] {
+            ports.push(socket.unwrap().local_addr().await.unwrap().port());
+        }
+        assert_ne!(ports[0], ports[1], "the node has two DHT sockets");
+
+        let wait = std::time::Duration::from_secs(10);
+        for port in ports {
+            let addr = SocketAddr::new("127.0.0.1".parse().unwrap(), port);
+            let mut conn = tokio::time::timeout(
+                wait,
+                client.connect_to(&KeyPair::generate(), keys.public_key, addr, &runtime),
+            )
+            .await
+            .expect("connect finished")
+            .expect("a direct handshake connects");
+            // Node `connectThroughNode`: the exact address the handshake went to.
+            assert_eq!(conn.remote_addr, Some(addr));
+            let mut accepted = tokio::time::timeout(wait, server.accept())
+                .await
+                .expect("server accepted")
+                .expect("a connection");
+            conn.stream.write(b"direct").await.unwrap();
+            let got = tokio::time::timeout(wait, accepted.stream.read())
+                .await
+                .expect("data arrived")
+                .unwrap();
+            assert_eq!(got.as_deref(), Some(&b"direct"[..]));
+        }
+        server.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listen_in_background_does_not_wait_for_the_first_announce() {
+        let runtime = UdxRuntime::new().unwrap();
+        // A bootstrap node that never answers keeps the announce query busy
+        // for seconds.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = firewalled_local_config();
+        config.dht.bootstrap = vec![silent.local_addr().unwrap().to_string()];
+        let (_task, dht, events) = spawn(&runtime, config).await.unwrap();
+        let keys = KeyPair::generate();
+        let mut server = dht.create_server(
+            &runtime,
+            ServerConfig::new(keys.clone(), FIREWALL_UNKNOWN),
+            events,
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            server.listen_in_background(&keys),
+        )
+        .await
+        .expect("listen_in_background waited on the DHT")
+        .expect("listen");
+        assert!(server.listening());
+        server.suspend().await.expect("suspend");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            server.resume_in_background(),
+        )
+        .await
+        .expect("resume_in_background waited on the DHT")
+        .expect("resume");
+        server.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn announce_fails_when_every_write_fails() {
+        let runtime = UdxRuntime::new().unwrap();
+        let (node, node_task) = fake_rejecting_node().await;
+        let mut config = firewalled_local_config();
+        config.dht.bootstrap = vec![node];
+        let (_task, dht, _events) = spawn(&runtime, config).await.unwrap();
+        let keys = KeyPair::generate();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            dht.announce(hash(&keys.public_key), &keys, &[]),
+        )
+        .await
+        .expect("announce finished");
+        assert!(matches!(result, Err(HyperDhtError::TooFewNodesResponded)));
+        assert!(dht.current_relays().is_empty());
+        node_task.abort();
     }
 
     #[test]

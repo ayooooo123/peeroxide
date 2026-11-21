@@ -280,7 +280,7 @@ impl Query {
                         from: data.from.clone(),
                         from_id: data.from_id,
                         token: data.token,
-                        closer_nodes: data.closer_nodes.clone(),
+                        closer_nodes: data.closer_nodes.iter().take(K).cloned().collect(),
                         error: data.error,
                         value: data.value,
                         rtt: data.rtt,
@@ -293,7 +293,7 @@ impl Query {
 
         // Add suggested closer nodes.  Stop when one is not closer (JS break).
         let mut extra: Vec<QueryRequest> = Vec::new();
-        for node in &data.closer_nodes {
+        for node in data.closer_nodes.iter().take(K) {
             let node_id = peer_id(&node.host, node.port);
             if node_id == self.own_id {
                 continue;
@@ -717,7 +717,7 @@ async fn resolve_one_bootstrap(s: &str) -> Option<(String, u16)> {
 async fn dns_resolve(hostname: &str, port: u16) -> Option<(String, u16)> {
     match tokio::net::lookup_host(format!("{hostname}:{port}")).await {
         Ok(mut addrs) => {
-            let addr = addrs.find(|a| a.is_ipv4()).or_else(|| addrs.next())?;
+            let addr = addrs.find(|address| address.is_ipv4())?;
             tracing::debug!(%hostname, %addr, "resolved bootstrap node via DNS");
             Some((addr.ip().to_string(), addr.port()))
         }

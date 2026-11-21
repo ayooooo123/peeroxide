@@ -10,6 +10,8 @@ use crate::hyperdht_messages::{
 use crate::messages::Ipv4Peer;
 
 const DEFAULT_FORWARD_TTL: Duration = Duration::from_secs(20 * 60);
+/// hyperdht `defaultCacheOpts` `router.forwards.maxSize`.
+const MAX_FORWARDS: usize = 65536;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -100,8 +102,30 @@ impl Router {
         }
     }
 
+    /// Insert a forward. At 65536 entries the older half of the
+    /// announce entries is dropped first, as xache drops its oldest
+    /// generation; server entries are never evicted (xache `retain`).
     pub fn set(&mut self, target: &[u8; 32], entry: ForwardEntry) {
+        if self.forwards.len() >= MAX_FORWARDS && !self.forwards.contains_key(target) {
+            self.evict_oldest_half();
+        }
         self.forwards.insert(*target, entry);
+    }
+
+    fn evict_oldest_half(&mut self) {
+        let mut ages: Vec<Instant> = self
+            .forwards
+            .values()
+            .filter(|e| !e.has_server)
+            .map(|e| e.inserted)
+            .collect();
+        if ages.is_empty() {
+            return;
+        }
+        let mid = ages.len() / 2;
+        let (_, &mut cutoff, _) = ages.select_nth_unstable(mid);
+        self.forwards
+            .retain(|_, e| e.has_server || e.inserted > cutoff);
     }
 
     pub fn get(&self, target: &[u8; 32]) -> Option<&ForwardEntry> {
@@ -418,6 +442,39 @@ mod tests {
         );
 
         assert!(router.get(&key).is_none());
+    }
+
+    #[test]
+    fn announce_forwards_are_capped_and_keep_servers() {
+        let mut router = Router::new();
+        let base = Instant::now();
+        let server = [0xff; 32];
+        router.set(
+            &server,
+            ForwardEntry {
+                relay: None,
+                has_server: true,
+                inserted: base,
+            },
+        );
+        for i in 0..MAX_FORWARDS as u32 + 1 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_le_bytes());
+            router.set(
+                &key,
+                ForwardEntry {
+                    relay: None,
+                    has_server: false,
+                    inserted: base + Duration::from_micros(u64::from(i)),
+                },
+            );
+        }
+        assert!(router.forwards.len() <= MAX_FORWARDS);
+        assert!(router.get(&server).is_some(), "server entries are retained");
+        let newest = (MAX_FORWARDS as u32).to_le_bytes();
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(&newest);
+        assert!(router.get(&key).is_some(), "the newest entry survives");
     }
 
     #[test]

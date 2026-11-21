@@ -1,12 +1,15 @@
-//! M6.8d: Two Rust HyperDHT nodes complete a Noise IK handshake via PEER_HANDSHAKE.
+//! M6.8d: a Rust client completes a Noise IK handshake with a Rust
+//! `HyperDhtServer` via PEER_HANDSHAKE.
 
 use std::time::Duration;
 
 use libudx::UdxRuntime;
 use peeroxide_dht::Router;
 use peeroxide_dht::crypto::hash;
-use peeroxide_dht::hyperdht::{HyperDhtConfig, KeyPair, ServerConfig, run_server, spawn};
-use peeroxide_dht::hyperdht_messages::{FIREWALL_UNKNOWN, NoisePayload, PEER_HANDSHAKE};
+use peeroxide_dht::hyperdht::{HyperDhtConfig, KeyPair, ServerConfig, spawn};
+use peeroxide_dht::hyperdht_messages::{
+    FIREWALL_UNKNOWN, NoisePayload, PEER_HANDSHAKE, SecretStreamInfo, UdxInfo,
+};
 use peeroxide_dht::messages::Ipv4Peer;
 use peeroxide_dht::noise::Keypair as NoiseKeypair;
 use peeroxide_dht::noise_wrap::NoiseWrap;
@@ -59,23 +62,17 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut srv_config = HyperDhtConfig::default();
     srv_config.dht = srv_dht;
-    let (_srv_join, srv_handle, srv_rx) = spawn(&rt, srv_config).await?;
+    let (_srv_join, srv_handle, srv_events) = spawn(&rt, srv_config).await?;
     let srv_port = srv_handle.dht().local_port().await?;
     tracing::info!(srv_port, "server node ready");
 
     let server_kp = KeyPair::generate();
     let target = hash(&server_kp.public_key);
 
-    srv_handle.register_server(&server_kp.public_key);
-
-    let server_config = ServerConfig::new(server_kp.clone(), 0);
+    let server_config = ServerConfig::new(server_kp.clone(), FIREWALL_UNKNOWN);
     let server_rt = UdxRuntime::new()?;
-    let server_task = tokio::spawn(run_server(
-        srv_rx,
-        server_config,
-        server_rt,
-        srv_handle.dht().clone(),
-    ));
+    let mut server = srv_handle.create_server(&server_rt, server_config, srv_events);
+    server.listen_in_background(&server_kp).await?;
 
     // ── 3. Client node ────────────────────────────────────────────────────
     let mut cli_dht = DhtConfig::default();
@@ -103,8 +100,15 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
         holepunch: None,
         addresses4: vec![],
         addresses6: vec![],
-        udx: None,
-        secret_stream: None,
+        // A real client's stream id; `HyperDhtServer` aborts without one
+        // (hyperdht `server.js` `remotePayload.udx ? NONE : ABORTED`).
+        udx: Some(UdxInfo {
+            version: 1,
+            reusable_socket: false,
+            id: 1,
+            seq: 0,
+        }),
+        secret_stream: Some(SecretStreamInfo { version: 1 }),
         relay_through: None,
         relay_addresses: None,
     };
@@ -175,12 +179,10 @@ async fn run_handshake_test() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ── Cleanup ───────────────────────────────────────────────────────────
+    server.close().await;
     cli_handle.destroy().await?;
     srv_handle.destroy().await?;
     bs_handle.destroy().await?;
-
-    server_task.abort();
-    let _ = server_task.await;
 
     Ok(())
 }

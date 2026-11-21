@@ -13,12 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A server connection rejected as a duplicate now probes the connection the swarm keeps with an empty keep-alive message (hyperswarm `existing.sendKeepAlive()`), so a dead kept connection is found soon.
 - Closed inbound and outbound connections release their connection-set slot, allowing the same Rust or Node peer to reconnect.
 - Dead stream handles are pruned; relay selection follows hyperswarm's forced/randomized-NAT semantics.
 - Adopt shared `HyperDhtServer` for Hyperswarm server connections, eliminating obsolete custom server handshakes, passive holepunch staging, and duplicate caches.
 - Lifecycle generation protection covers both incoming server connections and outgoing asynchronous dials to prevent stale completions from retiring replacements, overwriting current connections, or decrementing active connection counters for subsequent attempts.
 - Dead connection streams are retired prior to duplicate tie-break so immediate redials with close notifications queued behind them are accepted; abort registries are pruned on stream close.
 - Preserve topic-refresh flush completion when using the shared server.
+- Swarm connection bookkeeping now deduplicates in-flight dials and open streams together, releases dial slots after duplicate handshakes, retries closed initiator streams, enforces `max_peers` before dialing, and removes idle peer records.
+- `flush()` now completes with no topics or after `leave()`, and waits for queued dials from the completed refresh.
+- Rejoining a topic unions client/server roles. Leaving a server topic unannounces it.
+- Topic discovery no longer duplicates the server's public-key announce.
+- Corrected lifecycle documentation to state that suspend and destroy abort delivered connections.
 
 ## [1.7.4](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.7.3...peeroxide-v1.7.4) - 2026-11-02
 

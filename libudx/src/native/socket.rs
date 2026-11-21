@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
+use super::stream::StreamEntry;
 use crate::error::{Result, UdxError};
 
 /// An incoming unreliable datagram received on a [`UdxSocket`].
@@ -18,7 +19,7 @@ pub struct Datagram {
 struct UdxSocketInner {
     udp: Mutex<Option<Arc<super::udp::Udp>>>,
     recv_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    streams: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<super::stream::IncomingPacket>>>>,
+    streams: Arc<Mutex<HashMap<u32, StreamEntry>>>,
     fallback_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Datagram>>>>,
 }
 
@@ -64,7 +65,17 @@ impl UdxSocketInner {
             // once stream traffic arrives.
             let mut bufs = vec![vec![0u8; DATAGRAM_SIZE]];
             let mut datagrams = Vec::new();
-            'receive: while udp.recv_batch(&mut bufs, &mut datagrams).await.is_ok() {
+            'receive: loop {
+                if let Err(err) = udp.recv_batch(&mut bufs, &mut datagrams).await {
+                    // C logs a receive error and keeps reading (udx.c:1950).
+                    // Only a socket that can no longer name itself is gone.
+                    if udp.local_addr().is_err() {
+                        break;
+                    }
+                    tracing::debug!(%err, "udx: recv error");
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 let mut stream_packet = false;
                 for (index, range, addr) in datagrams.drain(..) {
                     let packet = bufs[index][range].to_vec();
@@ -72,17 +83,30 @@ impl UdxSocketInner {
                     if packet.len() >= super::header::HEADER_SIZE {
                         if let Ok(hdr) = super::header::Header::decode(&packet) {
                             let guard = streams.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(tx) = guard.get(&hdr.remote_id) {
-                                let Some(inner) = socket.upgrade() else {
-                                    break 'receive;
-                                };
-                                stream_packet = true;
-                                let _ = tx.send(super::stream::IncomingPacket {
-                                    data: packet,
-                                    addr,
-                                    socket: UdxSocket { inner },
-                                });
-                                continue;
+                            match guard.get(&hdr.remote_id) {
+                                Some(StreamEntry::Stream(tx)) => {
+                                    let Some(inner) = socket.upgrade() else {
+                                        break 'receive;
+                                    };
+                                    stream_packet = true;
+                                    // A full queue drops the packet like any UDP
+                                    // overflow; the sender retransmits.
+                                    let _ = tx.try_send(super::stream::IncomingPacket {
+                                        data: packet,
+                                        addr,
+                                        socket: UdxSocket { inner },
+                                    });
+                                    continue;
+                                }
+                                // C `process_timewait`: answered or ignored,
+                                // never handed on.
+                                Some(StreamEntry::Timewait(timewait)) => {
+                                    let timewait = Arc::clone(timewait);
+                                    drop(guard);
+                                    timewait.answer(hdr.type_flags);
+                                    continue;
+                                }
+                                None => {}
                             }
                         }
                     }
@@ -195,10 +219,10 @@ impl UdxSocket {
     pub(crate) fn register_stream(
         &self,
         local_id: u32,
-        tx: mpsc::UnboundedSender<super::stream::IncomingPacket>,
+        tx: mpsc::Sender<super::stream::IncomingPacket>,
     ) -> Result<()> {
         let mut streams = self.inner.streams.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = streams.get(&local_id) {
+        if let Some(StreamEntry::Stream(existing)) = streams.get(&local_id) {
             if existing.same_channel(&tx) {
                 drop(streams);
                 self.inner.ensure_recv_loop(self)?;
@@ -211,15 +235,14 @@ impl UdxSocket {
                 )));
             }
         }
-        streams.insert(local_id, tx);
+        // A timewait entry gives way to the new stream (C `udx_stream_init`).
+        streams.insert(local_id, StreamEntry::Stream(tx));
         drop(streams);
         self.inner.ensure_recv_loop(self)?;
         Ok(())
     }
 
-    pub(crate) fn streams_ref(
-        &self,
-    ) -> Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<super::stream::IncomingPacket>>>> {
+    pub(crate) fn streams_ref(&self) -> Arc<Mutex<HashMap<u32, StreamEntry>>> {
         Arc::clone(&self.inner.streams)
     }
 
@@ -367,8 +390,8 @@ mod tests {
             .await
             .expect("bind");
 
-        let (tx1, rx1) = mpsc::unbounded_channel();
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let (tx1, rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
 
         // 1. Initial registration of tx1 at ID 10 succeeds
         socket

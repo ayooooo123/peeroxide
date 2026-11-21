@@ -15,9 +15,10 @@
 use blake2::Blake2bMac;
 use blake2::digest::consts::U32;
 use blake2::digest::{KeyInit, Mac};
+use crypto_secretbox::aead::AeadInPlace;
+use crypto_secretbox::{Nonce, Tag, XSalsa20Poly1305};
 use rand::RngCore;
-use xsalsa20poly1305::aead::AeadInPlace;
-use xsalsa20poly1305::{Nonce, Tag, XSalsa20Poly1305};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::compact_encoding::EncodingError;
 use crate::hyperdht_messages::{self, HolepunchPayload};
@@ -40,6 +41,7 @@ pub enum SecurePayloadError {
     BufferTooShort,
 }
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SecurePayload {
     shared_secret: [u8; 32],
     local_secret: [u8; 32],
