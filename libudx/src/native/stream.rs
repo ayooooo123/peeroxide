@@ -2171,6 +2171,8 @@ impl UdxStream {
     }
 
     /// Write `data` reliably. Resolves when the remote peer ACKs all of it.
+    /// The peer advertises only the room that its reader has left, so a write that is larger
+    /// than the peer's receive window resolves only while the peer reads.
     /// An empty write resolves with the next packet sent (C semantics).
     pub async fn write(&self, data: &[u8]) -> Result<()> {
         let (tx, rx) = oneshot::channel();
