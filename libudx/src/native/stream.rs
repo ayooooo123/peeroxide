@@ -132,8 +132,17 @@ fn seq_after(a: u32, b: u32) -> bool {
 
 // ── Packet types ─────────────────────────────────────────────────────────────
 
+/// One datagram routed to a stream's processor.
+///
+/// The socket demux decodes the header once, so the header travels beside a
+/// body that holds the datagram from byte `HEADER_SIZE` on. Positions inside
+/// `body` are the wire positions minus `HEADER_SIZE`: the payload starts at
+/// `header.data_offset as usize`, and the SACK region is
+/// `header.sack_region(HEADER_SIZE + body.len())` shifted down by
+/// `HEADER_SIZE`.
 pub(crate) struct IncomingPacket {
-    pub data: Vec<u8>,
+    pub header: Header,
+    pub body: Vec<u8>,
     #[allow(dead_code)]
     pub addr: SocketAddr,
     /// The socket the datagram arrived on: the firewall hook commits to it,
@@ -2625,6 +2634,9 @@ async fn process_incoming(
     // Set when the owner dropped the stream: DESTROY once the queue is sent.
     let mut destroy_when_sent = false;
     let mut read_events = Vec::new();
+    // The datagram that a relay forwards, put together again from header and
+    // body. Kept between packets so that forwarding does not allocate.
+    let mut relay_datagram = Vec::new();
     // In-order DATA packets received since the last ACK went out.
     let mut pending_acks = 0u32;
     // Zero-window probes sent since the peer last advertised a window.
@@ -2665,14 +2677,9 @@ async fn process_incoming(
             packet = incoming_rx.recv() => {
                 let Some(packet) = packet else { break };
 
-                // ── Header decode (early — defense in depth) ─────────
-                // The socket-layer demux (`UdxSocket::ensure_recv_loop`) only
-                // routes packets whose header magic+version pass `Header::decode`,
-                // so reaching this point implies a well-formed UDX header.
-                let header = match Header::decode(&packet.data) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
+                // The socket demux (`UdxSocket::ensure_recv_loop`) decoded
+                // this header once, before routing the packet here.
+                let header = packet.header;
 
                 // ── Firewall hook: commit peer and socket ───────────────
                 // C libudx udx.c:1643-1650 consults the hook while the
@@ -2775,10 +2782,15 @@ async fn process_incoming(
                 // never hold one stream lock while taking the other.
                 if let Some(target) = relay_target {
                     let destination = target.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    let mut fwd = packet.data;
                     if let Some((dest_remote_id, dest_addr, dest_udp)) = destination {
-                        fwd[4..8].copy_from_slice(&dest_remote_id.to_le_bytes());
-                        let _ = dest_udp.send_to(&fwd, dest_addr).await;
+                        // The header travels beside the body, so the datagram
+                        // is put together again with the destination's remote
+                        // id; every other byte is the byte that arrived.
+                        relay_datagram.clear();
+                        relay_datagram.extend_from_slice(&header.encode());
+                        relay_datagram[4..8].copy_from_slice(&dest_remote_id.to_le_bytes());
+                        relay_datagram.extend_from_slice(&packet.body);
+                        let _ = dest_udp.send_to(&relay_datagram, dest_addr).await;
                     }
                     if header.has_flag(FLAG_DESTROY) {
                         tracing::debug!("relay: DESTROY received, closing relay stream");
@@ -2798,10 +2810,14 @@ async fn process_incoming(
                 // ── ACK + SACK processing ────────────────────────────
                 // Decode SACK ranges from wire format (outside lock). C libudx
                 // sends them with data_offset = 0, so the region is derived
-                // from the packet length, not from data_offset alone.
+                // from the packet length, not from data_offset alone. The
+                // region is a wire position; shift it into the body.
                 let sack_ranges = header
-                    .sack_region(packet.data.len())
-                    .and_then(|region| decode_sack(&packet.data[region]).ok());
+                    .sack_region(HEADER_SIZE + packet.body.len())
+                    .and_then(|region| {
+                        decode_sack(&packet.body[region.start - HEADER_SIZE..region.end - HEADER_SIZE])
+                            .ok()
+                    });
 
                 let (outcome, outgoing_empty, rto, tlp, send_pending, end_acked_now, remote_ended, udp) = {
                     let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -2868,16 +2884,20 @@ async fn process_incoming(
                 // A MESSAGE payload for `recv_message` (C `on_recv`,
                 // udx.c:1699-1707); C drops one whose data_offset runs past it.
                 let message = (header.has_flag(FLAG_MESSAGE)
-                    && header.payload_offset() <= packet.data.len())
-                .then(|| packet.data[header.payload_offset()..].to_vec());
+                    && header.data_offset as usize <= packet.body.len())
+                .then(|| packet.body[header.data_offset as usize..].to_vec());
 
                 // ── DATA / END processing (unified — handles combined DATA+END packets) ──
                 let is_data = header.has_flag(FLAG_DATA);
                 let is_end = header.has_flag(FLAG_END);
                 if is_data || is_end {
-                    let payload_start = header.payload_offset();
-                    let mut payload = packet.data;
-                    drop(payload.drain(..payload_start.min(payload.len())));
+                    // SACK bytes or MTU-probe padding sit before the payload;
+                    // with data_offset 0 nothing is removed from the front.
+                    let skip = (header.data_offset as usize).min(packet.body.len());
+                    let mut payload = packet.body;
+                    if skip > 0 {
+                        drop(payload.drain(..skip));
+                    }
                     let recv_flags = (if is_data { FLAG_DATA } else { 0 })
                         | (if is_end { FLAG_END } else { 0 });
 
@@ -4159,6 +4179,142 @@ mod abort_tests {
             .expect("the hole was not resent before the RTO");
         assert!(resent.has_flag(FLAG_DATA));
         assert_eq!(resent.seq, hole);
+    }
+
+    /// A DATA packet with SACK bytes in front of its payload (data_offset > 0)
+    /// and one with data_offset 0 must each deliver exactly their payload.
+    /// Wrong body arithmetic after the header left the buffer would leak the
+    /// SACK bytes into the payload or cut its first `data_offset` bytes.
+    #[tokio::test]
+    async fn data_payload_starts_after_data_offset_in_the_body() {
+        let (_runtime, socket, mut stream, peer) = raw_peer_stream().await;
+        let to = socket.local_addr().await.unwrap();
+        let packet = |seq: u32, type_flags: u8, data_offset: u8, prefix: &[u8], payload: &[u8]| {
+            let mut bytes = Header {
+                type_flags,
+                data_offset,
+                remote_id: 5,
+                recv_window: DEFAULT_RWND,
+                seq,
+                ack: 0,
+            }
+            .encode()
+            .to_vec();
+            bytes.extend_from_slice(prefix);
+            bytes.extend_from_slice(payload);
+            bytes
+        };
+        // Seq 0 carries a SACK block before its payload.
+        peer.send_to(&packet(0, FLAG_DATA | FLAG_SACK, 8, &[0; 8], b"alpha"), to)
+            .await
+            .unwrap();
+        // Seq 1 has nothing in front of its payload.
+        peer.send_to(&packet(1, FLAG_DATA, 0, &[], b"beta"), to)
+            .await
+            .unwrap();
+
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read())
+            .await
+            .expect("seq 0 was not delivered")
+            .expect("read error");
+        assert_eq!(read.as_deref(), Some(&b"alpha"[..]));
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read())
+            .await
+            .expect("seq 1 was not delivered")
+            .expect("read error");
+        assert_eq!(read.as_deref(), Some(&b"beta"[..]));
+    }
+
+    /// A MESSAGE packet whose data_offset runs past its body must be dropped:
+    /// delivering it, or cutting the payload of a correct one, is the wrong
+    /// behaviour this catches. The correct MESSAGE after it arrives whole.
+    #[tokio::test]
+    async fn message_with_data_offset_past_body_is_dropped() {
+        let (_runtime, socket, stream, peer) = raw_peer_stream().await;
+        let to = socket.local_addr().await.unwrap();
+        let remote = stream.remote_handle();
+        let message = |data_offset: u8, body: &[u8]| {
+            let mut packet = Header {
+                type_flags: FLAG_MESSAGE,
+                data_offset,
+                remote_id: 5,
+                recv_window: DEFAULT_RWND,
+                seq: 0,
+                ack: 0,
+            }
+            .encode()
+            .to_vec();
+            packet.extend_from_slice(body);
+            packet
+        };
+        // data_offset 10 with a 5-byte body runs past the packet.
+        peer.send_to(&message(10, b"short"), to).await.unwrap();
+        peer.send_to(&message(3, b"...whole"), to).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(1), remote.recv_message())
+            .await
+            .expect("no message")
+            .expect("message error");
+        assert_eq!(first, b"whole");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), remote.recv_message())
+                .await
+                .is_err(),
+            "the over-long MESSAGE was delivered"
+        );
+    }
+
+    /// C `send_ack` sends SACK blocks with data_offset = 0. An ACK in that
+    /// form must still mark the ranges: shifting the SACK region into the body
+    /// must not read the header bytes or miss the block.
+    #[tokio::test]
+    async fn ack_with_sack_ranges_and_zero_data_offset_marks_them() {
+        use tokio::io::AsyncWriteExt;
+        let (_runtime, _socket, stream, peer) = raw_peer_stream().await;
+        let inner = Arc::clone(&stream.inner);
+        let mut stream = stream.into_async_stream();
+        stream.write_all(&[7u8; 2 * MAX_PAYLOAD]).await.unwrap();
+        let mut from = None;
+        for _ in 0..2 {
+            let (header, addr) = recv_header(&peer, Duration::from_secs(1))
+                .await
+                .expect("two DATA packets");
+            assert!(header.has_flag(FLAG_DATA));
+            from = Some(addr);
+        }
+        let mut sack = Header {
+            type_flags: FLAG_SACK,
+            data_offset: 0,
+            remote_id: 5,
+            recv_window: DEFAULT_RWND,
+            seq: 0,
+            ack: 0,
+        }
+        .encode()
+        .to_vec();
+        sack.resize(HEADER_SIZE + 16, 0);
+        encode_sack(
+            &[
+                SackRange { start: 0, end: 1 },
+                SackRange { start: 1, end: 2 },
+            ],
+            &mut sack[HEADER_SIZE..],
+        );
+        peer.send_to(&sack, from.unwrap()).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let sacked = {
+                    let inner = inner.lock().unwrap_or_else(|e| e.into_inner());
+                    (0u32..2).all(|seq| inner.outgoing.get(&seq).is_some_and(|pkt| pkt.sacked))
+                };
+                if sacked {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("SACK ranges with data_offset 0 did not mark the packets");
     }
 
     /// C `process_packet` hands a MESSAGE payload to `on_recv`

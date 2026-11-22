@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use super::stream::StreamEntry;
+use super::stream::{StreamEntry, Timewait};
 use crate::error::{Result, UdxError};
 
 /// An incoming unreliable datagram received on a [`UdxSocket`].
@@ -16,11 +17,25 @@ pub struct Datagram {
     pub addr: SocketAddr,
 }
 
+/// What the receive loop does with one datagram.
+enum Route {
+    /// Handed to a live stream's queue.
+    Stream,
+    /// Answered by the time-wait entry with this `type_flags`.
+    Timewait(Arc<Timewait>, u8),
+    /// Nothing in the stream table: the whole datagram goes to the fallback.
+    Fallback,
+}
+
 struct UdxSocketInner {
     udp: Mutex<Option<Arc<super::udp::Udp>>>,
     recv_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     streams: Arc<Mutex<HashMap<u32, StreamEntry>>>,
     fallback_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Datagram>>>>,
+    /// Stream packets refused because the stream's queue was full. A packet
+    /// refused because the stream is gone (the queue is closed) is not
+    /// counted.
+    dropped_stream_packets: AtomicU64,
 }
 
 impl UdxSocketInner {
@@ -30,6 +45,7 @@ impl UdxSocketInner {
             recv_task: Mutex::new(None),
             streams: Arc::new(Mutex::new(HashMap::new())),
             fallback_tx: Arc::new(Mutex::new(None)),
+            dropped_stream_packets: AtomicU64::new(0),
         }
     }
 
@@ -77,43 +93,84 @@ impl UdxSocketInner {
                     continue;
                 }
                 let mut stream_packet = false;
-                for (index, range, addr) in datagrams.drain(..) {
-                    let packet = bufs[index][range].to_vec();
-
-                    if packet.len() >= super::header::HEADER_SIZE {
-                        if let Ok(hdr) = super::header::Header::decode(&packet) {
-                            let guard = streams.lock().unwrap_or_else(|e| e.into_inner());
-                            match guard.get(&hdr.remote_id) {
-                                Some(StreamEntry::Stream(tx)) => {
-                                    let Some(inner) = socket.upgrade() else {
-                                        break 'receive;
-                                    };
-                                    stream_packet = true;
-                                    // A full queue drops the packet like any UDP
-                                    // overflow; the sender retransmits.
-                                    let _ = tx.try_send(super::stream::IncomingPacket {
-                                        data: packet,
-                                        addr,
-                                        socket: UdxSocket { inner },
-                                    });
-                                    continue;
+                // One guard serves a run of stream packets; anything else
+                // releases it. The block ends (and the guard drops) before
+                // the next `.await`.
+                {
+                    let mut streams_guard: Option<
+                        std::sync::MutexGuard<'_, HashMap<u32, StreamEntry>>,
+                    > = None;
+                    for (index, range, addr) in datagrams.drain(..) {
+                        // Decode from the receive buffer: no copy, and no lock
+                        // for a datagram that is not a UDX packet.
+                        let datagram = &bufs[index][range];
+                        let header = if datagram.len() >= super::header::HEADER_SIZE {
+                            super::header::Header::decode(datagram).ok()
+                        } else {
+                            None
+                        };
+                        let route = match header {
+                            Some(header) => {
+                                let guard = streams_guard.get_or_insert_with(|| {
+                                    streams.lock().unwrap_or_else(|e| e.into_inner())
+                                });
+                                match guard.get(&header.remote_id) {
+                                    Some(StreamEntry::Stream(tx)) => {
+                                        let Some(inner) = socket.upgrade() else {
+                                            break 'receive;
+                                        };
+                                        stream_packet = true;
+                                        // Copy once, without the header: the
+                                        // stream's processor has it decoded.
+                                        let packet = super::stream::IncomingPacket {
+                                            header,
+                                            body: datagram[super::header::HEADER_SIZE..].to_vec(),
+                                            addr,
+                                            socket: UdxSocket { inner },
+                                        };
+                                        match tx.try_send(packet) {
+                                            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                            // A full queue drops the packet like any
+                                            // UDP overflow; the sender retransmits.
+                                            Err(mpsc::error::TrySendError::Full(packet)) => {
+                                                packet
+                                                    .socket
+                                                    .inner
+                                                    .dropped_stream_packets
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                        Route::Stream
+                                    }
+                                    // C `process_timewait`: answered or ignored,
+                                    // never handed on.
+                                    Some(StreamEntry::Timewait(timewait)) => {
+                                        Route::Timewait(Arc::clone(timewait), header.type_flags)
+                                    }
+                                    None => Route::Fallback,
                                 }
-                                // C `process_timewait`: answered or ignored,
-                                // never handed on.
-                                Some(StreamEntry::Timewait(timewait)) => {
-                                    let timewait = Arc::clone(timewait);
-                                    drop(guard);
-                                    timewait.answer(hdr.type_flags);
-                                    continue;
-                                }
-                                None => {}
                             }
+                            None => Route::Fallback,
+                        };
+                        match route {
+                            Route::Stream => continue,
+                            Route::Timewait(timewait, type_flags) => {
+                                streams_guard = None;
+                                timewait.answer(type_flags);
+                                continue;
+                            }
+                            Route::Fallback => {}
                         }
-                    }
-
-                    let guard = fallback_tx.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(tx) = &*guard {
-                        let _ = tx.send(Datagram { data: packet, addr });
+                        // Not a stream packet: release the stream table before
+                        // taking the fallback lock, and copy it whole.
+                        streams_guard = None;
+                        let guard = fallback_tx.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(tx) = &*guard {
+                            let _ = tx.send(Datagram {
+                                data: datagram.to_vec(),
+                                addr,
+                            });
+                        }
                     }
                 }
                 if stream_packet && bufs.len() == 1 {
@@ -187,6 +244,15 @@ impl UdxSocket {
     /// Return the local address this socket is bound to.
     pub async fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.inner.udp_arc()?.local_addr()?)
+    }
+
+    /// Number of stream packets dropped because the stream's incoming queue
+    /// was full.
+    ///
+    /// A packet refused because the stream is gone (its queue is closed) is
+    /// not counted, and neither is a datagram for no stream.
+    pub fn dropped_stream_packets(&self) -> u64 {
+        self.inner.dropped_stream_packets.load(Ordering::Relaxed)
     }
 
     /// Set the IP time-to-live (IPv4 `IP_TTL` / IPv6 hop limit) used for
@@ -314,7 +380,25 @@ impl UdxSocket {
 
 #[cfg(test)]
 mod tests {
+    use super::super::header::{FLAG_DATA, HEADER_SIZE, Header};
     use super::*;
+    use std::time::Duration;
+
+    /// A wire-format stream packet (header + payload) for demux tests.
+    fn stream_packet(remote_id: u32, seq: u32, payload: &[u8]) -> Vec<u8> {
+        let mut packet = Header {
+            type_flags: FLAG_DATA,
+            data_offset: 0,
+            remote_id,
+            recv_window: 4096,
+            seq,
+            ack: 0,
+        }
+        .encode()
+        .to_vec();
+        packet.extend_from_slice(payload);
+        packet
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "unreliable datagram task-allocation benchmark"]
@@ -418,5 +502,107 @@ mod tests {
         socket
             .register_stream(10, tx2)
             .expect("registration after previous stream closed");
+    }
+
+    /// One batch: a stream packet, a datagram with no stream, then another
+    /// stream packet. Both stream packets must reach the stream in order while
+    /// the fallback receiver gets the whole datagram, its first 20 bytes
+    /// included. A body-only fallback copy or a stream-table lock held across
+    /// the fallback send is wrong.
+    #[tokio::test]
+    async fn mixed_batch_keeps_stream_order_and_whole_fallback_datagram() {
+        let socket = UdxSocket::new();
+        socket.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let to = socket.local_addr().await.unwrap();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        socket.register_stream(10, tx).unwrap();
+        let mut fallback = socket.recv_start().unwrap();
+
+        let first = stream_packet(10, 0, b"first");
+        let stranger = stream_packet(77, 0, b"fallback");
+        let second = stream_packet(10, 1, b"second");
+        for packet in [&first, &stranger, &second] {
+            peer.send_to(packet, to).await.unwrap();
+        }
+
+        let (one, two) = tokio::time::timeout(Duration::from_secs(1), async {
+            let one = rx.recv().await.expect("first stream packet");
+            let two = rx.recv().await.expect("second stream packet");
+            (one, two)
+        })
+        .await
+        .expect("stream packets did not arrive in order");
+        assert_eq!((one.header.seq, one.body.as_slice()), (0, &b"first"[..]));
+        assert_eq!((two.header.seq, two.body.as_slice()), (1, &b"second"[..]));
+
+        let datagram = tokio::time::timeout(Duration::from_secs(1), fallback.recv())
+            .await
+            .expect("fallback datagram")
+            .expect("fallback receiver open");
+        assert_eq!(
+            datagram.data, stranger,
+            "the fallback gets the whole datagram, header included"
+        );
+        assert_eq!(&datagram.data[..HEADER_SIZE], &stranger[..HEADER_SIZE]);
+    }
+
+    /// A full stream queue must count one drop for each refused packet and a
+    /// closed queue (the stream is gone) must count none. Dropping a packet
+    /// with `let _ = try_send` (nothing counted) or counting the closed queue
+    /// is the wrong behaviour this catches.
+    #[tokio::test]
+    async fn full_stream_queue_is_counted_but_a_closed_one_is_not() {
+        let socket = UdxSocket::new();
+        socket.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let to = socket.local_addr().await.unwrap();
+        let mut fallback = socket.recv_start().unwrap();
+
+        // Queues by hand, no processor task: capacity 2 accepts two packets
+        // and refuses the rest.
+        let (tx, mut rx) = mpsc::channel(2);
+        socket.register_stream(10, tx).unwrap();
+        // A stream that is gone: its sender is closed, not full.
+        let (closed_tx, closed_rx) = mpsc::channel(2);
+        drop(closed_rx);
+        socket.register_stream(11, closed_tx).unwrap();
+
+        for i in 0..5u8 {
+            peer.send_to(&stream_packet(10, u32::from(i), &[i]), to)
+                .await
+                .unwrap();
+        }
+        for _ in 0..2 {
+            peer.send_to(&stream_packet(11, 0, b"gone"), to)
+                .await
+                .unwrap();
+        }
+        // A datagram for no stream is the marker: the demux handles the
+        // datagrams in order, so everything above has been processed once it
+        // reaches the fallback.
+        peer.send_to(&stream_packet(99, 0, b"marker"), to)
+            .await
+            .unwrap();
+        let marker = tokio::time::timeout(Duration::from_secs(1), fallback.recv())
+            .await
+            .expect("marker datagram")
+            .expect("fallback receiver open");
+        assert_eq!(&marker.data[HEADER_SIZE..], b"marker");
+
+        assert_eq!(
+            socket.dropped_stream_packets(),
+            3,
+            "the three packets refused by the full queue, and only those"
+        );
+        let queued: Vec<Vec<u8>> = (0..2)
+            .map(|_| rx.try_recv().expect("queued packet").body)
+            .collect();
+        assert_eq!(queued, [vec![0], vec![1]]);
+        assert!(
+            rx.try_recv().is_err(),
+            "the queue accepted more than its capacity"
+        );
     }
 }
