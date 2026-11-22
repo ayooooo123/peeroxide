@@ -6,6 +6,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
+use super::receive_window::ReceiveWindow;
 use super::stream::{StreamEvent, StreamInner};
 
 /// Adapter that implements [`tokio::io::AsyncRead`] and [`tokio::io::AsyncWrite`]
@@ -24,6 +25,9 @@ use super::stream::{StreamEvent, StreamInner};
 /// without `shutdown` abandons data the peer has not ACKed yet.
 pub struct UdxAsyncStream {
     inner: Arc<Mutex<StreamInner>>,
+    /// The same window as `inner`'s, kept outside the lock so a poll can
+    /// count bytes without holding it.
+    receive_window: Arc<ReceiveWindow>,
     read_rx: mpsc::UnboundedReceiver<StreamEvent>,
     read_buf: Vec<u8>,
     read_pos: usize,
@@ -40,8 +44,15 @@ impl UdxAsyncStream {
         processor: Option<tokio::task::JoinHandle<()>>,
         close_rx: Option<oneshot::Receiver<()>>,
     ) -> Self {
+        let receive_window = Arc::clone(
+            &inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .receive_window,
+        );
         Self {
             inner,
+            receive_window,
             read_rx,
             read_buf: Vec::new(),
             read_pos: 0,
@@ -117,6 +128,9 @@ impl AsyncRead for UdxAsyncStream {
                 self.read_buf.clear();
                 self.read_pos = 0;
             }
+            if self.receive_window.taken(n) {
+                self.lock().request_window_update();
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -127,6 +141,9 @@ impl AsyncRead for UdxAsyncStream {
                 if n < data.len() {
                     self.read_buf = data;
                     self.read_pos = n;
+                }
+                if self.receive_window.taken(n) {
+                    self.lock().request_window_update();
                 }
                 Poll::Ready(Ok(()))
             }

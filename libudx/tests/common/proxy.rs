@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rand::Rng;
@@ -56,6 +57,8 @@ pub struct UdpProxy {
     pub addr_for_a: SocketAddr,
     /// Peer B sends here; proxy forwards to Peer A.
     pub addr_for_b: SocketAddr,
+    forwarded_a_to_b: Arc<AtomicU64>,
+    forwarded_b_to_a: Arc<AtomicU64>,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -74,22 +77,44 @@ impl UdpProxy {
         let sock_a = Arc::new(sock_a);
         let sock_b = Arc::new(sock_b);
 
+        let forwarded_a_to_b = Arc::new(AtomicU64::new(0));
+        let forwarded_b_to_a = Arc::new(AtomicU64::new(0));
+
         // A→B
         let h1 = tokio::spawn(forward_loop(
             Arc::clone(&sock_a),
             Arc::clone(&sock_b),
             addr_b,
             config.a_to_b,
+            Arc::clone(&forwarded_a_to_b),
         ));
 
         // B→A
-        let h2 = tokio::spawn(forward_loop(sock_b, sock_a, addr_a, config.b_to_a));
+        let h2 = tokio::spawn(forward_loop(
+            sock_b,
+            sock_a,
+            addr_a,
+            config.b_to_a,
+            Arc::clone(&forwarded_b_to_a),
+        ));
 
         Self {
             addr_for_a,
             addr_for_b,
+            forwarded_a_to_b,
+            forwarded_b_to_a,
             handles: vec![h1, h2],
         }
+    }
+
+    /// Bytes of the datagrams that the proxy sent on from A to B so far.
+    pub fn forwarded_a_to_b(&self) -> u64 {
+        self.forwarded_a_to_b.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of the datagrams that the proxy sent on from B to A so far.
+    pub fn forwarded_b_to_a(&self) -> u64 {
+        self.forwarded_b_to_a.load(Ordering::Relaxed)
     }
 
     pub async fn stop(self) {
@@ -105,6 +130,7 @@ async fn forward_loop(
     send_sock: Arc<UdpSocket>,
     dest: SocketAddr,
     config: DirectionConfig,
+    forwarded: Arc<AtomicU64>,
 ) {
     let mut buf = vec![0u8; 2048];
 
@@ -160,6 +186,9 @@ async fn forward_loop(
                 packet[8..12].copy_from_slice(&rwnd.to_le_bytes());
             }
         }
+
+        // A delayed packet is counted now, when the decision to send it is made.
+        forwarded.fetch_add(packet.len() as u64, Ordering::Relaxed);
 
         if total_delay > Duration::ZERO {
             let send_sock = Arc::clone(&send_sock);
