@@ -92,8 +92,9 @@ async fn an_async_reader_that_stops_stops_the_sender_and_a_read_starts_it_again(
     .await;
 }
 
-/// Catches a window update that only two Rust peers understand, and a stock
-/// sender that ignores the window.
+/// Catches a window update that only two Rust peers understand, a stock
+/// sender that ignores the window, and a window that is still closed at the
+/// end, which keeps the stock sender from sending its END.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stock_js_sender_stops_and_starts_again() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -123,11 +124,16 @@ async fn reader_that_stops_stops_the_sender(make_reader: fn(UdxStream) -> Reader
     let mut reader = make_reader(stream_b);
     let received = stalled_sender_and_resume(&mut reader, &proxy).await;
     verify_payload(&payload, &received);
+    assert!(
+        reader.read_chunk().await.is_none(),
+        "the sender sent more than the payload"
+    );
     writer.await.expect("writer task failed");
 }
 
 /// The steps shared by the three tests: the pause, the two bounds on what the
-/// sender forwarded, the probe check, and the read past the resume mark.
+/// sender forwarded, the probe check, the read past the resume mark, and the
+/// read of the rest of the payload.
 async fn stalled_sender_and_resume(reader: &mut Reader, proxy: &UdpProxy) -> Vec<u8> {
     tokio::time::sleep(PAUSE).await;
 
@@ -165,23 +171,43 @@ async fn stalled_sender_and_resume(reader: &mut Reader, proxy: &UdpProxy) -> Vec
         "new data came only after the sender's probe timer; the window update is missing: {resume:?}"
     );
 
-    while let Some(chunk) = reader.read_chunk().await {
+    // Read the payload, not up to the sender's END: a stock `udx-native`
+    // stream never runs the callback of `write` (streamx `write(data)` takes
+    // one argument), so the Node peer ends its side only after ours ended.
+    while received.len() < TOTAL {
+        let chunk = reader
+            .read_chunk()
+            .await
+            .expect("the stream ended before the whole payload arrived");
         received.extend_from_slice(&chunk);
     }
     received
 }
 
+/// The Node peer, killed when the test ends early: a timeout drops the test
+/// future, and the peer would keep running.
+struct NodePeer(std::process::Child);
+
+impl Drop for NodePeer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Test 3: a stock `udx-native` sender behind the proxy, a Rust reader.
 async fn run_stock_js_sender_test() -> Result<(), Box<dyn std::error::Error>> {
-    let mut child = Command::new("node")
-        .arg(node_script_path("udx-large-transfer.js"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+    let mut child = NodePeer(
+        Command::new("node")
+            .arg(node_script_path("udx-large-transfer.js"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?,
+    );
 
-    let stdout = child.stdout.take().expect("no stdout");
-    let mut stdin = child.stdin.take().expect("no stdin");
+    let stdout = child.0.stdout.take().expect("no stdout");
+    let mut stdin = child.0.stdin.take().expect("no stdin");
 
     let mut output = BufReader::new(stdout);
     let mut line = String::new();
@@ -223,8 +249,13 @@ async fn run_stock_js_sender_test() -> Result<(), Box<dyn std::error::Error>> {
     );
     let received_hash = format!("{:x}", Sha256::digest(&received));
 
-    let stream = incoming.stream();
+    let mut stream = incoming.stream();
     stream.shutdown().await?;
+    // The Node peer ends its side when ours ends; its END needs an open window.
+    assert!(
+        stream.read().await?.is_none(),
+        "node sent more than the payload"
+    );
 
     let mut result_line = String::new();
     output.read_line(&mut result_line)?;
@@ -241,7 +272,7 @@ async fn run_stock_js_sender_test() -> Result<(), Box<dyn std::error::Error>> {
     socket.close().await?;
     drop(runtime);
 
-    let status = child.wait()?;
+    let status = child.0.wait()?;
     assert!(status.success(), "node process exited with: {status}");
     Ok(())
 }
