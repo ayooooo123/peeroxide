@@ -106,11 +106,7 @@ impl ReceiveWindow {
 
     /// `len` out-of-order bytes left the buffer.
     pub(crate) fn released_out_of_order(&self, len: usize) {
-        let _ = self
-            .out_of_order
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
-                Some(held.saturating_sub(len))
-            });
+        subtract_to_zero(&self.out_of_order, len);
     }
 
     /// The out-of-order buffer was cleared.
@@ -130,11 +126,7 @@ impl ReceiveWindow {
         if len == 0 {
             return false;
         }
-        let _ = self
-            .unread
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
-                Some(held.saturating_sub(len))
-            });
+        subtract_to_zero(&self.unread, len);
 
         // A whole target taken inside the period doubles the maximum. The
         // bytes that already waited when the measurement started say nothing
@@ -179,6 +171,21 @@ impl ReceiveWindow {
     #[cfg(test)]
     pub(crate) fn out_of_order_bytes(&self) -> usize {
         self.out_of_order.load(Ordering::Relaxed)
+    }
+}
+
+/// Subtracts `len` from `counter` and stops at zero. The loop is what
+/// `fetch_update` does; that method is deprecated on new compilers and its
+/// replacement `try_update` is newer than the minimum Rust version of the crate.
+fn subtract_to_zero(counter: &AtomicUsize, len: usize) {
+    let mut held = counter.load(Ordering::Relaxed);
+    while let Err(now) = counter.compare_exchange_weak(
+        held,
+        held.saturating_sub(len),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        held = now;
     }
 }
 
