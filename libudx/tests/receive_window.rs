@@ -21,9 +21,11 @@ use tokio::io::AsyncReadExt;
 const WINDOW: u64 = 4 * 1024 * 1024;
 const TOTAL: usize = 16 * 1024 * 1024;
 const PAUSE: Duration = Duration::from_secs(2);
-/// More than one window: the reader can get this far only with data that
-/// the sender sent after the reader started again.
-const RESUME_MARK: usize = 5 * 1024 * 1024;
+/// More than the sender may have forwarded while the reader waited (the
+/// checks below permit one and a half windows, and 64 KiB of probes): the
+/// reader can get this far only with data that the sender sent after the
+/// reader started again.
+const RESUME_MARK: usize = 7 * 1024 * 1024;
 
 /// The two read APIs of the crate, so the reader steps live in one place.
 enum Reader {
