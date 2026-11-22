@@ -16,7 +16,8 @@ use libudx::{UdxAsyncStream, UdxStream};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
-/// The largest window of the protocol.
+/// The window that a stream starts with. No reader here takes a byte before
+/// its pause, so the window still has this size when the sender must stop.
 const WINDOW: u64 = 4 * 1024 * 1024;
 const TOTAL: usize = 16 * 1024 * 1024;
 const PAUSE: Duration = Duration::from_secs(2);

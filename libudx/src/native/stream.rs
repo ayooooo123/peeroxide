@@ -14,7 +14,7 @@ use super::header::{
     FLAG_DATA, FLAG_DESTROY, FLAG_END, FLAG_HEARTBEAT, FLAG_MESSAGE, FLAG_SACK, HEADER_SIZE,
     Header, SackRange, decode_sack, encode_sack,
 };
-use super::receive_window::ReceiveWindow;
+use super::receive_window::{ReadMeter, ReceiveWindow};
 use crate::error::{Result, UdxError};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -1702,9 +1702,10 @@ impl StreamInner {
     /// Out-of-order packets are kept only while they fit inside the window we
     /// advertise: a sender that honours the window never has them dropped, and
     /// keeping more would let one peer grow the buffer without bound. In-order
-    /// data is refused only at twice the window (`HARD_LIMIT` in
-    /// `receive_window`), because a correct C sender's tail loss probe may
-    /// send one packet past a closed window. C libudx bounds neither.
+    /// data is refused only above the window plus one starting window
+    /// (`HARD_MARGIN` in `receive_window`), because a correct C sender's tail
+    /// loss probe may send one packet past a closed window. C libudx bounds
+    /// neither.
     fn receive_data(
         &mut self,
         seq: u32,
@@ -1720,8 +1721,8 @@ impl StreamInner {
         let next = self.next_remote_seq;
         if seq == next {
             // In-order: deliver directly, unless the reader lets the stream
-            // hold twice the window (the packet is not delivered, so no ACK
-            // covers it).
+            // hold the window plus one starting window (the packet is not
+            // delivered, so no ACK covers it).
             if !self.receive_window.admits_in_order(payload.len()) {
                 return;
             }
@@ -1974,6 +1975,8 @@ pub struct UdxStream {
     /// The same window as `inner`'s, kept outside the lock so a read can
     /// count bytes without holding it.
     receive_window: Arc<ReceiveWindow>,
+    /// Measures the one reader; a fast reader doubles the window.
+    read_meter: ReadMeter,
     processor: Mutex<Option<tokio::task::JoinHandle<()>>>,
     incoming_tx: Option<mpsc::Sender<IncomingPacket>>,
     incoming_rx: Mutex<Option<mpsc::Receiver<IncomingPacket>>>,
@@ -2008,6 +2011,7 @@ impl UdxStream {
             local_id,
             inner: Arc::new(Mutex::new(inner)),
             receive_window,
+            read_meter: ReadMeter::new(),
             processor: Mutex::new(None),
             incoming_tx: Some(incoming_tx),
             incoming_rx: Mutex::new(Some(incoming_rx)),
@@ -2032,16 +2036,25 @@ impl UdxStream {
         // Prevent Drop from deregistering — the processor task is still
         // running and deregisters on exit through its own clone.
         self.registrations = Registrations::default();
+        // `UdxStream` has a `Drop`, so the meter leaves by replacement.
+        let read_meter = std::mem::replace(&mut self.read_meter, ReadMeter::new());
         let Some(read_rx) = self.read_rx.take() else {
             return super::async_stream::UdxAsyncStream::new(
                 Arc::clone(&self.inner),
+                read_meter,
                 mpsc::unbounded_channel().1,
                 None,
                 self.close_rx.take(),
             );
         };
         let inner = Arc::clone(&self.inner);
-        super::async_stream::UdxAsyncStream::new(inner, read_rx, processor, self.close_rx.take())
+        super::async_stream::UdxAsyncStream::new(
+            inner,
+            read_meter,
+            read_rx,
+            processor,
+            self.close_rx.take(),
+        )
     }
 
     /// A handle that can destroy this stream from another owner, without
@@ -2174,7 +2187,7 @@ impl UdxStream {
         let rx = self.read_rx.as_mut().ok_or(UdxError::StreamClosed)?;
         match rx.recv().await {
             Some(StreamEvent::Data(d)) => {
-                if self.receive_window.taken(d.len()) {
+                if self.receive_window.taken(d.len(), &mut self.read_meter) {
                     self.inner
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -3822,7 +3835,10 @@ mod mtu_tests {
         // 3,000 held in order: 4,194,304 - 3,000 = 4,191,304.
         assert_eq!(inner.control_header(0).recv_window, DEFAULT_RWND - 3000);
         // The reader took 1,000: 2,000 held, 4,194,304 - 2,000 = 4,192,304.
-        let _ = inner.receive_window.taken(1000);
+        // The meter's 4,194,304-byte target is never reached, so the limit
+        // stays at the starting window.
+        let mut meter = ReadMeter::new();
+        let _ = inner.receive_window.taken(1000, &mut meter);
         assert_eq!(inner.control_header(0).recv_window, DEFAULT_RWND - 2000);
         // 500 held out of order: 2,500 held, 4,194,304 - 2,500 = 4,191,804.
         inner.receive_data(5, vec![0u8; 500], FLAG_DATA, &mut events);
@@ -4841,6 +4857,62 @@ mod abort_tests {
             .expect("no ACK for the packet the update reopened");
         assert_eq!(header.ack, 4196);
         assert_eq!(header.recv_window, 2_096_304);
+    }
+
+    /// Catches a window that stays at the starting size after the reader took
+    /// a whole window: the next ACK must advertise the doubled limit minus
+    /// what is held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acks_show_the_window_growing_when_the_reader_is_fast() {
+        let (_runtime, socket, mut stream, peer) = raw_peer_stream().await;
+        let to = socket.local_addr().await.unwrap();
+        // Heartbeats would mix with the ACKs this test reads.
+        stream.set_keepalive(None);
+        // The decision must not depend on how fast the machine is: any
+        // interval shorter than an hour counts as fast.
+        stream.read_meter.set_period(Duration::from_secs(3600));
+
+        for k in 0..4195u32 {
+            peer.send_to(&build_data_packet(5, k, 0, &[0u8; 1000]), to)
+                .await
+                .unwrap();
+            let (header, _) = recv_header(&peer, Duration::from_secs(5))
+                .await
+                .expect("no ACK for an in-order data packet");
+            assert_eq!(header.ack, k + 1);
+            // No whole window taken yet, so the window cannot pass 4,194,304.
+            assert!(
+                header.recv_window <= DEFAULT_RWND,
+                "the window grew before the reader took a whole window"
+            );
+            // Read a packet only after its ACK, so the ACK sees 1,000 bytes
+            // held, as in the neighbour test.
+            let data = stream.read().await.unwrap().expect("queued data");
+            assert_eq!(data.len(), 1000);
+        }
+        // 4,195 x 1,000 = 4,195,000 bytes taken, so the limit doubled when
+        // the reader crossed 4,194,304.
+
+        // One more packet, not read: 1,000 bytes held. The last read asked
+        // for an update ACK and it may arrive before this packet's ACK.
+        peer.send_to(&build_data_packet(5, 4195, 0, &[0u8; 1000]), to)
+            .await
+            .unwrap();
+        let mut header = recv_header(&peer, Duration::from_secs(5))
+            .await
+            .expect("no ACK after the growth")
+            .0;
+        if header.ack == 4195 {
+            // The update ACK from the last read: nothing held, 8,388,608.
+            assert_eq!(header.recv_window, 8_388_608);
+            header = recv_header(&peer, Duration::from_secs(5))
+                .await
+                .expect("no ACK for the unread packet")
+                .0;
+        }
+        assert_eq!(header.ack, 4196);
+        // 8,388,608 - 1,000 = 8,387,608.
+        assert_eq!(header.recv_window, 8_387_608);
     }
 
     /// Catches an async read that frees a whole Data event instead of the

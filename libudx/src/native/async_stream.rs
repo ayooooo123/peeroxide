@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
-use super::receive_window::ReceiveWindow;
+use super::receive_window::{ReadMeter, ReceiveWindow};
 use super::stream::{StreamEvent, StreamInner};
 
 /// Adapter that implements [`tokio::io::AsyncRead`] and [`tokio::io::AsyncWrite`]
@@ -28,6 +28,8 @@ pub struct UdxAsyncStream {
     /// The same window as `inner`'s, kept outside the lock so a poll can
     /// count bytes without holding it.
     receive_window: Arc<ReceiveWindow>,
+    /// Measures the one reader; a fast reader doubles the window.
+    read_meter: ReadMeter,
     read_rx: mpsc::UnboundedReceiver<StreamEvent>,
     read_buf: Vec<u8>,
     read_pos: usize,
@@ -40,6 +42,7 @@ pub struct UdxAsyncStream {
 impl UdxAsyncStream {
     pub(crate) fn new(
         inner: Arc<Mutex<StreamInner>>,
+        read_meter: ReadMeter,
         read_rx: mpsc::UnboundedReceiver<StreamEvent>,
         processor: Option<tokio::task::JoinHandle<()>>,
         close_rx: Option<oneshot::Receiver<()>>,
@@ -53,6 +56,7 @@ impl UdxAsyncStream {
         Self {
             inner,
             receive_window,
+            read_meter,
             read_rx,
             read_buf: Vec::new(),
             read_pos: 0,
@@ -111,48 +115,51 @@ fn poll_all_acked(inner: &mut StreamInner, cx: &mut Context<'_>) -> Poll<io::Res
 
 impl AsyncRead for UdxAsyncStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.read_eof {
+        // One projection, so the window and the meter are borrowed as
+        // separate fields.
+        let this = self.get_mut();
+        if this.read_eof {
             return Poll::Ready(Ok(()));
         }
 
-        if self.read_pos < self.read_buf.len() {
-            let remaining = &self.read_buf[self.read_pos..];
+        if this.read_pos < this.read_buf.len() {
+            let remaining = &this.read_buf[this.read_pos..];
             let n = remaining.len().min(buf.remaining());
             buf.put_slice(&remaining[..n]);
-            self.read_pos += n;
-            if self.read_pos >= self.read_buf.len() {
-                self.read_buf.clear();
-                self.read_pos = 0;
+            this.read_pos += n;
+            if this.read_pos >= this.read_buf.len() {
+                this.read_buf.clear();
+                this.read_pos = 0;
             }
-            if self.receive_window.taken(n) {
-                self.lock().request_window_update();
+            if this.receive_window.taken(n, &mut this.read_meter) {
+                this.lock().request_window_update();
             }
             return Poll::Ready(Ok(()));
         }
 
-        match self.read_rx.poll_recv(cx) {
+        match this.read_rx.poll_recv(cx) {
             Poll::Ready(Some(StreamEvent::Data(data))) => {
                 let n = data.len().min(buf.remaining());
                 buf.put_slice(&data[..n]);
                 if n < data.len() {
-                    self.read_buf = data;
-                    self.read_pos = n;
+                    this.read_buf = data;
+                    this.read_pos = n;
                 }
-                if self.receive_window.taken(n) {
-                    self.lock().request_window_update();
+                if this.receive_window.taken(n, &mut this.read_meter) {
+                    this.lock().request_window_update();
                 }
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(StreamEvent::Error(kind))) => {
-                self.read_eof = true;
+                this.read_eof = true;
                 Poll::Ready(Err(io::Error::new(kind, "UDX stream failed")))
             }
             Poll::Ready(Some(StreamEvent::End)) | Poll::Ready(None) => {
-                self.read_eof = true;
+                this.read_eof = true;
                 Poll::Ready(Ok(()))
             }
             Poll::Pending => Poll::Pending,
