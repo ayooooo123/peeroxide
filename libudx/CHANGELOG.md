@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The receive loop decodes a stream packet's header from the receive buffer, holds the stream table lock once for a run of stream packets, and copies only the packet body into the stream's queue. A datagram for no stream, and a stream in time-wait, release the table before the fallback channel or the time-wait answer.
+
+### Added
+
+- `UdxSocket::dropped_stream_packets`: the number of stream packets dropped because the stream's incoming queue (1,024 packets) was full. The count was invisible before; a packet refused because the stream is gone is not counted.
+
 ### Changed (review 2026-11-15)
 
 - A stream closes by itself once both sides have ended and everything it sent is ACKed (C `close_stream` on `UDX_STREAM_ALL_ENDED`): `closed()`, `is_alive()` and the close notification report it while the owner still holds the stream. By then every write has completed and the peer's data and EOF are queued for the reader, which may not have read them yet; they stay readable after the close. DATA arriving after the peer's END is dropped (C `SHOULD_READ`). The side that ended first answers the peer's ACK of its END with one more ACK and then keeps a TIMEWAIT entry for its id for 5 s (C `stream_timewait`): a late DATA or END gets the final ACK from the stream's last socket to its last remote, other packets are ignored, and nothing reaches whatever had the id. A new stream may take an id in TIMEWAIT, as in C. Dropping or destroying a closed stream sends no DESTROY.
