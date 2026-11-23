@@ -67,6 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unreliable datagrams send immediately when the socket is writable, reserving allocation and a task for backpressure.
 - Per-packet bookkeeping no longer walks every unacknowledged packet: `inflight()` is a counter, RACK loss detection reads a send-time-ordered queue, fast retransmit visits only the packets marked lost, and SACK processing skips blocks it has already applied. A seeder serving four loopback peers on Linux went from about 30 to 8 CPU-seconds per GiB with the changes below.
 - On Linux and Android a paced burst to one peer leaves in one UDP GSO `sendmsg`, and the socket reads up to eight datagram buffers per call (`recvmmsg`, GRO) via `quinn-udp`. On macOS one stream sends its burst at a time, which removed kernel lock contention between worker threads (about 3x the CPU per packet with four peers).
+- The GSO send builds its packet run in one buffer for each thread, reserved once to the size of the run and reused (at most 65,507 bytes), instead of a new `Vec` for every send; the Linux receive path builds its `IoSliceMut` array on the stack.
 - Sockets ask for 8 MiB kernel send and receive buffers (falling back to 4 and 2 MiB, as PearTube's JS `tuneUdxSocket`), so a full congestion window sent at once is not dropped by a 208 KiB default.
 - A receiver ACKs in-order data once per receive burst, at most every 8 packets; out-of-order data and END are still ACKed at once. C libudx ACKs every packet; both peers now handle about a third fewer datagrams per MiB.
 
