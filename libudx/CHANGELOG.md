@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The receive window follows what the reader has not taken: the window in ACK and data headers is the limit minus the payload held in order and out of order (C `recv_rwnd_max - get_read_buffer_size`, `udx.c:267-283`), and the receiver sends one extra ACK when a read makes the window at least half of the starting window larger than the value the peer last received. The JS wrapper never uses C's callback (`udx-native` 1.22.1 has no `get_read_buffer_size`), so a stock JS peer still advertises 4 MiB; a Rust receiver now stops such a peer at the window instead of growing its queue.
+- In-order data is accepted up to twice the starting window, so a paused reader does not kill a stream that follows the tail loss probe, and out-of-order data is stored only up to the starting window in bytes. A packet past either limit is dropped and not acknowledged.
+- The window maximum doubles, up to four times the starting window, when the reader takes a whole window inside the measurement period; a reader that waits keeps it.
+- `UdxStream::write` resolves only when the peer acknowledges every byte, which with a peer that follows the window also means that it waits for that peer's reader; the doc comment says so.
+
+### Fixed
+
+- The receive-window counters no longer use `AtomicUsize::fetch_update`, which new compilers mark deprecated: a compare-exchange loop gives the same "stop at zero" result, so the crate builds without warnings on stable and on the minimum Rust version.
+
 ### Changed (review 2026-11-15)
 
 - A stream closes by itself once both sides have ended and everything it sent is ACKed (C `close_stream` on `UDX_STREAM_ALL_ENDED`): `closed()`, `is_alive()` and the close notification report it while the owner still holds the stream. By then every write has completed and the peer's data and EOF are queued for the reader, which may not have read them yet; they stay readable after the close. DATA arriving after the peer's END is dropped (C `SHOULD_READ`). The side that ended first answers the peer's ACK of its END with one more ACK and then keeps a TIMEWAIT entry for its id for 5 s (C `stream_timewait`): a late DATA or END gets the final ACK from the stream's last socket to its last remote, other packets are ignored, and nothing reaches whatever had the id. A new stream may take an id in TIMEWAIT, as in C. Dropping or destroying a closed stream sends no DESTROY.
