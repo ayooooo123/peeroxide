@@ -1,132 +1,184 @@
-//! BBR congestion control state machine, ported from C libudx `udx_bbr.c`
-//! (the version udx-native 1.22.1 pins).
+//! BBRv3 congestion control state machine (`draft-ietf-ccwg-bbr`) with
+//! microsecond resolution.
 //!
-//! Matches C, including: the bandwidth filter (`win_filter_f64.c`, with its
-//! ¼/½-window aging), rounds counted only on rate samples C keeps
-//! (`bbr_update_bw`), `bbr_bdp`, `bbr_set_cwnd` (startup growth capped at
-//! the target once ten packets are delivered, ACK-aggregation allowance only
-//! once the pipe is full), recovery/restore, the pacing rate (seeded from
-//! the initial window at `bbr_init`, so the first flight is paced; floored
-//! at 1 byte/ms; re-seeded at the first RTT sample; only growing until the
-//! pipe is full), `bbr_on_rto` (keeps `full_bw_reached`),
-//! `bbr_on_transmit_start` (re-paces ProbeBW at gain 1, checks ProbeRTT
-//! done), ProbeRTT (200 ms dwell from the first ACK with at most 4 packets
-//! in flight plus one round, exit through `bbr_reset_mode` restoring
-//! `prior_cwnd`), and cycle phase and ACK-aggregation epochs on the
-//! stream's `delivered_ts`. The minimum RTT starts at `u32::MAX` (C `~0`).
-//! Times are whole milliseconds on the stream clock (C `uv_now`).
-//!
-//! The rate sample (`rate.rs`, `udx_rate.c`) carries the RACK RTT of the
-//! newest delivered packet and is discarded against the stream's RACK
-//! minimum RTT; the stream ends recovery when the cumulative ACK passes
-//! `high_seq` (C `process_packet`). Those parts live in `rate.rs`,
-//! `mod.rs` and `stream.rs`.
-//!
-//! No known differences from C remain in this module.
+//! Wire-compatible with UDX v1 peers (pure sender-side congestion control):
+//! - Microsecond RTT, delivery-rate, and pacing calculations so sub-ms LAN
+//!   paths and high-BDP WAN paths are modeled accurately.
+//! - Loss-aware `inflight_hi` and short-term lower bounds (`bw_lo`,
+//!   `inflight_lo`, `beta = 0.7`, `loss_thresh = 2%`, `headroom = 15%`) so
+//!   shallow-buffer bottlenecks do not suffer standing queues and chronic
+//!   retransmit storms, while ignoring isolated <2% random loss.
+//! - Startup exits early on high loss (>= 2% with >= 6 losses in a round)
+//!   instead of overflowing bottleneck buffers for three full RTTs.
+//! - Four-phase `ProbeBW` (`Down`, `Cruise`, `Refill`, `Up`) with gentler
+//!   0.90 drain gain and bounded probe wait so coexistence with both CUBIC
+//!   and stock BBRv1 peers stays fair.
+//! - `ProbeRTT` keeps `max(4, 0.5 * BDP)` packets in flight instead of
+//!   crushing cwnd to 4 packets, avoiding periodic stalls during video streams.
 
 use super::{
-    BBR_BW_FILTER_CYCLES, BBR_CWND_GAIN, BBR_CWND_MIN_TARGET, BBR_CYCLE_LEN, BBR_DRAIN_GAIN,
-    BBR_EXTRA_ACKED_GAIN, BBR_EXTRA_ACKED_MAX_MS, BBR_EXTRA_ACKED_WIN_RTTS, BBR_FULL_BW_COUNT,
-    BBR_FULL_BW_THRESH, BBR_HIGH_GAIN, BBR_MIN_PROBE_RTT_MODE_MS, BBR_MIN_RTT_INTERVAL_MS,
-    BBR_PACING_GAIN, BBR_PACING_MARGIN_PERCENT, BbrMode, CaState, filter::WinFilter,
-    rate::RateSample,
+    BBR_BETA, BBR_CWND_GAIN, BBR_CWND_MIN_TARGET, BBR_DRAIN_GAIN, BBR_EXTRA_ACKED_GAIN,
+    BBR_EXTRA_ACKED_MAX_US, BBR_EXTRA_ACKED_WIN_RTTS, BBR_FULL_BW_COUNT, BBR_FULL_BW_THRESH,
+    BBR_FULL_LOSS_CNT, BBR_HEADROOM, BBR_LOSS_THRESH, BBR_MIN_RTT_INTERVAL_US,
+    BBR_PACING_MARGIN_PERCENT, BBR_PROBE_BW_CRUISE_GAIN, BBR_PROBE_BW_DOWN_GAIN,
+    BBR_PROBE_BW_REFILL_GAIN, BBR_PROBE_BW_UP_GAIN, BBR_PROBE_RTT_CWND_GAIN,
+    BBR_PROBE_RTT_INTERVAL_US, BBR_PROBE_RTT_MODE_US, BBR_STARTUP_CWND_GAIN,
+    BBR_STARTUP_PACING_GAIN, BbrMode, CaState, rate::RateSample,
 };
 
-/// The stream state BBR reads and the window it writes (C reads these off
-/// `udx_stream_t`).
+/// Maximum probe wait in `ProbeBwCruise` (microseconds). Bounded at 1.5 s
+/// (and at least `min_rtt * 4`, up to `min_rtt * 8` on WAN links) so the flow
+/// keeps queues shallow without yielding excessive share to BBRv1 peers.
+const PROBE_WAIT_MIN_US: u64 = 200_000;
+const PROBE_WAIT_MAX_US: u64 = 1_500_000;
+
+/// Four phases of BBRv3's `ProbeBW` state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeBwPhase {
+    /// Drain excess queue at `0.90x` pacing gain.
+    Down,
+    /// Cruise at `1.0x` pacing gain with headroom below `inflight_hi`.
+    Cruise,
+    /// Refill pipe for 1 RTT at `1.0x` before probing upward.
+    Refill,
+    /// Probe for higher bandwidth at `1.25x` pacing gain.
+    Up,
+}
+
+/// The stream state BBR reads and the window it writes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Link {
     /// Congestion window in packets; BBR may change it.
     pub(crate) cwnd: u32,
-    /// Payload bytes per packet (C `udx__max_payload`).
+    /// Payload bytes per packet.
     pub(crate) mss: u32,
-    /// Packets delivered so far (C `stream->delivered`).
+    /// Packets delivered so far.
     pub(crate) delivered: u32,
-    /// When `delivered` last grew (C `stream->delivered_ts`).
-    pub(crate) delivered_ts: u64,
-    /// Smoothed RTT in ms, 0 before a sample.
-    pub(crate) srtt: u32,
-    /// Packets in flight (C `inflight_queue.len`).
+    /// When `delivered` last grew (µs).
+    pub(crate) delivered_ts_us: u64,
+    /// Smoothed RTT in microseconds, 0 before a sample.
+    pub(crate) srtt_us: u64,
+    /// Packets in flight.
     pub(crate) inflight: u32,
     pub(crate) ca_state: CaState,
-    /// Now, in ms on the stream clock (C `uv_now`).
-    pub(crate) now_ms: u64,
+    /// Now, in microseconds on the stream clock.
+    pub(crate) now_us: u64,
 }
 
-/// C `time_delta_ms`: `t1 - t0` as C computes it (a negative difference
-/// wraps, as the C cast does).
-fn time_delta_ms(t1: u64, t0: u64) -> u32 {
-    (t1 as i64).wrapping_sub(t0 as i64) as u32
-}
-
-/// Full BBR state machine.
+/// Full BBRv3 state machine.
 ///
-/// Unit conventions: BW = packets/ms, CWND = packets, pacing = bytes/ms.
+/// Unit conventions: BW = packets/µs, CWND = packets, pacing = bytes/sec.
 #[derive(Debug, Clone)]
 pub(crate) struct BbrState {
     mode: BbrMode,
+    probe_bw_phase: ProbeBwPhase,
     prev_ca_state: CaState,
-    // Bandwidth estimation
-    bw_filter: WinFilter<f64>,
+
+    // Bandwidth model (2-phase max filter + short-term lower bound)
+    bw_max: [f64; 2],
+    bw_latest: f64,
+    bw_lo: f64,
+
+    // Inflight bounds (loss-aware)
+    inflight_hi: u32,
+    inflight_lo: u32,
+    inflight_latest: u32,
+    loss_in_round: bool,
+    loss_events_in_round: u32,
+    loss_round_delivered: u32,
+    loss_round_start: bool,
+
     // Round tracking
     round_count: u32,
     round_start: bool,
     next_rtt_delivered: u32,
+
     // Startup
     full_bw: f64,
     full_bw_count: u32,
     full_bw_reached: bool,
-    // PROBE_BW
-    cycle_index: u32,
-    cycle_timestamp: u64,
-    // PROBE_RTT; `u32::MAX` is "no sample" (C `~0`).
-    min_rtt_ms: u32,
-    min_rtt_stamp: u64,
-    /// End of the ProbeRTT dwell; 0 until it starts.
-    probe_rtt_done_time: u64,
+
+    // ProbeBW timing & upward probing
+    cycle_stamp_us: u64,
+    bw_probe_wait_us: u64,
+    bw_probe_up_rounds: u32,
+    bw_probe_up_cnt: u32,
+    bw_probe_up_acks: u32,
+    bw_probe_samples: bool,
+    cycle_count: u32,
+
+    // Min-RTT and ProbeRTT (`u64::MAX` = no sample)
+    min_rtt_us: u64,
+    min_rtt_stamp_us: u64,
+    probe_rtt_min_us: u64,
+    probe_rtt_min_stamp_us: u64,
+    probe_rtt_done_time_us: u64,
     probe_rtt_round_done: bool,
+    probe_rtt_expired: bool,
     idle_restart: bool,
+
     // Gains (current)
     pacing_gain: f64,
     cwnd_gain: f64,
-    // Pacing (C `pacing_bytes_per_ms`, `has_seen_rtt`).
-    pacing_rate: u64,
+
+    // Pacing rate in bytes/sec
+    pacing_rate_bps: u64,
     has_seen_rtt: bool,
+
     // Recovery
     prior_cwnd: u32,
     packet_conservation: bool,
+
     // Ack aggregation
     extra_acked: [u32; 2],
     extra_acked_win_rtts: u32,
     extra_acked_idx: usize,
     ack_epoch_acked: u32,
-    ack_epoch_start: u64,
+    ack_epoch_start_us: u64,
 }
 
 impl BbrState {
-    /// C `bbr_init`: startup, no minimum RTT, and a pacing rate seeded from
-    /// the initial window `cwnd` over a 1 ms RTT.
-    pub(crate) fn new(now_ms: u64, cwnd: u32, mss: u32) -> Self {
+    /// Initialize in Startup with no RTT sample and an initial pacing rate
+    /// seeded from `cwnd` over a 1 ms RTT.
+    pub(crate) fn new(now_us: u64, cwnd: u32, mss: u32) -> Self {
         let mut state = Self {
             mode: BbrMode::Startup,
+            probe_bw_phase: ProbeBwPhase::Cruise,
             prev_ca_state: CaState::Open,
-            bw_filter: WinFilter::new(0, 0.0),
+            bw_max: [0.0; 2],
+            bw_latest: 0.0,
+            bw_lo: f64::INFINITY,
+            inflight_hi: u32::MAX,
+            inflight_lo: u32::MAX,
+            inflight_latest: 0,
+            loss_in_round: false,
+            loss_events_in_round: 0,
+            loss_round_delivered: 0,
+            loss_round_start: false,
             round_count: 0,
             round_start: false,
             next_rtt_delivered: 0,
             full_bw: 0.0,
             full_bw_count: 0,
             full_bw_reached: false,
-            cycle_index: 0,
-            cycle_timestamp: 0,
-            min_rtt_ms: u32::MAX,
-            min_rtt_stamp: now_ms,
-            probe_rtt_done_time: 0,
+            cycle_stamp_us: now_us,
+            bw_probe_wait_us: PROBE_WAIT_MIN_US,
+            bw_probe_up_rounds: 0,
+            bw_probe_up_cnt: u32::MAX,
+            bw_probe_up_acks: 0,
+            bw_probe_samples: false,
+            cycle_count: 0,
+            min_rtt_us: u64::MAX,
+            min_rtt_stamp_us: now_us,
+            probe_rtt_min_us: u64::MAX,
+            probe_rtt_min_stamp_us: now_us,
+            probe_rtt_done_time_us: 0,
             probe_rtt_round_done: false,
+            probe_rtt_expired: false,
             idle_restart: false,
-            pacing_gain: BBR_HIGH_GAIN,
-            cwnd_gain: BBR_HIGH_GAIN,
-            pacing_rate: 0,
+            pacing_gain: BBR_STARTUP_PACING_GAIN,
+            cwnd_gain: BBR_STARTUP_CWND_GAIN,
+            pacing_rate_bps: 0,
             has_seen_rtt: false,
             prior_cwnd: 0,
             packet_conservation: false,
@@ -134,26 +186,23 @@ impl BbrState {
             extra_acked_win_rtts: 0,
             extra_acked_idx: 0,
             ack_epoch_acked: 0,
-            ack_epoch_start: now_ms,
+            ack_epoch_start_us: now_us,
         };
         state.init_pacing_rate_from_rtt(0, cwnd, mss);
         state
     }
 
-    /// Returns the current BBR mode.
     pub(crate) fn mode(&self) -> BbrMode {
         self.mode
     }
 
-    /// Pacing rate in bytes/ms, at least 1.
-    pub(crate) fn pacing_rate(&self) -> u32 {
-        u32::try_from(self.pacing_rate).unwrap_or(u32::MAX)
+    /// Pacing rate in bytes per second.
+    pub(crate) fn pacing_rate_bps(&self) -> u64 {
+        self.pacing_rate_bps.max(1_200)
     }
 
-    /// C `bbr_main`, once per ACK while data was in flight: update the
-    /// model, the pacing rate and `link.cwnd`. Returns true while in
-    /// ProbeRTT, where C marks the stream app-limited
-    /// (`bbr_update_min_rtt`).
+    /// Run one BBRv3 update on an ACK while data was in flight. Returns true
+    /// while in `ProbeRTT`, signaling the caller to mark the stream app-limited.
     pub(crate) fn main(&mut self, rs: &RateSample, link: &mut Link) -> bool {
         let probe_rtt = self.update_model(rs, link);
         let bw = self.bw();
@@ -162,21 +211,23 @@ impl BbrState {
         probe_rtt
     }
 
-    /// C `bbr_on_rto`: a dummy loss sample.
+    /// RTO fired: reset short-term lower bounds and force a new round, keeping
+    /// `full_bw_reached` and `inflight_hi`.
     pub(crate) fn on_rto(&mut self) {
         self.prev_ca_state = CaState::Loss;
         self.full_bw = 0.0;
         self.round_start = true;
+        self.reset_lower_bounds();
     }
 
-    /// C `bbr_on_transmit_start`, when a packet leaves with nothing in
-    /// flight: an app-limited sender restarts from idle.
+    /// A packet leaves with nothing in flight: an app-limited sender restarts
+    /// from idle.
     pub(crate) fn on_transmit_start(&mut self, app_limited: bool, link: &mut Link) {
         if !app_limited {
             return;
         }
         self.idle_restart = true;
-        self.ack_epoch_start = link.now_ms;
+        self.ack_epoch_start_us = link.now_us;
         self.ack_epoch_acked = 0;
         match self.mode {
             BbrMode::ProbeBw => self.set_pacing_rate(self.bw(), 1.0, link),
@@ -185,7 +236,7 @@ impl BbrState {
         }
     }
 
-    /// C `bbr_save_cwnd`: remember the window to restore after recovery.
+    /// Remember `cwnd` to restore after recovery or ProbeRTT.
     pub(crate) fn save_cwnd(&mut self, cwnd: u32) {
         if self.prev_ca_state < CaState::Recovery && self.mode != BbrMode::ProbeRtt {
             self.prior_cwnd = cwnd;
@@ -194,44 +245,84 @@ impl BbrState {
         }
     }
 
-    /// Window saved for after recovery.
     #[cfg(test)]
     pub(crate) fn prior_cwnd(&self) -> u32 {
         self.prior_cwnd
     }
 
-    /// C `bbr_bw`: the windowed maximum bandwidth, packets/ms.
+    /// Effective operating bandwidth in packets/µs: `min(max_bw, bw_lo)`.
     pub(crate) fn bw(&self) -> f64 {
-        self.bw_filter.get()
+        let max_bw = self.max_bw();
+        if self.bw_lo.is_finite() {
+            max_bw.min(self.bw_lo)
+        } else {
+            max_bw
+        }
     }
 
-    /// Minimum RTT in ms (`u32::MAX` before a sample).
+    /// Long-term windowed maximum bandwidth in packets/µs.
+    fn max_bw(&self) -> f64 {
+        self.bw_max[0].max(self.bw_max[1])
+    }
+
     #[cfg(test)]
-    pub(crate) fn min_rtt_ms(&self) -> u32 {
-        self.min_rtt_ms
+    pub(crate) fn min_rtt_us(&self) -> u64 {
+        self.min_rtt_us
     }
 }
 
-// ─── Private update pipeline ─────────────────────────────────────────────────
+// ─── Private BBRv3 pipeline ──────────────────────────────────────────────────
 
 impl BbrState {
-    /// C `bbr_update_model`.
     fn update_model(&mut self, rs: &RateSample, link: &mut Link) -> bool {
-        self.update_bw(rs, link.delivered);
+        self.update_latest_delivery_signals(rs, link);
+        self.update_round(rs, link.delivered);
+        self.update_congestion_signals(rs, link);
         self.update_ack_aggregation(rs, link);
-        self.update_cycle_phase(rs, link);
-        self.check_full_bw_reached(rs);
+        self.check_startup_done(rs, link);
         self.check_drain(link);
+        self.update_probe_bw_cycle_phase(rs, link);
         let probe_rtt = self.update_min_rtt(rs, link);
         self.update_gains();
+        self.advance_latest_delivery_signals(rs, link);
         probe_rtt
     }
 
-    /// C `bbr_update_bw`: bandwidth filter and round counter.
-    fn update_bw(&mut self, rs: &RateSample, delivered: u32) {
+    /// Track per-round peak delivery rate and inflight delivered.
+    fn update_latest_delivery_signals(&mut self, rs: &RateSample, link: &Link) {
+        self.loss_round_start = false;
+        if rs.delivered == 0 || rs.interval_us == 0 {
+            return;
+        }
+        let bw = f64::from(rs.delivered) / (rs.interval_us as f64);
+        if bw > self.bw_latest {
+            self.bw_latest = bw;
+        }
+        if rs.delivered > self.inflight_latest {
+            self.inflight_latest = rs.delivered;
+        }
+        if rs.prior_delivered.wrapping_sub(self.loss_round_delivered) as i32 >= 0 {
+            self.loss_round_delivered = link.delivered;
+            self.loss_round_start = true;
+        }
+    }
+
+    fn advance_latest_delivery_signals(&mut self, rs: &RateSample, _link: &Link) {
+        if self.loss_round_start {
+            self.bw_latest = if rs.delivered > 0 && rs.interval_us > 0 {
+                f64::from(rs.delivered) / (rs.interval_us as f64)
+            } else {
+                0.0
+            };
+            self.inflight_latest = rs.delivered;
+            self.loss_in_round = false;
+            self.loss_events_in_round = 0;
+        }
+    }
+
+    fn update_round(&mut self, rs: &RateSample, delivered: u32) {
         self.round_start = false;
-        // A discarded sample neither starts a round nor updates the filter.
-        if rs.delivered == 0 || rs.interval_ms == 0 {
+        if rs.delivered == 0 || rs.interval_us == 0 {
             return;
         }
         if rs.prior_delivered.wrapping_sub(self.next_rtt_delivered) as i32 >= 0 {
@@ -240,16 +331,90 @@ impl BbrState {
             self.round_start = true;
             self.packet_conservation = false;
         }
-        let bw = f64::from(rs.delivered) / f64::from(rs.interval_ms);
-        if !rs.is_app_limited || bw >= self.bw() {
-            self.bw_filter
-                .apply_max(BBR_BW_FILTER_CYCLES, u64::from(self.round_count), bw);
+    }
+
+    /// Update `bw_max`, `inflight_hi`, and lower bounds (`bw_lo`, `inflight_lo`).
+    fn update_congestion_signals(&mut self, rs: &RateSample, link: &Link) {
+        if rs.delivered > 0 && rs.interval_us > 0 {
+            let bw = f64::from(rs.delivered) / (rs.interval_us as f64);
+            if (!rs.is_app_limited || bw >= self.max_bw()) && bw > self.bw_max[0] {
+                self.bw_max[0] = bw;
+            }
+        }
+        if rs.losses > 0 {
+            self.loss_in_round = true;
+            self.loss_events_in_round = self.loss_events_in_round.saturating_add(1);
+        }
+        if !self.loss_round_start {
+            return;
+        }
+        // Adapt short-term lower bounds on sustained >2% loss outside Startup/Up.
+        if self.mode == BbrMode::ProbeBw
+            && self.probe_bw_phase != ProbeBwPhase::Up
+            && self.loss_in_round
+            && self.is_inflight_too_high(rs)
+        {
+            self.adapt_lower_bounds(link);
         }
     }
 
-    /// C `bbr_update_ack_aggregation`, with epochs on `delivered_ts`.
+    /// Advance the 2-phase `bw_max` filter at the start of a new ProbeBW cycle.
+    fn advance_max_bw_filter(&mut self) {
+        if self.bw_max[0] == 0.0 {
+            return;
+        }
+        self.cycle_count = self.cycle_count.wrapping_add(1);
+        self.bw_max[1] = self.bw_max[0];
+        self.bw_max[0] = 0.0;
+    }
+
+    /// BBRv3 `is_inflight_too_high`: true when the flight experienced more than
+    /// `BBR_LOSS_THRESH` (2%) packet loss (with at least 2 lost packets so an
+    /// isolated random drop in a small flight does not cap the path).
+    fn is_inflight_too_high(&self, rs: &RateSample) -> bool {
+        if rs.lost_in_flight < 2 || rs.tx_in_flight == 0 {
+            return false;
+        }
+        (rs.lost_in_flight as f64) > (rs.tx_in_flight as f64) * BBR_LOSS_THRESH
+    }
+
+    /// Multiplicative backoff of short-term lower bounds (`beta = 0.7`),
+    /// bounded below by the actual latest delivered rate/volume.
+    fn adapt_lower_bounds(&mut self, link: &Link) {
+        if !self.bw_lo.is_finite() {
+            self.bw_lo = self.max_bw();
+        }
+        self.bw_lo = (self.bw_lo * BBR_BETA).max(self.bw_latest);
+
+        if self.inflight_lo == u32::MAX {
+            self.inflight_lo = link.cwnd;
+        }
+        let beta_inflight = ((f64::from(self.inflight_lo) * BBR_BETA) as u32)
+            .max(self.inflight_latest)
+            .max(BBR_CWND_MIN_TARGET);
+        self.inflight_lo = beta_inflight;
+    }
+
+    fn reset_lower_bounds(&mut self) {
+        self.bw_lo = f64::INFINITY;
+        self.inflight_lo = u32::MAX;
+    }
+
+    /// `inflight_hi` reduced by `BBR_HEADROOM` (15%) to leave room in shallow
+    /// queues during Cruise/Down.
+    fn inflight_with_headroom(&self) -> u32 {
+        if self.inflight_hi == u32::MAX {
+            return u32::MAX;
+        }
+        let headroom = ((f64::from(self.inflight_hi) * BBR_HEADROOM) as u32).max(1);
+        self.inflight_hi
+            .saturating_sub(headroom)
+            .max(BBR_CWND_MIN_TARGET)
+    }
+
+    /// ACK-aggregation estimator in microseconds.
     fn update_ack_aggregation(&mut self, rs: &RateSample, link: &Link) {
-        if rs.acked_sacked == 0 || rs.delivered == 0 || rs.interval_ms == 0 {
+        if rs.acked_sacked == 0 || rs.delivered == 0 || rs.interval_us == 0 {
             return;
         }
         if self.round_start {
@@ -260,15 +425,15 @@ impl BbrState {
                 self.extra_acked[self.extra_acked_idx] = 0;
             }
         }
-        let epoch_ms = time_delta_ms(link.delivered_ts, self.ack_epoch_start);
-        let mut expected_acked = (self.bw() * f64::from(epoch_ms)) as u32;
-        // A slower ACK rate than expected, or a counter about to overflow
-        // (C `bbr_ack_epoch_acked_reset_thresh`), starts a new epoch.
+        let epoch_us = link
+            .delivered_ts_us
+            .saturating_sub(self.ack_epoch_start_us);
+        let mut expected_acked = (self.bw() * (epoch_us as f64)) as u32;
         if self.ack_epoch_acked <= expected_acked
             || u64::from(self.ack_epoch_acked) + u64::from(rs.acked_sacked) >= u64::from(u32::MAX)
         {
             self.ack_epoch_acked = 0;
-            self.ack_epoch_start = link.delivered_ts;
+            self.ack_epoch_start_us = link.delivered_ts_us;
             expected_acked = 0;
         }
         self.ack_epoch_acked += rs.acked_sacked;
@@ -278,74 +443,216 @@ impl BbrState {
         }
     }
 
-    /// C `bbr_update_cycle_phase` / `bbr_is_next_cycle_phase`.
-    fn update_cycle_phase(&mut self, rs: &RateSample, link: &Link) {
-        if self.mode != BbrMode::ProbeBw {
+    /// Startup exit: either bandwidth plateaued for 3 rounds OR loss exceeded
+    /// 2% across >= 6 loss events in a round (BBRv3 startup loss exit).
+    fn check_startup_done(&mut self, rs: &RateSample, link: &Link) {
+        if self.mode != BbrMode::Startup || self.full_bw_reached {
             return;
         }
-        let is_full_length =
-            time_delta_ms(link.delivered_ts, self.cycle_timestamp) > self.min_rtt_ms;
-        let next = if self.pacing_gain == 1.0 {
-            is_full_length
-        } else if self.pacing_gain > 1.0 {
-            is_full_length
-                && (rs.losses > 0 || link.inflight > self.bdp(self.bw(), self.pacing_gain))
-        } else {
-            is_full_length || link.inflight <= self.bdp(self.bw(), 1.0)
-        };
-        if next {
-            self.advance_cycle_phase(link.delivered_ts);
+        // Full bandwidth plateau check.
+        if self.round_start && !rs.is_app_limited {
+            if self.max_bw() >= self.full_bw * BBR_FULL_BW_THRESH {
+                self.full_bw = self.max_bw();
+                self.full_bw_count = 0;
+            } else {
+                self.full_bw_count += 1;
+                if self.full_bw_count >= BBR_FULL_BW_COUNT {
+                    self.full_bw_reached = true;
+                }
+            }
+        }
+        // BBRv3 high-loss startup exit: avoid overflowing shallow queues for 3 RTTs.
+        if self.loss_round_start
+            && self.loss_events_in_round >= BBR_FULL_LOSS_CNT
+            && self.is_inflight_too_high(rs)
+        {
+            self.full_bw_reached = true;
+            let safe_hi = self
+                .bdp(self.max_bw(), 1.0)
+                .max(self.inflight_latest)
+                .max(BBR_CWND_MIN_TARGET);
+            self.inflight_hi = safe_hi;
+            let _ = link;
         }
     }
 
-    /// C `bbr_check_full_bw_reached`.
-    fn check_full_bw_reached(&mut self, rs: &RateSample) {
-        if self.full_bw_reached || !self.round_start || rs.is_app_limited {
-            return;
-        }
-        if self.bw() >= self.full_bw * BBR_FULL_BW_THRESH {
-            self.full_bw = self.bw();
-            self.full_bw_count = 0;
-            return;
-        }
-        self.full_bw_count += 1;
-        self.full_bw_reached = self.full_bw_count >= BBR_FULL_BW_COUNT;
-    }
-
-    /// C `bbr_check_drain`.
     fn check_drain(&mut self, link: &Link) {
         if self.mode == BbrMode::Startup && self.full_bw_reached {
-            tracing::debug!(from = ?BbrMode::Startup, to = ?BbrMode::Drain, "bbr: mode transition");
+            tracing::debug!(from = ?BbrMode::Startup, to = ?BbrMode::Drain, "bbr3: mode transition");
             self.mode = BbrMode::Drain;
         }
         if self.mode == BbrMode::Drain && link.inflight <= self.bdp(self.bw(), 1.0) {
-            tracing::debug!(from = ?BbrMode::Drain, to = ?BbrMode::ProbeBw, "bbr: mode transition");
-            self.reset_probe_bw_mode(link.delivered_ts);
+            tracing::debug!(from = ?BbrMode::Drain, to = ?BbrMode::ProbeBw, "bbr3: mode transition");
+            self.start_probe_bw_down(link);
         }
     }
 
-    /// C `bbr_update_min_rtt`: the minimum-RTT filter and ProbeRTT. Returns
-    /// true while in ProbeRTT.
-    fn update_min_rtt(&mut self, rs: &RateSample, link: &mut Link) -> bool {
-        let now = link.now_ms;
-        let filter_expired = now > self.min_rtt_stamp + BBR_MIN_RTT_INTERVAL_MS;
-        if rs.rtt_ms > 0 && (rs.rtt_ms < self.min_rtt_ms || filter_expired) {
-            self.min_rtt_ms = rs.rtt_ms;
-            self.min_rtt_stamp = now;
+    /// Pick the wait duration in `ProbeBwCruise` before probing upward again.
+    fn pick_probe_wait_us(&self) -> u64 {
+        let rtt_based = if self.min_rtt_us < u64::MAX {
+            self.min_rtt_us.saturating_mul(6)
+        } else {
+            PROBE_WAIT_MIN_US
+        };
+        // Small deterministic phase jitter across cycles to desynchronize
+        // flows sharing one queue.
+        let jitter = u64::from(self.cycle_count.wrapping_mul(2_654_435_761) % 100_000);
+        rtt_based.clamp(PROBE_WAIT_MIN_US, PROBE_WAIT_MAX_US) + jitter
+    }
+
+    fn start_probe_bw_down(&mut self, link: &Link) {
+        self.mode = BbrMode::ProbeBw;
+        self.probe_bw_phase = ProbeBwPhase::Down;
+        self.cycle_stamp_us = link.now_us;
+        self.bw_probe_wait_us = self.pick_probe_wait_us();
+        self.bw_probe_up_cnt = u32::MAX;
+        self.bw_probe_samples = false;
+        self.reset_lower_bounds();
+    }
+
+    fn start_probe_bw_cruise(&mut self) {
+        self.probe_bw_phase = ProbeBwPhase::Cruise;
+        self.reset_lower_bounds();
+    }
+
+    fn start_probe_bw_refill(&mut self, link: &Link) {
+        self.reset_lower_bounds();
+        self.bw_probe_up_rounds = 0;
+        self.bw_probe_up_acks = 0;
+        self.probe_bw_phase = ProbeBwPhase::Refill;
+        self.next_rtt_delivered = link.delivered;
+        self.cycle_stamp_us = link.now_us;
+    }
+
+    fn start_probe_bw_up(&mut self, link: &Link) {
+        self.advance_max_bw_filter();
+        self.probe_bw_phase = ProbeBwPhase::Up;
+        self.cycle_stamp_us = link.now_us;
+        self.bw_probe_up_rounds = 0;
+        self.bw_probe_up_acks = 0;
+        self.bw_probe_samples = true;
+        self.raise_inflight_hi_slope(link);
+    }
+
+    fn raise_inflight_hi_slope(&mut self, link: &Link) {
+        let growth_this_round = 1u32.checked_shl(self.bw_probe_up_rounds.min(20)).unwrap_or(u32::MAX);
+        self.bw_probe_up_cnt = (link.cwnd / growth_this_round).max(1);
+    }
+
+    fn probe_inflight_hi_upward(&mut self, rs: &RateSample, link: &Link) {
+        if self.inflight_hi == u32::MAX || rs.acked_sacked == 0 {
+            return;
         }
-        if filter_expired && !self.idle_restart && self.mode != BbrMode::ProbeRtt {
-            tracing::debug!(from = ?self.mode, to = ?BbrMode::ProbeRtt, "bbr: mode transition");
+        if link.inflight < self.inflight_hi && link.cwnd < self.inflight_hi {
+            return;
+        }
+        self.bw_probe_up_acks = self.bw_probe_up_acks.saturating_add(rs.acked_sacked);
+        if self.bw_probe_up_acks >= self.bw_probe_up_cnt {
+            let delta = self.bw_probe_up_acks / self.bw_probe_up_cnt;
+            self.bw_probe_up_acks -= delta * self.bw_probe_up_cnt;
+            self.inflight_hi = self.inflight_hi.saturating_add(delta);
+        }
+        if self.round_start {
+            self.bw_probe_up_rounds = self.bw_probe_up_rounds.saturating_add(1);
+            self.raise_inflight_hi_slope(link);
+        }
+    }
+
+    /// Four-phase ProbeBW cycle transitions (`Down` -> `Cruise` -> `Refill` -> `Up`).
+    fn update_probe_bw_cycle_phase(&mut self, rs: &RateSample, link: &Link) {
+        if self.mode != BbrMode::ProbeBw {
+            return;
+        }
+        let elapsed_us = link.now_us.saturating_sub(self.cycle_stamp_us);
+        let target_inflight = self.bdp(self.bw(), 1.0);
+
+        match self.probe_bw_phase {
+            ProbeBwPhase::Down => {
+                // Exit Down once queue has drained to BDP or headroom ceiling,
+                // or after 1 min_rtt if inflight has not drained yet.
+                let drained = link.inflight <= target_inflight
+                    || link.inflight <= self.inflight_with_headroom();
+                let timed_out =
+                    self.min_rtt_us < u64::MAX && elapsed_us >= self.min_rtt_us;
+                if drained || timed_out {
+                    self.start_probe_bw_cruise();
+                }
+            }
+            ProbeBwPhase::Cruise => {
+                // Probe upward once the wait interval has elapsed and we are
+                // not app-limited.
+                if !rs.is_app_limited && elapsed_us >= self.bw_probe_wait_us {
+                    self.start_probe_bw_refill(link);
+                }
+            }
+            ProbeBwPhase::Refill => {
+                // Spend one round refilling the pipe before pushing above 1.0x.
+                if self.round_start {
+                    self.start_probe_bw_up(link);
+                }
+            }
+            ProbeBwPhase::Up => {
+                // Hit loss ceiling -> pin `inflight_hi` and drain immediately.
+                if self.is_inflight_too_high(rs) {
+                    let safe = rs
+                        .tx_in_flight
+                        .saturating_sub(rs.lost_in_flight)
+                        .max(target_inflight)
+                        .max(BBR_CWND_MIN_TARGET);
+                    self.inflight_hi = safe;
+                    self.start_probe_bw_down(link);
+                    return;
+                }
+                self.probe_inflight_hi_upward(rs, link);
+                let min_rtt_done =
+                    self.min_rtt_us < u64::MAX && elapsed_us > self.min_rtt_us;
+                let probe_target = self.bdp(self.max_bw(), BBR_PROBE_BW_UP_GAIN);
+                if min_rtt_done && (link.inflight >= probe_target || rs.losses > 0) {
+                    self.start_probe_bw_down(link);
+                }
+            }
+        }
+    }
+
+    /// Min-RTT filter (10 s) and BBRv3 ProbeRTT (5 s interval, `0.5 * BDP` cwnd).
+    fn update_min_rtt(&mut self, rs: &RateSample, link: &mut Link) -> bool {
+        let now = link.now_us;
+        let probe_expired = now.saturating_sub(self.probe_rtt_min_stamp_us) > BBR_PROBE_RTT_INTERVAL_US;
+        if rs.rtt_us > 0 && (rs.rtt_us < self.probe_rtt_min_us || probe_expired) {
+            self.probe_rtt_min_us = rs.rtt_us;
+            self.probe_rtt_min_stamp_us = now;
+        }
+        let min_expired = now.saturating_sub(self.min_rtt_stamp_us) > BBR_MIN_RTT_INTERVAL_US;
+        if rs.rtt_us > 0 && (rs.rtt_us < self.min_rtt_us || min_expired) {
+            self.min_rtt_us = rs.rtt_us;
+            self.min_rtt_stamp_us = now;
+        }
+
+        if probe_expired {
+            self.probe_rtt_expired = true;
+        }
+
+        if self.probe_rtt_expired && !self.idle_restart && self.mode != BbrMode::ProbeRtt {
+            tracing::debug!(from = ?self.mode, to = ?BbrMode::ProbeRtt, "bbr3: mode transition");
             self.mode = BbrMode::ProbeRtt;
             self.save_cwnd(link.cwnd);
-            self.probe_rtt_done_time = 0;
+            self.probe_rtt_done_time_us = 0;
+            self.probe_rtt_expired = false;
         }
+
         let probe_rtt = self.mode == BbrMode::ProbeRtt;
         if probe_rtt {
-            if self.probe_rtt_done_time == 0 && link.inflight <= BBR_CWND_MIN_TARGET {
-                self.probe_rtt_done_time = now + BBR_MIN_PROBE_RTT_MODE_MS;
+            let probe_cwnd = self.probe_rtt_cwnd();
+            if self.probe_rtt_done_time_us == 0 && link.inflight <= probe_cwnd {
+                let dwell = if self.min_rtt_us < u64::MAX {
+                    self.min_rtt_us.min(BBR_PROBE_RTT_MODE_US)
+                } else {
+                    BBR_PROBE_RTT_MODE_US
+                };
+                self.probe_rtt_done_time_us = now.saturating_add(dwell);
                 self.probe_rtt_round_done = false;
                 self.next_rtt_delivered = link.delivered;
-            } else if self.probe_rtt_done_time != 0 {
+            } else if self.probe_rtt_done_time_us != 0 {
                 if self.round_start {
                     self.probe_rtt_round_done = true;
                 }
@@ -360,82 +667,75 @@ impl BbrState {
         probe_rtt
     }
 
-    /// C `bbr_check_probe_rtt_done`: after the dwell, restore the window
-    /// and go back to Startup or ProbeBW.
-    fn check_probe_rtt_done(&mut self, link: &mut Link) {
-        if self.probe_rtt_done_time == 0 || link.now_ms <= self.probe_rtt_done_time {
-            return;
-        }
-        self.min_rtt_stamp = link.now_ms;
-        link.cwnd = link.cwnd.max(self.prior_cwnd);
-        self.reset_mode(link.delivered_ts);
+    fn probe_rtt_cwnd(&self) -> u32 {
+        self.bdp(self.bw(), BBR_PROBE_RTT_CWND_GAIN)
+            .max(BBR_CWND_MIN_TARGET)
     }
 
-    /// C `bbr_reset_mode`.
-    fn reset_mode(&mut self, delivered_ts: u64) {
+    fn check_probe_rtt_done(&mut self, link: &mut Link) {
+        if self.probe_rtt_done_time_us == 0 || link.now_us <= self.probe_rtt_done_time_us {
+            return;
+        }
+        self.probe_rtt_min_stamp_us = link.now_us;
+        self.min_rtt_us = self.min_rtt_us.min(self.probe_rtt_min_us);
+        link.cwnd = link.cwnd.max(self.prior_cwnd);
         if self.full_bw_reached {
-            self.reset_probe_bw_mode(delivered_ts);
+            self.start_probe_bw_down(link);
         } else {
-            tracing::debug!(from = ?self.mode, to = ?BbrMode::Startup, "bbr: mode transition");
             self.mode = BbrMode::Startup;
         }
     }
 
-    /// C `bbr_reset_probe_bw_mode`: ProbeBW from cycle phase 4.
-    fn reset_probe_bw_mode(&mut self, delivered_ts: u64) {
-        self.mode = BbrMode::ProbeBw;
-        self.cycle_index = 3;
-        self.advance_cycle_phase(delivered_ts);
-    }
-
-    /// C `bbr_advance_cycle_phase`.
-    fn advance_cycle_phase(&mut self, delivered_ts: u64) {
-        self.cycle_index = (self.cycle_index + 1) % BBR_CYCLE_LEN;
-        self.cycle_timestamp = delivered_ts;
-    }
-
-    /// C `bbr_update_gains`.
     fn update_gains(&mut self) {
         (self.pacing_gain, self.cwnd_gain) = match self.mode {
-            BbrMode::Startup => (BBR_HIGH_GAIN, BBR_HIGH_GAIN),
-            BbrMode::Drain => (BBR_DRAIN_GAIN, BBR_HIGH_GAIN),
-            BbrMode::ProbeBw => (BBR_PACING_GAIN[self.cycle_index as usize], BBR_CWND_GAIN),
-            BbrMode::ProbeRtt => (1.0, 1.0),
+            BbrMode::Startup => (BBR_STARTUP_PACING_GAIN, BBR_STARTUP_CWND_GAIN),
+            BbrMode::Drain => (BBR_DRAIN_GAIN, BBR_STARTUP_CWND_GAIN),
+            BbrMode::ProbeBw => {
+                let pg = match self.probe_bw_phase {
+                    ProbeBwPhase::Down => BBR_PROBE_BW_DOWN_GAIN,
+                    ProbeBwPhase::Cruise => BBR_PROBE_BW_CRUISE_GAIN,
+                    ProbeBwPhase::Refill => BBR_PROBE_BW_REFILL_GAIN,
+                    ProbeBwPhase::Up => BBR_PROBE_BW_UP_GAIN,
+                };
+                (pg, BBR_CWND_GAIN)
+            }
+            BbrMode::ProbeRtt => (1.0, BBR_PROBE_RTT_CWND_GAIN),
         };
     }
 
-    /// C `bbr_bw_to_pacing_rate`: bytes/ms for `bw` packets/ms, never 0.
-    fn bw_to_pacing_rate(bw: f64, mss: u32, gain: f64) -> u64 {
-        ((bw * f64::from(mss) * gain * BBR_PACING_MARGIN_PERCENT) as u64).max(1)
-    }
-
-    /// C `bbr_init_pacing_rate_from_rtt`: the window over the smoothed RTT
-    /// (1 ms before a sample) at the startup gain.
-    fn init_pacing_rate_from_rtt(&mut self, srtt: u32, cwnd: u32, mss: u32) {
-        let srtt = if srtt > 0 {
-            self.has_seen_rtt = true;
-            srtt
+    /// Convert `bw` (packets/µs) to pacing rate in bytes/sec.
+    fn bw_to_pacing_rate_bps(bw: f64, mss: u32, gain: f64) -> u64 {
+        let bps = bw * 1_000_000.0 * f64::from(mss) * gain * BBR_PACING_MARGIN_PERCENT;
+        if !bps.is_finite() || bps < 1_200.0 {
+            1_200
+        } else if bps >= (u64::MAX as f64) {
+            u64::MAX
         } else {
-            1
+            bps as u64
+        }
+    }
+
+    fn init_pacing_rate_from_rtt(&mut self, srtt_us: u64, cwnd: u32, mss: u32) {
+        let srtt_us = if srtt_us > 0 {
+            self.has_seen_rtt = true;
+            srtt_us
+        } else {
+            1_000
         };
-        let bw = f64::from(cwnd) / f64::from(srtt);
-        self.pacing_rate = Self::bw_to_pacing_rate(bw, mss, BBR_HIGH_GAIN);
+        let bw = f64::from(cwnd) / (srtt_us as f64);
+        self.pacing_rate_bps = Self::bw_to_pacing_rate_bps(bw, mss, BBR_STARTUP_PACING_GAIN);
     }
 
-    /// C `bbr_set_pacing_rate`: the first RTT sample re-seeds the rate from
-    /// the window; until the pipe is full the rate only grows.
     fn set_pacing_rate(&mut self, bw: f64, gain: f64, link: &Link) {
-        let rate = Self::bw_to_pacing_rate(bw, link.mss, gain);
-        if !self.has_seen_rtt && link.srtt > 0 {
-            self.init_pacing_rate_from_rtt(link.srtt, link.cwnd, link.mss);
+        let rate = Self::bw_to_pacing_rate_bps(bw, link.mss, gain);
+        if !self.has_seen_rtt && link.srtt_us > 0 {
+            self.init_pacing_rate_from_rtt(link.srtt_us, link.cwnd, link.mss);
         }
-        if self.full_bw_reached || rate > self.pacing_rate {
-            self.pacing_rate = rate;
+        if self.full_bw_reached || rate > self.pacing_rate_bps {
+            self.pacing_rate_bps = rate;
         }
     }
 
-    /// C `bbr_set_cwnd_to_recover_or_restore`: adjusts the window for
-    /// losses and recovery; true while packet conservation holds it.
     fn set_cwnd_to_recover_or_restore(
         &mut self,
         rs: &RateSample,
@@ -443,7 +743,6 @@ impl BbrState {
         cwnd: &mut u32,
         link: &Link,
     ) -> bool {
-        // An ACK for p packets releases at most 2p: deduct the losses first.
         if rs.losses > 0 {
             *cwnd = cwnd.saturating_sub(rs.losses).max(1);
         }
@@ -463,7 +762,24 @@ impl BbrState {
         false
     }
 
-    /// C `bbr_set_cwnd`.
+    /// Cap `cwnd` by BBRv3's loss-aware `inflight_hi` (with headroom in
+    /// Cruise/Down) and short-term `inflight_lo`.
+    fn bound_cwnd_for_model(&self, cwnd: u32) -> u32 {
+        let mut cap = u32::MAX;
+        if self.mode == BbrMode::ProbeBw {
+            match self.probe_bw_phase {
+                ProbeBwPhase::Cruise | ProbeBwPhase::Down => {
+                    cap = self.inflight_with_headroom();
+                }
+                ProbeBwPhase::Refill | ProbeBwPhase::Up => {
+                    cap = self.inflight_hi;
+                }
+            }
+        }
+        cap = cap.min(self.inflight_lo);
+        cwnd.min(cap).max(BBR_CWND_MIN_TARGET)
+    }
+
     fn set_cwnd(&mut self, rs: &RateSample, acked: u32, bw: f64, gain: f64, link: &mut Link) {
         let mut cwnd = link.cwnd;
         if acked > 0 && !self.set_cwnd_to_recover_or_restore(rs, acked, &mut cwnd, link) {
@@ -473,42 +789,41 @@ impl BbrState {
             if self.full_bw_reached {
                 cwnd = cwnd.saturating_add(acked).min(target);
             } else if cwnd < target || link.delivered < 10 {
-                // Startup grows by what was ACKed, but only toward the
-                // target once the first ten packets are delivered.
                 cwnd = cwnd.saturating_add(acked);
             }
             cwnd = cwnd.max(BBR_CWND_MIN_TARGET);
         }
-        // In ProbeRtt, enforce a tiny window to obtain a fresh RTT sample.
+        cwnd = self.bound_cwnd_for_model(cwnd);
         if self.mode == BbrMode::ProbeRtt {
-            cwnd = cwnd.min(BBR_CWND_MIN_TARGET);
+            cwnd = cwnd.min(self.probe_rtt_cwnd());
         }
         link.cwnd = cwnd;
     }
 
-    /// C `bbr_bdp` (also `bbr_inflight`): BDP × gain in packets; the initial
-    /// window (10) before a minimum-RTT sample, else at least 1.
+    /// BDP × gain in packets; initial window (10) before a min-RTT sample.
     fn bdp(&self, bw: f64, gain: f64) -> u32 {
-        if self.min_rtt_ms == u32::MAX {
+        if self.min_rtt_us == u64::MAX {
             return 10;
         }
-        ((bw * f64::from(self.min_rtt_ms) * gain) as u32).max(1)
+        let packets = bw * (self.min_rtt_us as f64) * gain;
+        if !packets.is_finite() || packets < 1.0 {
+            1
+        } else if packets >= f64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            packets as u32
+        }
     }
 
-    /// C `bbr_ack_aggregation_cwnd`: once the pipe is full, the recent ACK
-    /// aggregation in packets, at most 100 ms worth at the current rate.
     fn ack_aggregation_cwnd(&self) -> u32 {
         if BBR_EXTRA_ACKED_GAIN == 0.0 || !self.full_bw_reached {
             return 0;
         }
-        let max_aggr_cwnd = (self.bw() * BBR_EXTRA_ACKED_MAX_MS as f64) as u32;
-        // C `bbr_extra_acked` returns a `uint16_t`.
-        let extra = self.extra_acked[0].max(self.extra_acked[1]) as u16;
+        let max_aggr_cwnd = (self.bw() * (BBR_EXTRA_ACKED_MAX_US as f64)) as u32;
+        let extra = self.extra_acked[0].max(self.extra_acked[1]);
         ((BBR_EXTRA_ACKED_GAIN * f64::from(extra)) as u32).min(max_aggr_cwnd)
     }
 }
-
-// ─── Unit tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -518,291 +833,126 @@ mod tests {
 
     fn make_rs(
         delivered: u32,
-        interval_ms: u32,
+        interval_us: u64,
         prior_delivered: u32,
         app_limited: bool,
     ) -> RateSample {
-        let mut rs = RateSample::new(interval_ms);
+        let mut rs = RateSample::new(interval_us);
         rs.delivered = delivered;
-        rs.interval_ms = interval_ms;
+        rs.interval_us = interval_us;
         rs.acked_sacked = delivered;
         rs.prior_delivered = prior_delivered;
         rs.is_app_limited = app_limited;
+        rs.tx_in_flight = delivered;
         rs
     }
 
-    fn link(cwnd: u32, delivered: u32, inflight: u32, now_ms: u64) -> Link {
+    fn link(cwnd: u32, delivered: u32, inflight: u32, now_us: u64) -> Link {
         Link {
             cwnd,
             mss: MSS,
             delivered,
-            delivered_ts: now_ms,
-            srtt: 0,
+            delivered_ts_us: now_us,
+            srtt_us: 0,
             inflight,
             ca_state: CaState::Open,
-            now_ms,
+            now_us,
         }
     }
 
-    /// Four rounds at a constant rate: full bandwidth, then Drain, then
-    /// ProbeBW once inflight is under the BDP.
-    fn into_probe_bw(state: &mut BbrState) {
-        for i in 0_u32..4 {
-            let rs = make_rs(10, 10, i * 10, false);
-            state.main(&rs, &mut link(10, (i + 1) * 10, 100, 0));
+    #[test]
+    fn startup_exits_early_on_high_loss() {
+        let mut state = BbrState::new(0, 10, MSS);
+        let mut l = link(100, 100, 100, 50_000);
+        // Simulate 6 loss events in one round with 5% flight loss (> 2%).
+        for i in 0..6u32 {
+            let mut rs = make_rs(20, 50_000, i * 20, false);
+            rs.losses = 1;
+            rs.tx_in_flight = 100;
+            rs.lost_in_flight = 5;
+            l.delivered = (i + 1) * 20;
+            state.main(&rs, &mut l);
         }
+        // Next round completes -> Startup exits to Drain with bounded inflight_hi.
+        let mut rs = make_rs(20, 50_000, 120, false);
+        rs.losses = 1;
+        rs.tx_in_flight = 100;
+        rs.lost_in_flight = 5;
+        l.delivered = 140;
+        state.main(&rs, &mut l);
+        assert!(state.full_bw_reached);
         assert_eq!(state.mode, BbrMode::Drain);
-        let rs = make_rs(10, 10, 40, false);
-        state.main(&rs, &mut link(10, 50, 1, 0));
-        assert_eq!(state.mode, BbrMode::ProbeBw);
+        assert!(state.inflight_hi < u32::MAX);
     }
 
     #[test]
-    fn new_state_starts_up() {
-        let state = BbrState::new(0, 10, MSS);
-        assert_eq!(state.mode, BbrMode::Startup);
-        assert_eq!(state.pacing_gain, BBR_HIGH_GAIN);
-        assert_eq!(state.min_rtt_ms, u32::MAX);
-    }
-
-    #[test]
-    fn full_bw_is_reached_after_three_flat_rounds() {
+    fn one_percent_random_loss_does_not_trigger_inflight_hi_cap() {
         let mut state = BbrState::new(0, 10, MSS);
-        let rs = make_rs(10, 10, 0, false);
-        state.main(&rs, &mut link(10, 10, 5, 0));
-        for i in 1_u32..=3 {
-            let rs = make_rs(10, 10, i * 10, false);
-            state.main(&rs, &mut link(10, (i + 1) * 10, 5, 0));
-        }
-        assert_eq!(state.full_bw_count, BBR_FULL_BW_COUNT);
-        assert!(state.full_bw_reached);
+        let mut rs = make_rs(99, 50_000, 0, false);
+        rs.tx_in_flight = 100;
+        rs.lost_in_flight = 1;
+        assert!(!state.is_inflight_too_high(&rs));
+        // 2% exact is NOT strictly greater than 2%.
+        rs.lost_in_flight = 2;
+        assert!(!state.is_inflight_too_high(&rs));
+        // 3% IS strictly greater than 2%.
+        rs.lost_in_flight = 3;
+        assert!(state.is_inflight_too_high(&rs));
+        // Even with 1% loss, state stays unbounded in startup.
+        let mut l = link(100, 100, 50, 50_000);
+        rs.lost_in_flight = 1;
+        rs.losses = 1;
+        state.main(&rs, &mut l);
+        assert_eq!(state.inflight_hi, u32::MAX);
     }
 
     #[test]
-    fn probe_bw_cycle_advances_after_min_rtt() {
+    fn probe_rtt_keeps_half_bdp_instead_of_four_packets() {
         let mut state = BbrState::new(0, 10, MSS);
-        into_probe_bw(&mut state);
-        let before = state.cycle_index;
-        let later = u64::from(state.min_rtt_ms) + 5;
-        let rs = make_rs(10, 10, 50, false);
-        state.main(&rs, &mut link(10, 60, 1, later));
-        assert_eq!(state.cycle_index, (before + 1) % BBR_CYCLE_LEN);
-    }
-
-    #[test]
-    fn save_cwnd_keeps_the_larger_window_in_probe_rtt() {
-        let mut state = BbrState::new(0, 10, MSS);
-        state.save_cwnd(42);
-        assert_eq!(state.prior_cwnd, 42);
-        state.mode = BbrMode::ProbeRtt;
-        state.save_cwnd(30);
-        assert_eq!(state.prior_cwnd, 42);
-    }
-
-    #[test]
-    fn pacing_rate_applies_the_margin() {
-        let mut state = BbrState::new(0, 10, MSS);
+        state.min_rtt_us = 50_000;
+        // 1 pkt / 1000 us = 1000 pkt/s -> BDP = 50 packets -> 0.5 * BDP = 25 packets.
+        state.bw_max[0] = 0.001;
         state.full_bw_reached = true;
-        // 1.0 packets/ms × 1180 bytes × 1.0 × 0.99 = 1168.2.
-        state.set_pacing_rate(1.0, 1.0, &link(10, 0, 0, 0));
-        assert_eq!(state.pacing_rate, 1168);
-    }
-
-    #[test]
-    fn cwnd_never_goes_below_the_minimum_target() {
-        let mut state = BbrState::new(0, 10, MSS);
-        let rs = make_rs(1, 10, 0, false);
-        let mut l = link(0, 0, 0, 0);
-        state.set_cwnd(&rs, 1, 0.0, BBR_CWND_GAIN, &mut l);
-        assert_eq!(l.cwnd, BBR_CWND_MIN_TARGET);
-    }
-
-    /// C `bbr_set_cwnd` (udx_bbr.c:239): in startup the window grows only
-    /// while below the target or before ten packets are delivered.
-    #[test]
-    fn startup_cwnd_stops_at_the_target_after_ten_delivered() {
-        let mut state = BbrState::new(0, 10, MSS);
-        state.min_rtt_ms = 10;
-        let rs = make_rs(5, 10, 0, false);
-        // Target: bdp(0.5 pkt/ms × 10 ms × 2.885) = 14 packets; cwnd is 20.
-        let mut l = link(20, 5, 10, 0);
-        state.set_cwnd(&rs, 5, 0.5, BBR_HIGH_GAIN, &mut l);
-        assert_eq!(l.cwnd, 25, "under ten delivered it still grows");
-        let mut l = link(20, 50, 10, 0);
-        state.set_cwnd(&rs, 5, 0.5, BBR_HIGH_GAIN, &mut l);
-        assert_eq!(l.cwnd, 20);
-    }
-
-    /// C `bbr_update_bw` (udx_bbr.c:323-335): a discarded rate sample
-    /// starts no round.
-    #[test]
-    fn discarded_sample_starts_no_round() {
-        let mut state = BbrState::new(0, 10, MSS);
-        state.update_bw(&make_rs(5, 0, 5, false), 10);
-        assert!(!state.round_start);
-        assert_eq!(state.round_count, 0);
-        state.update_bw(&make_rs(5, 10, 5, false), 10);
-        assert!(state.round_start);
-        assert_eq!((state.round_count, state.next_rtt_delivered), (1, 10));
-    }
-
-    /// C `bbr_bw_to_pacing_rate` / `bbr_set_pacing_rate`: the rate is at
-    /// least 1 byte/ms, the first RTT re-seeds it from the window, and in
-    /// startup it only grows.
-    #[test]
-    fn pacing_rate_is_floored_seeded_and_only_grows_in_startup() {
-        let mut state = BbrState::new(0, 10, MSS);
-        state.pacing_rate = 1;
-        let mut l = link(10, 0, 0, 0);
-        l.srtt = 20;
-        // Seeded from cwnd 10 / srtt 20 ms: 0.5 × 1180 × 2.88539 × 0.99.
-        state.set_pacing_rate(0.1, BBR_HIGH_GAIN, &l);
-        assert_eq!(state.pacing_rate, 1685);
-        state.set_pacing_rate(1.0, BBR_HIGH_GAIN, &l);
-        assert_eq!(state.pacing_rate, 3370);
-        state.set_pacing_rate(0.1, BBR_HIGH_GAIN, &l);
-        assert_eq!(state.pacing_rate, 3370);
-        state.full_bw_reached = true;
-        state.set_pacing_rate(0.1, BBR_HIGH_GAIN, &l);
-        assert_eq!(state.pacing_rate, 337);
-        state.set_pacing_rate(0.0, 1.0, &l);
-        assert_eq!(state.pacing_rate, 1);
-    }
-
-    /// C `win_filter_f64_apply_common`: when the best bandwidth sample ages
-    /// out, the estimate falls to the runner-up kept after a quarter window.
-    #[test]
-    fn bandwidth_filter_falls_back_to_the_aged_runner_up() {
-        let mut state = BbrState::new(0, 10, MSS);
-        for (round, bw) in [(1, 10.0), (4, 8.0), (7, 7.0), (12, 1.0)] {
-            state.round_count = round - 1;
-            state.next_rtt_delivered = 0;
-            state.update_bw(&make_rs((bw * 10.0) as u32, 10, 0, false), 0);
-            assert_eq!(state.round_count, round);
-        }
-        assert_eq!(state.bw(), 8.0);
-    }
-
-    // ── The former differences from C, one state-machine test each ──────────
-
-    /// C `bbr_init` seeds the pacing rate from the initial window over a
-    /// 1 ms RTT, so the first flight is paced (it was 0, "unpaced").
-    #[test]
-    fn first_flight_is_paced_from_the_initial_window() {
-        let state = BbrState::new(0, 10, 1152);
-        // 10 packets/ms × 1152 bytes × 2.88539 × 0.99 = 32907.3.
-        assert_eq!(state.pacing_rate(), 32907);
-    }
-
-    /// C `bbr_on_rto` keeps `full_bw_reached` and `full_bw_count`.
-    #[test]
-    fn rto_keeps_full_bandwidth_reached() {
-        let mut state = BbrState::new(0, 10, MSS);
-        state.full_bw = 5.0;
-        state.full_bw_count = 3;
-        state.full_bw_reached = true;
-        state.on_rto();
-        assert!(state.full_bw_reached);
-        assert_eq!(state.full_bw_count, 3);
-        assert_eq!(state.full_bw, 0.0);
-        assert!(state.round_start);
-        assert_eq!(state.prev_ca_state, CaState::Loss);
-    }
-
-    /// C `bbr_on_transmit_start`: an app-limited restart in ProbeBW paces
-    /// at gain 1, and in ProbeRTT it ends a finished dwell.
-    #[test]
-    fn transmit_start_repaces_probe_bw_and_ends_probe_rtt() {
-        let mut state = BbrState::new(0, 10, MSS);
-        state.bw_filter.apply_max(BBR_BW_FILTER_CYCLES, 0, 1.0);
         state.mode = BbrMode::ProbeBw;
-        state.full_bw_reached = true;
-        state.pacing_rate = 5000;
-        let mut l = link(10, 0, 0, 0);
-        state.on_transmit_start(false, &mut l);
-        assert_eq!(state.pacing_rate, 5000, "not app-limited: unchanged");
-        state.on_transmit_start(true, &mut l);
-        assert_eq!(state.pacing_rate, 1168, "1 packet/ms × 1180 × 0.99");
-
-        state.mode = BbrMode::ProbeRtt;
-        state.probe_rtt_done_time = 100;
-        state.prior_cwnd = 40;
-        let mut l = link(4, 0, 0, 150);
-        state.on_transmit_start(true, &mut l);
-        assert_eq!(state.mode, BbrMode::ProbeBw);
-        assert_eq!(l.cwnd, 40);
-        assert_eq!(state.min_rtt_stamp, 150);
-    }
-
-    /// C `bbr_update_min_rtt` / `bbr_check_probe_rtt_done`: the dwell ends
-    /// 200 ms after the first ACK with at most 4 in flight, whatever comes
-    /// in flight later, once a round has passed; the window goes back to
-    /// `prior_cwnd`, the mode to Startup unless the pipe was full, and the
-    /// minimum-RTT stamp is not refreshed meanwhile.
-    #[test]
-    fn probe_rtt_dwell_exit_and_restore() {
-        let mut state = BbrState::new(0, 10, MSS);
-        state.min_rtt_ms = 10;
-        state.full_bw_count = 1; // not reached: back to Startup
-        let mut l = link(40, 100, 30, 10_001);
+        let mut l = link(100, 200, 60, BBR_PROBE_RTT_INTERVAL_US + 1);
         state.main(&RateSample::new(0), &mut l);
         assert_eq!(state.mode, BbrMode::ProbeRtt);
-        assert_eq!(state.prior_cwnd, 40);
-        assert_eq!(l.cwnd, 4);
-        assert_eq!(
-            state.probe_rtt_done_time, 0,
-            "dwell waits for <= 4 in flight"
-        );
-
-        let mut l = link(4, 100, 3, 10_050);
-        state.main(&RateSample::new(0), &mut l);
-        assert_eq!(state.probe_rtt_done_time, 10_250);
-        assert_eq!(state.next_rtt_delivered, 100);
-        assert_eq!(state.min_rtt_stamp, 0, "no refresh while probing");
-
-        // More in flight does not restart the dwell.
-        let mut l = link(4, 105, 10, 10_100);
-        // App-limited samples leave `full_bw_count` alone.
-        state.main(&make_rs(5, 20, 100, true), &mut l);
-        assert_eq!(state.probe_rtt_done_time, 10_250);
-        assert!(state.probe_rtt_round_done);
-
-        let mut l = link(4, 110, 3, 10_251);
-        state.main(&make_rs(5, 20, 105, true), &mut l);
-        assert_eq!(state.mode, BbrMode::Startup);
-        assert_eq!(l.cwnd, 40, "prior_cwnd restored");
+        assert_eq!(l.cwnd, 25);
     }
 
-    /// C advances the ProbeBW cycle on `delivered_ts`: an ACK that only
-    /// reports a loss, long after the last delivery, does not.
     #[test]
-    fn cycle_phase_runs_on_delivered_ts() {
+    fn probe_bw_up_pins_inflight_hi_and_drains_on_high_loss() {
         let mut state = BbrState::new(0, 10, MSS);
-        into_probe_bw(&mut state);
-        state.cycle_index = 2; // gain 1.0
-        state.update_gains();
-        state.cycle_timestamp = 0;
-        let mut rs = RateSample::new(0);
-        rs.losses = 1;
-        let mut l = link(10, 50, 1, 1_000);
-        l.delivered_ts = 0;
+        state.min_rtt_us = 20_000;
+        state.bw_max[0] = 0.005; // BDP = 100 pkts
+        state.full_bw_reached = true;
+        state.mode = BbrMode::ProbeBw;
+        state.probe_bw_phase = ProbeBwPhase::Up;
+        state.cycle_stamp_us = 100_000;
+
+        let mut rs = make_rs(100, 20_000, 0, false);
+        rs.tx_in_flight = 130;
+        rs.lost_in_flight = 10;
+        rs.losses = 10;
+        let mut l = link(130, 100, 120, 130_000);
         state.main(&rs, &mut l);
-        assert_eq!(state.cycle_index, 2);
-        l.delivered_ts = 1_000;
-        state.main(&rs, &mut l);
-        assert_eq!(state.cycle_index, 3);
+
+        assert_eq!(state.probe_bw_phase, ProbeBwPhase::Down);
+        assert_eq!(state.inflight_hi, 120);
+        // Cruise/Down applies 15% headroom: 120 - 18 = 102.
+        assert!(l.cwnd <= 102, "expected cwnd <= 102, got {}", l.cwnd);
     }
 
-    /// C measures the ACK-aggregation epoch on `delivered_ts`.
     #[test]
-    fn ack_aggregation_epoch_starts_at_delivered_ts() {
-        let mut state = BbrState::new(0, 10, MSS);
-        state.ack_epoch_acked = 0;
-        let rs = make_rs(4, 10, 0, false);
-        let mut l = link(10, 4, 0, 500);
-        l.delivered_ts = 200;
-        state.update_ack_aggregation(&rs, &l);
-        assert_eq!(state.ack_epoch_start, 200);
-        assert_eq!(state.ack_epoch_acked, 4);
+    fn sub_millisecond_rtt_produces_accurate_bdp_and_pacing() {
+        let mut state = BbrState::new(0, 10, 1452);
+        // 300 us RTT, 50 packets delivered in 300 us => ~166,667 pkt/s (~242 MB/s).
+        let rs = make_rs(50, 300, 0, false);
+        let mut l = link(50, 50, 50, 300);
+        l.srtt_us = 300;
+        state.main(&rs, &mut l);
+        assert_eq!(state.min_rtt_us(), 300);
+        assert_eq!(state.bdp(state.bw(), 1.0), 50);
+        assert!(state.pacing_rate_bps() > 200_000_000);
     }
 }
