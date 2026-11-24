@@ -17,9 +17,6 @@ const INITIAL_BUCKET_BYTES: u64 = 25_000;
 /// Largest GSO burst quantum waited for between sends: one max UDP GSO send.
 const MAX_GSO_QUANTUM_BYTES: u64 = 65_507;
 
-/// Upper bound on 1 ms idle token accrual (4 MiB -> >32 Gbit/s).
-const MAX_IDLE_BURST_BYTES: u64 = 4 * 1024 * 1024;
-
 /// Minimum pacing rate (bytes/s) to prevent division by zero or infinite waits.
 const MIN_RATE_BPS: u64 = 1_200;
 
@@ -82,16 +79,17 @@ impl TokenBucket {
         }
     }
 
-    /// Maximum burst credit in bytes: ~4 ms of traffic at the current rate,
+    /// Maximum burst credit in bytes: ~2 ms of traffic at the current rate,
     /// floored at 2 packets (so low rates stay smooth without overshooting)
-    /// and bounded by `MAX_IDLE_BURST_BYTES`. Allowing 4 ms of slack ensures
-    /// 1 ms async timer-wheel rounding (e.g. a 1.05 ms pacing sleep waking at
-    /// 1.8 ms) never clamps away elapsed credit and under-paces the stream,
-    /// while `udp::send_batch` segments each send into <= 64 KiB GSO calls.
+    /// and capped at one max UDP GSO send (`65_507` bytes). Two milliseconds of
+    /// slack prevents 1 ms async timer-wheel rounding (e.g. a 1.45 ms pacing
+    /// sleep waking at 2.0 ms) from clamping away elapsed credit, while the
+    /// 64 KiB ceiling prevents multi-hundred-KiB Startup bursts from
+    /// overflowing bottleneck queues.
     fn burst_cap_bytes(&self) -> u64 {
-        let four_ms = self.rate_bps / 250;
+        let two_ms = self.rate_bps / 500;
         let min_burst = u64::from(self.mss).saturating_mul(2);
-        four_ms.clamp(min_burst, MAX_IDLE_BURST_BYTES)
+        two_ms.clamp(min_burst, MAX_GSO_QUANTUM_BYTES)
     }
 
     /// Refill tokens for the exact nanoseconds elapsed since the last refill.
@@ -262,23 +260,22 @@ mod tests {
         );
     }
 
-    /// At 1 Gbit/s (125 MB/s), idle burst slack holds ~4 ms (~500 KiB) so 1 ms
-    /// async timer ticks never clamp away elapsed credit on multi-Gbit/s paths.
+    /// At 1 Gbit/s (125 MB/s), idle burst credit caps at one max UDP GSO send
+    /// (`65_507` B) so Startup / idle restarts never dump >64 KiB bursts.
     #[test]
-    fn high_rate_allows_timer_slack_without_truncating_credit() {
+    fn high_rate_caps_idle_burst_to_one_gso_send() {
         let start = Instant::now();
         let mut tb = TokenBucket::new(125_000_000, 1452, start);
         assert!(tb.try_consume(INITIAL_BUCKET_BYTES as u32, start));
-        // Simulate a 2 ms timer wakeup (1 ms overshoot): full 250 KB is credited.
-        let t2 = start + Duration::from_millis(2);
-        tb.refill(t2);
+        let t10 = start + Duration::from_millis(10);
+        tb.refill(t10);
         let mut burst = 0u32;
-        while tb.try_consume(1452, t2) {
+        while tb.try_consume(1452, t10) {
             burst += 1452;
         }
         assert!(
-            (249_000..=253_000).contains(&burst),
-            "expected ~250 KB for 2 ms at 1 Gbit/s, got {burst}"
+            burst >= 64_000 && burst <= MAX_GSO_QUANTUM_BYTES as u32 + 1452,
+            "expected ~65 KB GSO-capped burst at 1 Gbit/s, got {burst}"
         );
     }
 
