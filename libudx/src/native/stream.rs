@@ -3185,6 +3185,9 @@ async fn process_incoming(
 
                                 let end_acked_now = outcome.ack_advanced && guard.end_acked();
                                 if end_acked_now && guard.remote_ended {
+                                    for event in read_events.drain(..) {
+                                        let _ = read_tx.send(event);
+                                    }
                                     guard.close_ended();
                                     should_break = true;
                                     break;
@@ -3222,10 +3225,16 @@ async fn process_incoming(
                                 }
 
                                 if guard.all_ended() {
+                                    for event in read_events.drain(..) {
+                                        let _ = read_tx.send(event);
+                                    }
                                     guard.close_ended();
                                     should_break = true;
                                     break;
                                 } else if is_destroy {
+                                    for event in read_events.drain(..) {
+                                        let _ = read_tx.send(event);
+                                    }
                                     guard.fail(
                                         std::io::ErrorKind::ConnectionReset,
                                         "stream destroyed by peer",
@@ -3531,9 +3540,15 @@ async fn process_incoming(
                                             ack = guard.ack_packet();
                                         }
                                         if guard.all_ended() {
+                                            for event in read_events.drain(..) {
+                                                let _ = read_tx.send(event);
+                                            }
                                             guard.close_ended();
                                             brk = true;
                                         } else if is_destroy {
+                                            for event in read_events.drain(..) {
+                                                let _ = read_tx.send(event);
+                                            }
                                             guard.fail(
                                                 std::io::ErrorKind::ConnectionReset,
                                                 "stream destroyed by peer",
