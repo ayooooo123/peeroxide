@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The receive loop decodes a stream packet's header from the receive buffer, holds the stream table lock once for a run of stream packets, and slices packet bodies from a 64 KiB `BytesMut` slab into refcounted `Bytes` values. A datagram for no stream, and a stream in time-wait, release the table before the fallback channel or the time-wait answer.
-- The stream hot path backs outbound packets with a 64 KiB `BytesMut` slab (cloning `Bytes` handles instead of copying each packet on send/retransmit), collapses per-packet `StreamInner` and `UdxSocket` locks to a single `StreamInner` lock on the fast path, drains up to 32 incoming packets per wake, keeps plain 20-byte ACKs/heartbeats inline on the stack, reuses ACK/send scratch buffers, takes post-BBR sends in the same pass, and coalesces queued DATA packets in `UdxAsyncStream::poll_read`.
+- The receive loop decodes a stream packet's header from the receive buffer, holds the stream table lock once for a run of stream packets, coalesces redundant intermediate pure cumulative ACKs within a receive batch (preserving duplicate ACKs, SACKs, window shrinks, and non-ACK packets), and slices packet bodies from a 64 KiB `BytesMut` slab into refcounted `Bytes` values. A datagram for no stream, and a stream in time-wait, release the table before the fallback channel or the time-wait answer.
+- The stream hot path replaces the `BTreeMap` outgoing buffer with an O(1) sequence-indexed `VecDeque` ring buffer, backs outbound packets with a 64 KiB `BytesMut` slab (cloning `Bytes` handles instead of copying each packet on send/retransmit), processes incoming bursts under a single `StreamInner` lock, sends immediately on write notifications without an extra pacing-timer round-trip, keeps plain 20-byte ACKs/heartbeats and up to 8-range SACK ACKs inline on the stack, reuses ACK/SACK/send scratch buffers, takes post-BBR sends in the same pass, and coalesces queued DATA packets in `UdxAsyncStream::poll_read`.
 
 ### Added
 

@@ -13,7 +13,7 @@ use super::congestion::filter::WinFilter;
 use super::congestion::rate::Delivered;
 use super::header::{
     FLAG_DATA, FLAG_DESTROY, FLAG_END, FLAG_HEARTBEAT, FLAG_MESSAGE, FLAG_SACK, HEADER_SIZE,
-    Header, SackRange, decode_sack, encode_sack,
+    Header, SackRange, decode_sack_into, encode_sack,
 };
 use crate::error::{Result, UdxError};
 
@@ -246,7 +246,7 @@ impl Timewait {
             return;
         }
         if let Some(udp) = self.udp.upgrade() {
-            send_now(Some((udp, self.remote_addr, ControlBytes::Inline(self.header))));
+            send_now(Some((udp, self.remote_addr, ControlBytes::inline_header(self.header))));
         }
     }
 }
@@ -289,6 +289,217 @@ impl SentPacket {
     /// Counted by `inflight()`: neither SACKed nor waiting for a retransmit.
     fn is_inflight(&self) -> bool {
         !self.sacked && !self.lost
+    }
+}
+
+/// Sequence-indexed ring buffer of unacknowledged sent packets.
+///
+/// Replaces `BTreeMap<u32, SentPacket>` on the hot path: O(1) insert, lookup,
+/// cumulative pop, and SACK range walks with zero per-node heap allocations
+/// once warmed up to the stream's BDP, and wrapping-safe sequence ordering.
+struct OutgoingMap {
+    /// Sequence number of `slots[0]` when `count > 0`.
+    base: u32,
+    /// Invariant: when `count > 0`, both `slots.front()` and `slots.back()` are `Some`.
+    slots: VecDeque<Option<SentPacket>>,
+    count: usize,
+}
+
+impl OutgoingMap {
+    fn new() -> Self {
+        Self {
+            base: 0,
+            slots: VecDeque::new(),
+            count: 0,
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.count
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.count = 0;
+    }
+
+    fn insert(&mut self, seq: u32, pkt: SentPacket) -> Option<SentPacket> {
+        if self.count == 0 {
+            self.base = seq;
+            self.slots.clear();
+            self.slots.push_back(Some(pkt));
+            self.count = 1;
+            return None;
+        }
+        let delta = seq.wrapping_sub(self.base) as i32;
+        if delta >= 0 {
+            let idx = delta as usize;
+            if idx < self.slots.len() {
+                let prev = self.slots[idx].replace(pkt);
+                if prev.is_none() {
+                    self.count += 1;
+                }
+                prev
+            } else {
+                self.slots.resize_with(idx, || None);
+                self.slots.push_back(Some(pkt));
+                self.count += 1;
+                None
+            }
+        } else {
+            let pre = (-delta) as usize;
+            for _ in 1..pre {
+                self.slots.push_front(None);
+            }
+            self.slots.push_front(Some(pkt));
+            self.base = seq;
+            self.count += 1;
+            None
+        }
+    }
+
+    #[inline]
+    fn get(&self, seq: &u32) -> Option<&SentPacket> {
+        if self.count == 0 {
+            return None;
+        }
+        let delta = seq.wrapping_sub(self.base) as i32;
+        if delta < 0 {
+            return None;
+        }
+        self.slots.get(delta as usize).and_then(|s| s.as_ref())
+    }
+
+    #[inline]
+    fn get_mut(&mut self, seq: &u32) -> Option<&mut SentPacket> {
+        if self.count == 0 {
+            return None;
+        }
+        let delta = seq.wrapping_sub(self.base) as i32;
+        if delta < 0 {
+            return None;
+        }
+        self.slots.get_mut(delta as usize).and_then(|s| s.as_mut())
+    }
+
+    #[inline]
+    fn first_key_value(&self) -> Option<(u32, &SentPacket)> {
+        if self.count == 0 {
+            return None;
+        }
+        self.slots
+            .front()
+            .and_then(|s| s.as_ref())
+            .map(|p| (self.base, p))
+    }
+
+    #[inline]
+    fn pop_first(&mut self) -> Option<(u32, SentPacket)> {
+        if self.count == 0 {
+            return None;
+        }
+        let pkt = self.slots.pop_front().flatten()?;
+        let seq = self.base;
+        self.base = self.base.wrapping_add(1);
+        self.count -= 1;
+        while matches!(self.slots.front(), Some(None)) {
+            self.slots.pop_front();
+            self.base = self.base.wrapping_add(1);
+        }
+        Some((seq, pkt))
+    }
+
+    #[inline]
+    fn last_key_value(&self) -> Option<(u32, &SentPacket)> {
+        if self.count == 0 {
+            return None;
+        }
+        let seq = self.base.wrapping_add((self.slots.len() - 1) as u32);
+        self.slots
+            .back()
+            .and_then(|s| s.as_ref())
+            .map(|p| (seq, p))
+    }
+
+    #[inline]
+    fn last_seq(&self) -> Option<u32> {
+        (self.count > 0).then(|| self.base.wrapping_add((self.slots.len() - 1) as u32))
+    }
+
+    fn values(&self) -> impl Iterator<Item = &SentPacket> {
+        self.slots.iter().filter_map(|s| s.as_ref())
+    }
+
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = (u32, &SentPacket)> {
+        let base = self.base;
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(move |(i, s)| s.as_ref().map(|p| (base.wrapping_add(i as u32), p)))
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (u32, &mut SentPacket)> {
+        let base = self.base;
+        self.slots
+            .iter_mut()
+            .enumerate()
+            .filter_map(move |(i, s)| s.as_mut().map(|p| (base.wrapping_add(i as u32), p)))
+    }
+
+    fn range_bounds(&self, range: std::ops::Range<u32>) -> (usize, usize) {
+        if self.count == 0 || !seq_after(range.end, range.start) {
+            return (0, 0);
+        }
+        let len = self.slots.len();
+        let lo = if seq_after(range.start, self.base) {
+            (range.start.wrapping_sub(self.base) as usize).min(len)
+        } else {
+            0
+        };
+        let hi = if seq_after(range.end, self.base) {
+            (range.end.wrapping_sub(self.base) as usize).min(len)
+        } else {
+            0
+        };
+        (lo.min(hi), hi)
+    }
+
+    #[cfg(test)]
+    fn range(&self, range: std::ops::Range<u32>) -> impl Iterator<Item = (u32, &SentPacket)> {
+        let base = self.base;
+        let (lo, hi) = self.range_bounds(range);
+        self.slots
+            .range(lo..hi)
+            .enumerate()
+            .filter_map(move |(i, s)| s.as_ref().map(|p| (base.wrapping_add((lo + i) as u32), p)))
+    }
+
+    fn range_mut(
+        &mut self,
+        range: std::ops::Range<u32>,
+    ) -> impl Iterator<Item = (u32, &mut SentPacket)> {
+        let base = self.base;
+        let (lo, hi) = self.range_bounds(range);
+        self.slots
+            .range_mut(lo..hi)
+            .enumerate()
+            .filter_map(move |(i, s)| s.as_mut().map(|p| (base.wrapping_add((lo + i) as u32), p)))
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<&u32> for OutgoingMap {
+    type Output = SentPacket;
+
+    fn index(&self, seq: &u32) -> &Self::Output {
+        self.get(seq).expect("seq not in OutgoingMap")
     }
 }
 
@@ -360,8 +571,8 @@ pub(crate) struct StreamInner {
     /// carry it.
     pub(crate) next_seq: u32,
     pub(crate) pending_writes: Vec<PendingWrite>,
-    /// Sent packets awaiting ACK, keyed by sequence number.
-    outgoing: BTreeMap<u32, SentPacket>,
+    /// Sent packets awaiting ACK, in a sequence-indexed ring buffer.
+    outgoing: OutgoingMap,
     /// Packets in `outgoing` neither SACKed nor marked lost (`inflight()`),
     /// kept as a counter: the send and ACK paths read it once per packet.
     inflight_count: u32,
@@ -504,6 +715,9 @@ pub(crate) struct StreamInner {
     tx_slab: BytesMut,
     /// Scratch buffer reused by `detect_losses` across ACKs.
     lost_seqs_scratch: Vec<u32>,
+    /// Scratch buffers reused by `on_sack_into` across SACKs.
+    sack_delivered_scratch: Vec<(u32, Instant, bool)>,
+    sack_gaps_scratch: Vec<(u32, u32)>,
     /// Pacing timer wakeups, for tests of the send loop's idle behaviour.
     #[cfg(test)]
     pacing_wakeups: u32,
@@ -551,6 +765,8 @@ impl StreamInner {
         self.write_queue = VecDeque::new();
         self.tx_slab = BytesMut::new();
         self.lost_seqs_scratch = Vec::new();
+        self.sack_delivered_scratch = Vec::new();
+        self.sack_gaps_scratch = Vec::new();
         self.outgoing.clear();
         self.inflight_count = 0;
         self.sacked_count = 0;
@@ -861,13 +1077,17 @@ impl StreamInner {
     /// stream whose peer advertised a zero window asks for a zero-window
     /// probe at once (C `_udx_stream_write`, udx.c:2805).
     fn push_write(&mut self, write: WriteBuf) {
+        let was_unsent = self.has_unsent();
+        let is_end = write.end;
         if self.unacked_written == 0 && self.send_rwnd == 0 && self.connected {
             self.zwp_wanted = true;
         }
         self.queued_bytes += write.data.len();
         self.unacked_written += write.data.len();
         self.write_queue.push_back(write);
-        if let Some(tx) = &self.notify_tx {
+        if (!was_unsent || is_end || self.zwp_wanted)
+            && let Some(tx) = &self.notify_tx
+        {
             let _ = tx.send(StreamNotify::DataQueued);
         }
     }
@@ -1212,7 +1432,7 @@ impl StreamInner {
             let seq = self.next_seq;
             (self.send_new(false)?, seq, false)
         } else {
-            let (&seq, pkt) = self.outgoing.last_key_value()?;
+            let (seq, pkt) = self.outgoing.last_key_value()?;
             if pkt.lost || pkt.sacked {
                 return None;
             }
@@ -1243,7 +1463,7 @@ impl StreamInner {
             u64::from(self.rack_rtt) + u64::from(self.rack_reo_wnd()),
         );
         let mut newly_lost = Vec::new();
-        for (&seq, pkt) in &mut self.outgoing {
+        for (seq, pkt) in self.outgoing.iter_mut() {
             if pkt.sacked {
                 continue;
             }
@@ -1403,11 +1623,11 @@ impl StreamInner {
             *end > *start
         });
 
-        // Pop acknowledged entries in place instead of splitting the BTreeMap.
+        // Pop acknowledged entries in O(1) per packet from the sequence ring.
         while self
             .outgoing
             .first_key_value()
-            .is_some_and(|(&seq, _)| seq < ack)
+            .is_some_and(|(seq, _)| seq_after(ack, seq))
         {
             let Some((seq, pkt)) = self.outgoing.pop_first() else {
                 break;
@@ -1489,15 +1709,16 @@ impl StreamInner {
     /// billion lookups (C `udx_sack_is_valid` rejects it outright).
     fn on_sack_into(&mut self, ranges: &[SackRange], sack_rate_info: &mut AckedRateInfo) {
         let epoch = self.epoch;
-        let mut delivered = Vec::new();
+        let mut delivered = std::mem::take(&mut self.sack_delivered_scratch);
+        delivered.clear();
+        let mut gaps = std::mem::take(&mut self.sack_gaps_scratch);
         let mut left_flight = 0;
         // Coverage only claims seqs already sent: a block naming unsent seqs
         // must not hide their real SACK later.
         let sent_end = self
             .outgoing
-            .keys()
-            .next_back()
-            .map_or(0, |&seq| seq.saturating_add(1));
+            .last_seq()
+            .map_or(0, |seq| seq.saturating_add(1));
         for range in ranges {
             let (start, end) = (range.start, range.end.min(sent_end));
             if start >= end {
@@ -1505,7 +1726,7 @@ impl StreamInner {
             }
             // The peer repeats its blocks on every ACK: walk only what no
             // earlier block covered.
-            let mut gaps = Vec::new();
+            gaps.clear();
             let mut at = start;
             for &(covered_start, covered_end) in &self.sack_cover {
                 if covered_end <= at {
@@ -1525,8 +1746,8 @@ impl StreamInner {
             if at < end {
                 gaps.push((at, end));
             }
-            for (gap_start, gap_end) in gaps {
-                for (&seq, pkt) in self.outgoing.range_mut(gap_start..gap_end) {
+            for &(gap_start, gap_end) in &gaps {
+                for (seq, pkt) in self.outgoing.range_mut(gap_start..gap_end) {
                     if !pkt.sacked {
                         if !pkt.lost {
                             left_flight += 1;
@@ -1559,9 +1780,13 @@ impl StreamInner {
             self.mtu_probe_wanted = true;
         }
         let now = self.now();
-        for (seq, time_sent, retransmitted) in delivered {
+        for &(seq, time_sent, retransmitted) in &delivered {
             self.on_packet_acked(seq, time_sent, retransmitted, now);
         }
+        delivered.clear();
+        gaps.clear();
+        self.sack_delivered_scratch = delivered;
+        self.sack_gaps_scratch = gaps;
     }
 
     #[cfg(test)]
@@ -1978,7 +2203,7 @@ impl StreamInner {
             timewait_wanted: false,
             next_seq: 0,
             pending_writes: Vec::new(),
-            outgoing: BTreeMap::new(),
+            outgoing: OutgoingMap::new(),
             inflight_count: 0,
             send_order: VecDeque::new(),
             lost_queue: VecDeque::new(),
@@ -2043,6 +2268,8 @@ impl StreamInner {
             runtime,
             tx_slab: BytesMut::new(),
             lost_seqs_scratch: Vec::new(),
+            sack_delivered_scratch: Vec::new(),
+            sack_gaps_scratch: Vec::new(),
             #[cfg(test)]
             pacing_wakeups: 0,
         }
@@ -2641,7 +2868,7 @@ impl UdxStreamRemote {
             // Unsent data is cut into packets at send time, for this peer
             // at the base MTU, as in C.
             inner.reset_mtu();
-            let done = inner.outgoing.keys().next_back().copied().map(|last| {
+            let done = inner.outgoing.last_seq().map(|last| {
                 let (tx, rx) = oneshot::channel();
                 inner.remote_change = Some((last.wrapping_add(1), tx));
                 rx
@@ -2762,6 +2989,10 @@ async fn process_incoming(
     let mut send_batch: Vec<(Bytes, SocketAddr)> = Vec::new();
     let mut completed_writes: WriteSenders = Vec::new();
     let mut acked_rate_info: AckedRateInfo = Vec::new();
+    let mut sack_ranges_scratch: Vec<SackRange> = Vec::new();
+    let mut incoming_burst: Vec<IncomingPacket> = Vec::with_capacity(MAX_INCOMING_BURST);
+    let mut burst_acks: Vec<ControlPacket> = Vec::new();
+    let mut burst_messages: Vec<(Vec<u8>, mpsc::Sender<Vec<u8>>)> = Vec::new();
     // The datagram that a relay forwards, put together again from header and
     // body. Kept between packets so that forwarding does not allocate.
     let mut relay_datagram = Vec::new();
@@ -2811,300 +3042,521 @@ async fn process_incoming(
             // ── Incoming packet processing ───────────────────────────
             packet = incoming_rx.recv() => {
                 let Some(first_packet) = packet else { break 'outer };
-                let mut next_packet = Some(first_packet);
-                let mut burst = 0usize;
+                incoming_burst.clear();
+                incoming_burst.push(first_packet);
+                while incoming_burst.len() < MAX_INCOMING_BURST {
+                    match incoming_rx.try_recv() {
+                        Ok(p) => incoming_burst.push(p),
+                        Err(_) => break,
+                    }
+                }
 
-                while burst < MAX_INCOMING_BURST {
-                    let packet = match next_packet.take() {
-                        Some(p) => p,
-                        None => match incoming_rx.try_recv() {
-                            Ok(p) => p,
-                            Err(_) => break,
-                        },
-                    };
-                    burst += 1;
-
-                    // The socket demux (`UdxSocket::ensure_recv_loop`) decoded
-                    // this header once, before routing the packet here.
-                    let header = packet.header;
-                    let is_data = header.has_flag(FLAG_DATA);
-                    let is_end = header.has_flag(FLAG_END);
-                    let is_destroy = header.has_flag(FLAG_DESTROY);
-                    let is_heartbeat = header.has_flag(FLAG_HEARTBEAT);
-                    let is_message = header.has_flag(FLAG_MESSAGE);
-
-                    // Decode SACK ranges outside the lock only when SACK is set.
-                    let sack_ranges = if header.has_flag(FLAG_SACK) {
-                        header
-                            .sack_region(HEADER_SIZE + packet.body.len())
-                            .and_then(|region| {
-                                decode_sack(
-                                    &packet.body
-                                        [region.start - HEADER_SIZE..region.end - HEADER_SIZE],
-                                )
-                                .ok()
-                            })
-                    } else {
-                        None
-                    };
-
-                    // Extract MESSAGE payload outside the lock if present.
-                    let message = (is_message && header.data_offset as usize <= packet.body.len())
-                        .then(|| packet.body[header.data_offset as usize..].to_vec());
-
-                    // Single-lock fast path for connected, non-relay packets;
-                    // firewall hooks and relay forwarding drop the lock and
-                    // run their cold paths.
+                let mut idx = 0usize;
+                while idx < incoming_burst.len() {
                     send_batch.clear();
                     completed_writes.clear();
-                    let mut body = packet.body;
+                    burst_acks.clear();
+                    burst_messages.clear();
+
                     let mut should_break = false;
-                    let mut relay_target: Option<Endpoint> = None;
+                    let mut any_ack_advanced = false;
+                    let mut any_delivered = false;
+                    let mut any_send_new_data = false;
+                    let mut any_recv_window_nonzero = false;
+                    let mut last_reorder_timeout: Option<Duration> = None;
+                    let mut last_send_stop: Option<SendStop> = None;
+                    let mut zwp_stalled = false;
+                    let mut was_outgoing_empty = false;
+                    let mut outgoing_empty = true;
+                    let mut rto = Duration::from_millis(INITIAL_RTO_MS.into());
+                    let mut tlp: Option<u32> = None;
+                    let mut udp: Option<Arc<super::udp::Udp>> = None;
+                    let mut did_process_fast = false;
+                    let mut cold_relay: Option<(Endpoint, Header, Bytes, bool)> = None;
+                    let mut cold_firewall_idx: Option<usize> = None;
 
-                    #[allow(clippy::large_enum_variant)]
-                    enum Step {
-                        Processed {
-                            outcome: AckOutcome,
-                            was_outgoing_empty: bool,
-                            outgoing_empty: bool,
-                            rto: Duration,
-                            tlp: Option<u32>,
-                            zwp_stalled: bool,
-                            udp: Option<Arc<super::udp::Udp>>,
-                            ack: Option<ControlPacket>,
-                            hb_ack: Option<ControlPacket>,
-                            message_tx: Option<mpsc::Sender<Vec<u8>>>,
-                        },
-                        Relay(Bytes),
-                        Continue,
-                        Break,
-                    }
-
-                    let step = 'step: {
+                    {
                         let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
                         if guard.terminated {
-                            break 'step Step::Break;
-                        }
-                        let same = guard
-                            .udp
-                            .as_ref()
-                            .is_some_and(|ours| Arc::as_ptr(ours) as usize == packet.udp_ptr);
-                        if !guard.connected || !same {
-                            let is_connected = guard.connected;
-                            let hook = guard.firewall_hook.take();
-                            drop(guard);
-                            let accepted = match hook {
-                                Some(mut hook) => {
-                                    let ok = hook(
-                                        &packet.socket,
-                                        packet.addr.port(),
-                                        packet.addr.ip(),
-                                    );
-                                    let mut guard =
-                                        inner.lock().unwrap_or_else(|e| e.into_inner());
-                                    guard.firewall_hook = Some(hook);
-                                    if !ok {
-                                        tracing::debug!(addr = ?packet.addr, "firewall hook: rejected");
-                                        false
-                                    } else {
-                                        if !is_connected {
-                                            guard.remote_addr = Some(packet.addr);
-                                            guard.udp = packet.socket.udp_arc().ok();
-                                            guard.socket = Some(packet.socket.clone());
-                                            guard.connected = true;
-                                            guard.publish_endpoint();
-                                            if let Some(tx) = &guard.notify_tx {
-                                                let _ = tx.send(StreamNotify::DataQueued);
-                                            }
-                                            tracing::debug!(addr = ?packet.addr, "firewall hook: accepted");
-                                        }
-                                        true
-                                    }
-                                }
-                                None if !is_connected => false,
-                                None => true,
-                            };
-                            if !accepted {
-                                break 'step Step::Continue;
-                            }
-                            guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                            if guard.terminated {
-                                break 'step Step::Break;
-                            }
-                        }
-                        last_heard = TokioInstant::now();
-
-                        // Peer seen on the current path (after `change_remote`).
-                        if !guard.observed_current_remote || guard.remote_observed.is_some() {
-                            let observed = is_message
-                                || (is_data && header.seq == guard.next_remote_seq);
-                            if observed && guard.remote_addr == Some(packet.addr) {
-                                let same = guard.udp.as_ref().is_some_and(|ours| {
-                                    Arc::as_ptr(ours) as usize == packet.udp_ptr
-                                });
-                                if same {
-                                    guard.observed_current_remote = true;
-                                    if let Some(tx) = guard.remote_observed.take() {
-                                        let _ = tx.send(());
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(ref target) = guard.relay_target {
-                            relay_target = Some(Arc::clone(target));
-                            break 'step Step::Relay(body);
-                        }
-
-                        tracing::trace!(
-                            flags = header.type_flags,
-                            seq = header.seq,
-                            ack = header.ack,
-                            data_offset = header.data_offset,
-                            "process_incoming: received packet"
-                        );
-                        let was_outgoing_empty = guard.outgoing.is_empty();
-                        let outcome = guard.on_ack_packet_into(
-                            &header,
-                            sack_ranges.as_deref(),
-                            &mut completed_writes,
-                            &mut acked_rate_info,
-                            &mut send_batch,
-                            true,
-                        );
-                        let end_acked_now = outcome.ack_advanced && guard.end_acked();
-                        let outgoing_empty = guard.outgoing.is_empty();
-                        let rto = Duration::from_millis(guard.rto.into());
-                        let tlp = if outcome.ack_advanced || outcome.send_new_data {
-                            guard.loss_probe_timeout()
-                        } else {
-                            None
-                        };
-                        let zwp_stalled = matches!(outcome.send_stop, Some(SendStop::Window))
-                            && guard.zero_window_stalled();
-                        let udp = if !send_batch.is_empty() {
-                            guard.udp.clone()
-                        } else {
-                            None
-                        };
-
-                        // The peer ACKed our END after its own END was delivered:
-                        // the stream is done, without another ACK (C udx.c:1803).
-                        if end_acked_now && guard.remote_ended {
-                            guard.close_ended();
                             should_break = true;
-                        }
-
-                        let mut ack = None;
-                        if !should_break {
-                            if is_data || is_end {
-                                // SACK bytes or MTU-probe padding sit before the
-                                // payload; advancing a `Bytes` slice is O(1).
-                                let skip = (header.data_offset as usize).min(body.len());
-                                if skip > 0 {
-                                    body.advance(skip);
-                                }
-                                let recv_flags = (if is_data { FLAG_DATA } else { 0 })
-                                    | (if is_end { FLAG_END } else { 0 });
-                                guard.receive_data(
-                                    header.seq,
-                                    body,
-                                    recv_flags,
-                                    &mut read_events,
-                                );
-                                // One ACK per receive burst (at most ACK_EVERY packets):
-                                // out-of-order data and END are ACKed at once.
-                                pending_acks += 1;
-                                let ack_now = is_end
-                                    || end_acked_now
-                                    || !guard.recv_ranges.is_empty()
-                                    || pending_acks >= ACK_EVERY
-                                    || incoming_rx.is_empty();
-                                if ack_now {
-                                    pending_acks = 0;
-                                    ack = guard.ack_packet();
-                                }
-                            } else if end_acked_now {
-                                // C `send_ack` after the peer ACKed our END (udx.c:1810).
-                                ack = guard.ack_packet();
-                            }
-
-                            // Both directions ended: close, leaving timewait if we ended first.
-                            if guard.all_ended() {
-                                guard.close_ended();
-                                should_break = true;
-                            } else if is_destroy {
-                                guard.fail(
-                                    std::io::ErrorKind::ConnectionReset,
-                                    "stream destroyed by peer",
-                                );
-                                should_break = true;
-                            }
-                        }
-
-                        let message_tx = if !should_break && message.is_some() {
-                            guard.message_tx.clone()
                         } else {
-                            None
-                        };
-                        let hb_ack = if !should_break && is_heartbeat {
-                            guard.ack_packet()
-                        } else {
-                            None
-                        };
-
-                        Step::Processed {
-                            outcome,
-                            was_outgoing_empty,
-                            outgoing_empty,
-                            rto,
-                            tlp,
-                            zwp_stalled,
-                            udp,
-                            ack,
-                            hb_ack,
-                            message_tx,
-                        }
-                    };
-
-                    match step {
-                        Step::Break => break 'outer,
-                        Step::Continue => continue,
-                        Step::Relay(relay_body) => {
-                            if let Some(target) = relay_target {
-                                let destination =
-                                    target.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                if let Some((dest_remote_id, dest_addr, dest_udp)) = destination {
-                                    relay_datagram.clear();
-                                    relay_datagram.extend_from_slice(&header.encode());
-                                    relay_datagram[4..8]
-                                        .copy_from_slice(&dest_remote_id.to_le_bytes());
-                                    relay_datagram.extend_from_slice(&relay_body);
-                                    let _ = dest_udp.send_to(&relay_datagram, dest_addr).await;
+                            was_outgoing_empty = guard.outgoing.is_empty();
+                            while idx < incoming_burst.len() {
+                                let same = guard.udp.as_ref().is_some_and(|ours| {
+                                    Arc::as_ptr(ours) as usize == incoming_burst[idx].udp_ptr
+                                });
+                                if !guard.connected || !same {
+                                    cold_firewall_idx = Some(idx);
+                                    break;
                                 }
-                                if is_destroy {
-                                    tracing::debug!("relay: DESTROY received, closing relay stream");
-                                    break 'outer;
+                                if let Some(ref target) = guard.relay_target {
+                                    let p = &mut incoming_burst[idx];
+                                    let h = p.header.clone();
+                                    let body = std::mem::take(&mut p.body);
+                                    let is_destroy = h.has_flag(FLAG_DESTROY);
+                                    cold_relay = Some((Arc::clone(target), h, body, is_destroy));
+                                    idx += 1;
+                                    break;
+                                }
+
+                                let p = &mut incoming_burst[idx];
+                                let header = p.header.clone();
+                                let addr = p.addr;
+                                let udp_ptr = p.udp_ptr;
+                                let mut body = std::mem::take(&mut p.body);
+                                idx += 1;
+
+                                let is_data = header.has_flag(FLAG_DATA);
+                                let is_end = header.has_flag(FLAG_END);
+                                let is_destroy = header.has_flag(FLAG_DESTROY);
+                                let is_heartbeat = header.has_flag(FLAG_HEARTBEAT);
+                                let is_message = header.has_flag(FLAG_MESSAGE);
+
+                                did_process_fast = true;
+                                if header.recv_window > 0 {
+                                    any_recv_window_nonzero = true;
+                                }
+
+                                // Peer seen on the current path (after `change_remote`).
+                                if !guard.observed_current_remote || guard.remote_observed.is_some()
+                                {
+                                    let observed = is_message
+                                        || (is_data && header.seq == guard.next_remote_seq);
+                                    if observed && guard.remote_addr == Some(addr) {
+                                        let same_sock = guard.udp.as_ref().is_some_and(|ours| {
+                                            Arc::as_ptr(ours) as usize == udp_ptr
+                                        });
+                                        if same_sock {
+                                            guard.observed_current_remote = true;
+                                            if let Some(tx) = guard.remote_observed.take() {
+                                                let _ = tx.send(());
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let has_sacks = if header.has_flag(FLAG_SACK) {
+                                    header
+                                        .sack_region(HEADER_SIZE + body.len())
+                                        .is_some_and(|region| {
+                                            decode_sack_into(
+                                                &body[region.start - HEADER_SIZE
+                                                    ..region.end - HEADER_SIZE],
+                                                &mut sack_ranges_scratch,
+                                            )
+                                            .is_ok()
+                                        })
+                                } else {
+                                    false
+                                };
+
+                                let message = (is_message
+                                    && header.data_offset as usize <= body.len())
+                                .then(|| body[header.data_offset as usize..].to_vec());
+
+                                tracing::trace!(
+                                    flags = header.type_flags,
+                                    seq = header.seq,
+                                    ack = header.ack,
+                                    data_offset = header.data_offset,
+                                    "process_incoming: received packet"
+                                );
+
+                                let is_last_in_burst = idx == incoming_burst.len();
+                                let outcome = guard.on_ack_packet_into(
+                                    &header,
+                                    has_sacks.then_some(sack_ranges_scratch.as_slice()),
+                                    &mut completed_writes,
+                                    &mut acked_rate_info,
+                                    &mut send_batch,
+                                    false,
+                                );
+                                any_ack_advanced |= outcome.ack_advanced;
+                                any_delivered |= outcome.delivered;
+                                any_send_new_data |= outcome.send_new_data;
+                                if outcome.reorder_timeout.is_some() {
+                                    last_reorder_timeout = outcome.reorder_timeout;
+                                } else if outcome.ack_advanced {
+                                    last_reorder_timeout = None;
+                                }
+                                if outcome.send_stop.is_some() {
+                                    last_send_stop = outcome.send_stop;
+                                }
+
+                                let end_acked_now = outcome.ack_advanced && guard.end_acked();
+                                if end_acked_now && guard.remote_ended {
+                                    guard.close_ended();
+                                    should_break = true;
+                                    break;
+                                }
+
+                                if is_data || is_end {
+                                    let skip = (header.data_offset as usize).min(body.len());
+                                    if skip > 0 {
+                                        body.advance(skip);
+                                    }
+                                    let recv_flags = (if is_data { FLAG_DATA } else { 0 })
+                                        | (if is_end { FLAG_END } else { 0 });
+                                    guard.receive_data(
+                                        header.seq,
+                                        body,
+                                        recv_flags,
+                                        &mut read_events,
+                                    );
+                                    pending_acks += 1;
+                                    let ack_now = is_end
+                                        || end_acked_now
+                                        || !guard.recv_ranges.is_empty()
+                                        || pending_acks >= ACK_EVERY
+                                        || (is_last_in_burst && incoming_rx.is_empty());
+                                    if ack_now {
+                                        pending_acks = 0;
+                                        if let Some(ack) = guard.ack_packet() {
+                                            burst_acks.push(ack);
+                                        }
+                                    }
+                                } else if end_acked_now {
+                                    if let Some(ack) = guard.ack_packet() {
+                                        burst_acks.push(ack);
+                                    }
+                                }
+
+                                if guard.all_ended() {
+                                    guard.close_ended();
+                                    should_break = true;
+                                    break;
+                                } else if is_destroy {
+                                    guard.fail(
+                                        std::io::ErrorKind::ConnectionReset,
+                                        "stream destroyed by peer",
+                                    );
+                                    should_break = true;
+                                    break;
+                                }
+
+                                if let (Some(msg), Some(tx)) = (message, guard.message_tx.clone()) {
+                                    burst_messages.push((msg, tx));
+                                }
+                                if is_heartbeat {
+                                    if let Some(hb) = guard.ack_packet() {
+                                        burst_acks.push(hb);
+                                    }
+                                }
+                                if send_batch.len() >= 64 {
+                                    break;
                                 }
                             }
+
+                            if did_process_fast {
+                                if !should_break
+                                    && send_batch.len() < 64
+                                    && guard.has_pending_send()
+                                {
+                                    let (stop, more_new_data) =
+                                        guard.take_send_batch_into(&mut send_batch);
+                                    last_send_stop = Some(stop);
+                                    any_send_new_data |= more_new_data;
+                                }
+                                outgoing_empty = guard.outgoing.is_empty();
+                                rto = Duration::from_millis(guard.rto.into());
+                                tlp = if any_ack_advanced || any_send_new_data {
+                                    guard.loss_probe_timeout()
+                                } else {
+                                    None
+                                };
+                                zwp_stalled = matches!(last_send_stop, Some(SendStop::Window))
+                                    && guard.zero_window_stalled();
+                                if !send_batch.is_empty() {
+                                    udp = guard.udp.clone();
+                                }
+                            }
+                        }
+                    }
+
+                    if did_process_fast {
+                        for tx in completed_writes.drain(..).flatten() {
+                            let _ = tx.send(Ok(()));
+                        }
+                        if let (false, Some(udp)) = (send_batch.is_empty(), udp) {
+                            if let Some(size) = udp.send_batch(&send_batch).await {
+                                inner
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .on_send_too_big(size);
+                            }
+                        }
+                        for event in read_events.drain(..) {
+                            let _ = read_tx.send(event);
+                        }
+                        for ack in burst_acks.drain(..) {
+                            send_now(Some(ack));
+                        }
+                        for (msg, tx) in burst_messages.drain(..) {
+                            let _ = tx.try_send(msg);
+                        }
+
+                        if should_break {
+                            break 'outer;
+                        }
+
+                        if any_recv_window_nonzero {
+                            zwp_probes = 0;
+                        }
+
+                        let now = TokioInstant::now();
+                        last_heard = now;
+                        if any_ack_advanced && outgoing_empty {
+                            if rto_armed {
+                                rto_sleep.as_mut().reset(far());
+                                rto_armed = false;
+                            }
+                            if tlp_armed {
+                                tlp_sleep.as_mut().reset(far());
+                                tlp_armed = false;
+                            }
+                            if reo_armed {
+                                reo_sleep.as_mut().reset(far());
+                                reo_armed = false;
+                            }
+                        } else if let Some(reorder) = last_reorder_timeout {
+                            reo_sleep.as_mut().reset(now + reorder);
+                            reo_armed = true;
+                            if tlp_armed {
+                                tlp_sleep.as_mut().reset(far());
+                                tlp_armed = false;
+                            }
+                            rto_sleep.as_mut().reset(now + rto);
+                            rto_armed = true;
+                        } else if any_ack_advanced {
+                            if reo_armed {
+                                reo_sleep.as_mut().reset(far());
+                                reo_armed = false;
+                            }
+                            rto_sleep.as_mut().reset(now + rto);
+                            rto_armed = true;
+                            if let Some(tlp_ms) = tlp {
+                                let tlp_dur = Duration::from_millis(tlp_ms.into()).min(rto);
+                                tlp_sleep.as_mut().reset(now + tlp_dur);
+                                tlp_armed = true;
+                            } else if tlp_armed {
+                                tlp_sleep.as_mut().reset(far());
+                                tlp_armed = false;
+                            }
+                        } else {
+                            if any_delivered && reo_armed && !outgoing_empty {
+                                rto_sleep.as_mut().reset(now + rto);
+                                rto_armed = true;
+                            }
+                            if was_outgoing_empty && !outgoing_empty {
+                                rto_sleep.as_mut().reset(now + rto);
+                                rto_armed = true;
+                            }
+                            if any_send_new_data {
+                                if let Some(tlp_ms) = tlp {
+                                    let rto_left =
+                                        rto_sleep.deadline().saturating_duration_since(now);
+                                    tlp_sleep.as_mut().reset(
+                                        now + Duration::from_millis(tlp_ms.into()).min(rto_left),
+                                    );
+                                    tlp_armed = true;
+                                    if reo_armed {
+                                        reo_sleep.as_mut().reset(far());
+                                        reo_armed = false;
+                                    }
+                                }
+                            }
+                        }
+
+                        match last_send_stop {
+                            Some(SendStop::Pacing(delay)) => {
+                                pacing_sleep.as_mut().reset(now + delay);
+                                pacing_armed = true;
+                            }
+                            Some(SendStop::Window) => {
+                                if pacing_armed {
+                                    pacing_sleep.as_mut().reset(far());
+                                    pacing_armed = false;
+                                }
+                                if zwp_stalled && !rto_armed {
+                                    rto_sleep.as_mut().reset(now + rto);
+                                    rto_armed = true;
+                                }
+                            }
+                            Some(SendStop::Idle) if pacing_armed => {
+                                pacing_sleep.as_mut().reset(far());
+                                pacing_armed = false;
+                            }
+                            Some(SendStop::Idle) | None => {}
+                        }
+                    } else if should_break {
+                        break 'outer;
+                    }
+
+                    if let Some((target, relay_hdr, relay_body, relay_destroy)) = cold_relay {
+                        last_heard = TokioInstant::now();
+                        let destination =
+                            target.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        if let Some((dest_remote_id, dest_addr, dest_udp)) = destination {
+                            relay_datagram.clear();
+                            relay_datagram.extend_from_slice(&relay_hdr.encode());
+                            relay_datagram[4..8].copy_from_slice(&dest_remote_id.to_le_bytes());
+                            relay_datagram.extend_from_slice(&relay_body);
+                            let _ = dest_udp.send_to(&relay_datagram, dest_addr).await;
+                        }
+                        if relay_destroy {
+                            tracing::debug!("relay: DESTROY received, closing relay stream");
+                            break 'outer;
+                        }
+                        continue;
+                    }
+
+                    if let Some(fw_idx) = cold_firewall_idx {
+                        let pkt_addr = incoming_burst[fw_idx].addr;
+                        let pkt_socket = incoming_burst[fw_idx].socket.clone();
+                        let (is_connected, hook) = {
+                            let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                            if guard.terminated {
+                                break 'outer;
+                            }
+                            (guard.connected, guard.firewall_hook.take())
+                        };
+                        let accepted = match hook {
+                            Some(mut hook) => {
+                                let ok = hook(&pkt_socket, pkt_addr.port(), pkt_addr.ip());
+                                let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                                guard.firewall_hook = Some(hook);
+                                if !ok {
+                                    tracing::debug!(addr = ?pkt_addr, "firewall hook: rejected");
+                                    false
+                                } else {
+                                    if !is_connected {
+                                        guard.remote_addr = Some(pkt_addr);
+                                        guard.udp = pkt_socket.udp_arc().ok();
+                                        guard.socket = Some(pkt_socket);
+                                        guard.connected = true;
+                                        guard.publish_endpoint();
+                                        if let Some(tx) = &guard.notify_tx {
+                                            let _ = tx.send(StreamNotify::DataQueued);
+                                        }
+                                        tracing::debug!(addr = ?pkt_addr, "firewall hook: accepted");
+                                    }
+                                    true
+                                }
+                            }
+                            None if !is_connected => false,
+                            None => true,
+                        };
+                        if !accepted {
+                            idx = fw_idx + 1;
                             continue;
                         }
-                        Step::Processed {
-                            outcome,
-                            was_outgoing_empty,
-                            outgoing_empty,
-                            rto,
-                            tlp,
-                            zwp_stalled,
-                            udp,
-                            ack,
-                            hb_ack,
-                            message_tx,
-                        } => {
+                        // Accepted: if still on a different socket than `guard.udp`
+                        // (mid-`change_remote`), process this single packet now so
+                        // the next loop iteration doesn't re-invoke the firewall hook.
+                        let still_different = {
+                            let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                            !guard.udp.as_ref().is_some_and(|ours| {
+                                Arc::as_ptr(ours) as usize == incoming_burst[fw_idx].udp_ptr
+                            })
+                        };
+                        if still_different {
+                            // Temporarily advance `idx` and process this packet via
+                            // the fast path by matching its `udp_ptr`? No — simply
+                            // process it cleanly right here using the same logic.
+                            let p = &mut incoming_burst[fw_idx];
+                            let header = p.header.clone();
+                            let mut body = std::mem::take(&mut p.body);
+                            idx = fw_idx + 1;
+                            let is_data = header.has_flag(FLAG_DATA);
+                            let is_end = header.has_flag(FLAG_END);
+                            let is_destroy = header.has_flag(FLAG_DESTROY);
+                            let is_heartbeat = header.has_flag(FLAG_HEARTBEAT);
+                            let is_message = header.has_flag(FLAG_MESSAGE);
+                            let has_sacks = if header.has_flag(FLAG_SACK) {
+                                header
+                                    .sack_region(HEADER_SIZE + body.len())
+                                    .is_some_and(|region| {
+                                        decode_sack_into(
+                                            &body[region.start - HEADER_SIZE
+                                                ..region.end - HEADER_SIZE],
+                                            &mut sack_ranges_scratch,
+                                        )
+                                        .is_ok()
+                                    })
+                            } else {
+                                false
+                            };
+                            let message = (is_message
+                                && header.data_offset as usize <= body.len())
+                            .then(|| body[header.data_offset as usize..].to_vec());
+                            send_batch.clear();
+                            completed_writes.clear();
+                            let (ack, hb_ack, msg_tx, send_udp, brk) = {
+                                let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                                if guard.terminated {
+                                    (None, None, None, None, true)
+                                } else {
+                                    let outcome = guard.on_ack_packet_into(
+                                        &header,
+                                        has_sacks.then_some(sack_ranges_scratch.as_slice()),
+                                        &mut completed_writes,
+                                        &mut acked_rate_info,
+                                        &mut send_batch,
+                                        true,
+                                    );
+                                    let end_acked_now = outcome.ack_advanced && guard.end_acked();
+                                    let mut brk = false;
+                                    let mut ack = None;
+                                    if end_acked_now && guard.remote_ended {
+                                        guard.close_ended();
+                                        brk = true;
+                                    } else {
+                                        if is_data || is_end {
+                                            let skip =
+                                                (header.data_offset as usize).min(body.len());
+                                            if skip > 0 {
+                                                body.advance(skip);
+                                            }
+                                            let recv_flags = (if is_data { FLAG_DATA } else { 0 })
+                                                | (if is_end { FLAG_END } else { 0 });
+                                            guard.receive_data(
+                                                header.seq,
+                                                body,
+                                                recv_flags,
+                                                &mut read_events,
+                                            );
+                                            pending_acks = 0;
+                                            ack = guard.ack_packet();
+                                        } else if end_acked_now {
+                                            ack = guard.ack_packet();
+                                        }
+                                        if guard.all_ended() {
+                                            guard.close_ended();
+                                            brk = true;
+                                        } else if is_destroy {
+                                            guard.fail(
+                                                std::io::ErrorKind::ConnectionReset,
+                                                "stream destroyed by peer",
+                                            );
+                                            brk = true;
+                                        }
+                                    }
+                                    let msg_tx = (!brk && message.is_some())
+                                        .then(|| guard.message_tx.clone())
+                                        .flatten();
+                                    let hb_ack =
+                                        (!brk && is_heartbeat).then(|| guard.ack_packet()).flatten();
+                                    let send_udp = (!send_batch.is_empty())
+                                        .then(|| guard.udp.clone())
+                                        .flatten();
+                                    (ack, hb_ack, msg_tx, send_udp, brk)
+                                }
+                            };
                             for tx in completed_writes.drain(..).flatten() {
                                 let _ = tx.send(Ok(()));
                             }
-                            if let (false, Some(udp)) = (send_batch.is_empty(), udp) {
-                                if let Some(size) = udp.send_batch(&send_batch).await {
+                            if let (false, Some(send_udp)) = (send_batch.is_empty(), send_udp) {
+                                if let Some(size) = send_udp.send_batch(&send_batch).await {
                                     inner
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner())
@@ -3115,136 +3567,140 @@ async fn process_incoming(
                                 let _ = read_tx.send(event);
                             }
                             send_now(ack);
-
-                            if should_break {
-                                break 'outer;
-                            }
-
-                            if header.recv_window > 0 {
-                                zwp_probes = 0;
-                            }
-
-                            let now = TokioInstant::now();
-                            if outcome.ack_advanced && outgoing_empty {
-                                if rto_armed {
-                                    rto_sleep.as_mut().reset(far());
-                                    rto_armed = false;
-                                }
-                                if tlp_armed {
-                                    tlp_sleep.as_mut().reset(far());
-                                    tlp_armed = false;
-                                }
-                                if reo_armed {
-                                    reo_sleep.as_mut().reset(far());
-                                    reo_armed = false;
-                                }
-                            } else if let Some(reorder) = outcome.reorder_timeout {
-                                reo_sleep.as_mut().reset(now + reorder);
-                                reo_armed = true;
-                                if tlp_armed {
-                                    tlp_sleep.as_mut().reset(far());
-                                    tlp_armed = false;
-                                }
-                                rto_sleep.as_mut().reset(now + rto);
-                                rto_armed = true;
-                            } else if outcome.ack_advanced {
-                                if reo_armed {
-                                    reo_sleep.as_mut().reset(far());
-                                    reo_armed = false;
-                                }
-                                rto_sleep.as_mut().reset(now + rto);
-                                rto_armed = true;
-                                if let Some(tlp_ms) = tlp {
-                                    let tlp_dur = Duration::from_millis(tlp_ms.into()).min(rto);
-                                    tlp_sleep.as_mut().reset(now + tlp_dur);
-                                    tlp_armed = true;
-                                } else if tlp_armed {
-                                    tlp_sleep.as_mut().reset(far());
-                                    tlp_armed = false;
-                                }
-                            } else {
-                                if outcome.delivered && reo_armed && !outgoing_empty {
-                                    // C moves `next_rto_ts`, which the reorder timer re-arms.
-                                    rto_sleep.as_mut().reset(now + rto);
-                                    rto_armed = true;
-                                }
-                                if was_outgoing_empty && !outgoing_empty {
-                                    rto_sleep.as_mut().reset(now + rto);
-                                    rto_armed = true;
-                                }
-                                if outcome.send_new_data {
-                                    if let Some(tlp_ms) = tlp {
-                                        let rto_left =
-                                            rto_sleep.deadline().saturating_duration_since(now);
-                                        tlp_sleep.as_mut().reset(
-                                            now + Duration::from_millis(tlp_ms.into())
-                                                .min(rto_left),
-                                        );
-                                        tlp_armed = true;
-                                        if reo_armed {
-                                            reo_sleep.as_mut().reset(far());
-                                            reo_armed = false;
-                                        }
-                                    }
-                                }
-                            }
-
-                            match outcome.send_stop {
-                                Some(SendStop::Pacing(delay)) => {
-                                    pacing_sleep.as_mut().reset(now + delay);
-                                    pacing_armed = true;
-                                }
-                                Some(SendStop::Window) => {
-                                    if pacing_armed {
-                                        pacing_sleep.as_mut().reset(far());
-                                        pacing_armed = false;
-                                    }
-                                    if zwp_stalled && !rto_armed {
-                                        rto_sleep.as_mut().reset(now + rto);
-                                        rto_armed = true;
-                                    }
-                                }
-                                Some(SendStop::Idle) if pacing_armed => {
-                                    pacing_sleep.as_mut().reset(far());
-                                    pacing_armed = false;
-                                }
-                                Some(SendStop::Idle) | None => {}
-                            }
-
-                            if let (Some(msg), Some(tx)) = (message, message_tx) {
-                                // Full queue: dropped, as an unread datagram.
+                            if let (Some(msg), Some(tx)) = (message, msg_tx) {
                                 let _ = tx.try_send(msg);
                             }
-
                             send_now(hb_ack);
+                            if brk {
+                                break 'outer;
+                            }
                         }
                     }
                 }
+                incoming_burst.clear();
             }
 
             Some(notify) = notify_rx.recv() => {
-                match notify {
-                    StreamNotify::DataQueued => {
-                        pacing_sleep.as_mut().reset(TokioInstant::now());
-                        pacing_armed = true;
+                let mut wake_send = false;
+                let mut update_keepalive = false;
+                let mut next_notify = Some(notify);
+                while let Some(n) = next_notify {
+                    match n {
+                        StreamNotify::DataQueued => {
+                            wake_send = true;
+                        }
+                        StreamNotify::Shutdown => {
+                            shutting_down = true;
+                            wake_send = true;
+                        }
+                        StreamNotify::Dropped => {
+                            shutting_down = true;
+                            destroy_when_sent = true;
+                            wake_send = true;
+                        }
+                        StreamNotify::Keepalive => {
+                            update_keepalive = true;
+                        }
                     }
-                    StreamNotify::Shutdown => {
-                        shutting_down = true;
-                        pacing_sleep.as_mut().reset(TokioInstant::now());
-                        pacing_armed = true;
+                    next_notify = notify_rx.try_recv().ok();
+                }
+                if update_keepalive {
+                    let interval = inner.lock().unwrap_or_else(|e| e.into_inner()).keepalive;
+                    last_heard = TokioInstant::now();
+                    keepalive_sleep
+                        .as_mut()
+                        .reset(last_heard + interval.unwrap_or(FAR_FUTURE));
+                }
+                if wake_send && !pacing_armed {
+                    // Send immediately instead of bouncing through `pacing_sleep`.
+                    send_batch.clear();
+                    let (stop, arm_rto, tlp, rto, udp, zwp, zwp_stalled) = {
+                        let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                        let was_outgoing_empty = guard.outgoing.is_empty();
+                        let (stop, new_data) = guard.take_send_batch_into(&mut send_batch);
+                        let arm_rto = was_outgoing_empty && !guard.outgoing.is_empty();
+                        let tlp = if new_data {
+                            guard.loss_probe_timeout()
+                        } else {
+                            None
+                        };
+                        let zwp = std::mem::take(&mut guard.zwp_wanted)
+                            .then(|| guard.heartbeat_packet())
+                            .flatten();
+                        let zwp_stalled =
+                            matches!(stop, SendStop::Window) && guard.zero_window_stalled();
+                        (
+                            stop,
+                            arm_rto,
+                            tlp,
+                            Duration::from_millis(guard.rto.into()),
+                            if !send_batch.is_empty() {
+                                guard.udp.clone()
+                            } else {
+                                None
+                            },
+                            zwp,
+                            zwp_stalled,
+                        )
+                    };
+                    if zwp.is_some() {
+                        send_now(zwp);
+                        rto_sleep.as_mut().reset(TokioInstant::now() + rto);
+                        rto_armed = true;
                     }
-                    StreamNotify::Dropped => {
-                        shutting_down = true;
-                        destroy_when_sent = true;
-                        pacing_sleep.as_mut().reset(TokioInstant::now());
-                        pacing_armed = true;
+                    if let Some(udp) = udp {
+                        if let Some(size) = udp.send_batch(&send_batch).await {
+                            inner
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .on_send_too_big(size);
+                        }
                     }
-                    StreamNotify::Keepalive => {
-                        let interval = inner.lock().unwrap_or_else(|e| e.into_inner()).keepalive;
-                        last_heard = TokioInstant::now();
-                        keepalive_sleep
+                    let now = TokioInstant::now();
+                    if arm_rto {
+                        rto_sleep.as_mut().reset(now + rto);
+                        rto_armed = true;
+                    }
+                    if let Some(tlp) = tlp {
+                        let rto_left = rto_sleep.deadline().saturating_duration_since(now);
+                        tlp_sleep
                             .as_mut()
-                            .reset(last_heard + interval.unwrap_or(FAR_FUTURE));
+                            .reset(now + Duration::from_millis(tlp.into()).min(rto_left));
+                        tlp_armed = true;
+                        if reo_armed {
+                            reo_sleep.as_mut().reset(far());
+                            reo_armed = false;
+                        }
+                    }
+                    match stop {
+                        SendStop::Pacing(delay) => {
+                            pacing_sleep.as_mut().reset(now + delay);
+                            pacing_armed = true;
+                        }
+                        SendStop::Window => {
+                            if zwp_stalled && !rto_armed {
+                                rto_sleep.as_mut().reset(now + rto);
+                                rto_armed = true;
+                            }
+                        }
+                        SendStop::Idle => {}
+                    }
+                    if shutting_down {
+                        let destroy = {
+                            let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                            if guard.connected && guard.has_unsent() {
+                                continue;
+                            }
+                            if destroy_when_sent {
+                                guard.destroy_packet()
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((udp, addr, packet)) = destroy {
+                            let _ = udp.send_to(&packet, addr).await;
+                        }
+                        break 'outer;
                     }
                 }
             }
@@ -3489,17 +3945,36 @@ fn build_data_packet(remote_id: u32, seq: u32, ack: u32, payload: &[u8]) -> Vec<
 
 // ── Control packets (ACK, heartbeat) ─────────────────────────────────────────
 
-/// Bytes of a control packet: 20-byte plain ACKs, heartbeats and timewait
-/// replies stay inline on the stack without allocating on the heap.
+/// Maximum number of SACK ranges that fit inline on the stack (20 + 8*8 = 84 B).
+const INLINE_SACK_RANGES: usize = 8;
+const INLINE_CONTROL_CAP: usize = HEADER_SIZE + INLINE_SACK_RANGES * 8;
+
+/// Bytes of a control packet: 20-byte plain ACKs, heartbeats, timewait replies,
+/// and SACK ACKs with up to 8 ranges stay inline on the stack without allocating.
 enum ControlBytes {
-    Inline([u8; HEADER_SIZE]),
+    Inline {
+        buf: [u8; INLINE_CONTROL_CAP],
+        len: u8,
+    },
     Heap(Vec<u8>),
+}
+
+impl ControlBytes {
+    #[inline]
+    fn inline_header(header: [u8; HEADER_SIZE]) -> Self {
+        let mut buf = [0u8; INLINE_CONTROL_CAP];
+        buf[..HEADER_SIZE].copy_from_slice(&header);
+        Self::Inline {
+            buf,
+            len: HEADER_SIZE as u8,
+        }
+    }
 }
 
 impl AsRef<[u8]> for ControlBytes {
     fn as_ref(&self) -> &[u8] {
         match self {
-            Self::Inline(buf) => buf,
+            Self::Inline { buf, len } => &buf[..usize::from(*len)],
             Self::Heap(buf) => buf,
         }
     }
@@ -3520,12 +3995,30 @@ impl StreamInner {
         let (udp, addr) = (self.udp.clone()?, self.remote_addr?);
         if self.recv_ranges.is_empty() {
             let header = self.control_header(0);
-            return Some((udp, addr, ControlBytes::Inline(header.encode())));
+            return Some((udp, addr, ControlBytes::inline_header(header.encode())));
         }
-        let sacks = self.sack_ranges();
-        let sack_byte_len = sacks.len() * 8;
+        let count = self.recv_ranges.len().min(MAX_SACK_RANGES);
+        let sack_byte_len = count * 8;
         let mut header = self.control_header(FLAG_SACK);
         header.data_offset = u8::try_from(sack_byte_len).unwrap_or(0);
+        if count <= INLINE_SACK_RANGES {
+            let mut buf = [0u8; INLINE_CONTROL_CAP];
+            header.encode_into(&mut buf[..HEADER_SIZE]);
+            for (i, &(start, end)) in self.recv_ranges.iter().take(count).enumerate() {
+                let off = HEADER_SIZE + i * 8;
+                buf[off..off + 4].copy_from_slice(&start.to_le_bytes());
+                buf[off + 4..off + 8].copy_from_slice(&end.to_le_bytes());
+            }
+            return Some((
+                udp,
+                addr,
+                ControlBytes::Inline {
+                    buf,
+                    len: (HEADER_SIZE + sack_byte_len) as u8,
+                },
+            ));
+        }
+        let sacks = self.sack_ranges();
         let mut packet = vec![0u8; HEADER_SIZE + sack_byte_len];
         header.encode_into(&mut packet[..HEADER_SIZE]);
         encode_sack(&sacks, &mut packet[HEADER_SIZE..]);
@@ -3534,7 +4027,7 @@ impl StreamInner {
 
     /// A heartbeat (C `send_probe`); the peer answers it with an ACK.
     fn heartbeat_packet(&self) -> Option<ControlPacket> {
-        let packet = ControlBytes::Inline(self.control_header(FLAG_HEARTBEAT).encode());
+        let packet = ControlBytes::inline_header(self.control_header(FLAG_HEARTBEAT).encode());
         Some((self.udp.clone()?, self.remote_addr?, packet))
     }
 }
@@ -3658,7 +4151,7 @@ mod mtu_tests {
                     let expected: Vec<u32> = inner
                         .outgoing
                         .iter()
-                        .filter(|&(&seq, p)| {
+                        .filter(|&(seq, p)| {
                             p.is_inflight()
                                 && (p.time_sent < rack_time
                                     || (p.time_sent == rack_time && seq_after(rack_seq, seq)))
@@ -3671,7 +4164,7 @@ mod mtu_tests {
                             }
                             due
                         })
-                        .map(|(&seq, _)| seq)
+                        .map(|(seq, _)| seq)
                         .collect();
                     let (lost, timeout) = inner.detect_losses(now);
                     assert_eq!(lost as usize, expected.len());
