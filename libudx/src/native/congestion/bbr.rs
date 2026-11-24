@@ -17,7 +17,7 @@
 //!   crushing cwnd to 4 packets, avoiding periodic stalls during video streams.
 
 use super::{
-    BBR_BETA, BBR_BW_FILTER_ROUNDS, BBR_CWND_GAIN, BBR_CWND_MIN_TARGET, BBR_DRAIN_GAIN,
+    BBR_BETA, BBR_BW_FILTER_CYCLES, BBR_CWND_GAIN, BBR_CWND_MIN_TARGET, BBR_DRAIN_GAIN,
     BBR_EXTRA_ACKED_GAIN, BBR_EXTRA_ACKED_MAX_US, BBR_EXTRA_ACKED_WIN_RTTS, BBR_FULL_BW_COUNT,
     BBR_FULL_BW_THRESH, BBR_FULL_LOSS_CNT, BBR_HEADROOM, BBR_LOSS_THRESH, BBR_MIN_RTT_INTERVAL_US,
     BBR_PACING_MARGIN_PERCENT, BBR_PROBE_BW_CRUISE_GAIN, BBR_PROBE_BW_DOWN_GAIN,
@@ -350,7 +350,7 @@ impl BbrState {
             let bw = f64::from(rs.delivered) / (rs.interval_us as f64);
             if !rs.is_app_limited || bw >= self.max_bw() {
                 self.bw_filter
-                    .apply_max(BBR_BW_FILTER_ROUNDS, u64::from(self.round_count), bw);
+                    .apply_max(BBR_BW_FILTER_CYCLES, u64::from(self.cycle_count), bw);
             }
         }
         if rs.losses > 0 {
@@ -501,6 +501,11 @@ impl BbrState {
 
     /// Pick the wait duration in `ProbeBwCruise` before probing upward again.
     fn pick_probe_wait_us(&self) -> u64 {
+        if self.min_rtt_us < 2_000 {
+            // Sub-ms loopback/LAN path: probe every ~8 RTTs (floored at 2 ms)
+            // instead of stalling 150 ms between probes.
+            return self.min_rtt_us.saturating_mul(8).max(2_000);
+        }
         let rtt_based = if self.min_rtt_us < u64::MAX {
             self.min_rtt_us.saturating_mul(6)
         } else {
@@ -540,6 +545,7 @@ impl BbrState {
         self.cycle_count = self.cycle_count.wrapping_add(1);
         self.probe_bw_phase = ProbeBwPhase::Up;
         self.cycle_stamp_us = link.now_us;
+        self.next_rtt_delivered = link.delivered;
         self.bw_probe_up_rounds = 0;
         self.bw_probe_up_acks = 0;
         self.bw_probe_samples = true;
@@ -964,7 +970,7 @@ mod tests {
         let mut state = BbrState::new(0, 10, MSS);
         state.min_rtt_us = 50_000;
         // 1 pkt / 1000 us = 1000 pkt/s -> BDP = 50 packets -> 0.5 * BDP = 25 packets.
-        state.bw_filter.apply_max(BBR_BW_FILTER_ROUNDS, 0, 0.001);
+        state.bw_filter.apply_max(BBR_BW_FILTER_CYCLES, 0, 0.001);
         state.full_bw_reached = true;
         state.mode = BbrMode::ProbeBw;
         let mut l = link(100, 200, 60, BBR_PROBE_RTT_INTERVAL_US + 1);
@@ -977,7 +983,7 @@ mod tests {
     fn probe_bw_up_pins_inflight_hi_and_drains_on_high_loss() {
         let mut state = BbrState::new(0, 10, MSS);
         state.min_rtt_us = 20_000;
-        state.bw_filter.apply_max(BBR_BW_FILTER_ROUNDS, 0, 0.005); // BDP = 100 pkts
+        state.bw_filter.apply_max(BBR_BW_FILTER_CYCLES, 0, 0.005); // BDP = 100 pkts
         state.full_bw_reached = true;
         state.mode = BbrMode::ProbeBw;
         state.probe_bw_phase = ProbeBwPhase::Up;
@@ -1015,7 +1021,7 @@ mod tests {
     fn deep_queue_clears_inflight_hi_to_avoid_bbrv1_starvation() {
         let mut state = BbrState::new(0, 10, MSS);
         state.min_rtt_us = 50_000;
-        state.bw_filter.apply_max(BBR_BW_FILTER_ROUNDS, 0, 0.001); // BDP = 50 pkts
+        state.bw_filter.apply_max(BBR_BW_FILTER_CYCLES, 0, 0.001); // BDP = 50 pkts
         state.full_bw_reached = true;
         state.mode = BbrMode::ProbeBw;
         state.probe_bw_phase = ProbeBwPhase::Up;

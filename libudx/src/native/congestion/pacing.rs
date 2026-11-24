@@ -82,15 +82,16 @@ impl TokenBucket {
         }
     }
 
-    /// Maximum burst credit in bytes: ~1 ms of traffic at the current rate,
+    /// Maximum burst credit in bytes: ~4 ms of traffic at the current rate,
     /// floored at 2 packets (so low rates stay smooth without overshooting)
-    /// and bounded by `MAX_IDLE_BURST_BYTES`. Keeping 1 ms of credit prevents
-    /// 1 ms async timer granularity from throttling loopback or 1+ Gbit/s LAN
-    /// paths; `udp::send_batch` segments each send into <= 64 KiB GSO calls.
+    /// and bounded by `MAX_IDLE_BURST_BYTES`. Allowing 4 ms of slack ensures
+    /// 1 ms async timer-wheel rounding (e.g. a 1.05 ms pacing sleep waking at
+    /// 1.8 ms) never clamps away elapsed credit and under-paces the stream,
+    /// while `udp::send_batch` segments each send into <= 64 KiB GSO calls.
     fn burst_cap_bytes(&self) -> u64 {
-        let one_ms = self.rate_bps / 1_000;
+        let four_ms = self.rate_bps / 250;
         let min_burst = u64::from(self.mss).saturating_mul(2);
-        one_ms.clamp(min_burst, MAX_IDLE_BURST_BYTES)
+        four_ms.clamp(min_burst, MAX_IDLE_BURST_BYTES)
     }
 
     /// Refill tokens for the exact nanoseconds elapsed since the last refill.
@@ -255,21 +256,56 @@ mod tests {
         );
     }
 
-    /// At 1 Gbit/s (125 MB/s), 1 ms idle credit holds ~125 KiB so 1 ms async
-    /// timer ticks never throttle multi-Gbit/s loopback/LAN paths.
+    /// At 1 Gbit/s (125 MB/s), idle burst slack holds ~4 ms (~500 KiB) so 1 ms
+    /// async timer ticks never clamp away elapsed credit on multi-Gbit/s paths.
     #[test]
-    fn high_rate_allows_one_ms_burst_across_timer_ticks() {
+    fn high_rate_allows_timer_slack_without_truncating_credit() {
         let start = Instant::now();
         let mut tb = TokenBucket::new(125_000_000, 1452, start);
         assert!(tb.try_consume(INITIAL_BUCKET_BYTES as u32, start));
-        tb.refill(start + Duration::from_millis(10));
+        // Simulate a 2 ms timer wakeup (1 ms overshoot): full 250 KB is credited.
+        let t2 = start + Duration::from_millis(2);
+        tb.refill(t2);
         let mut burst = 0u32;
-        while tb.try_consume(1452, start + Duration::from_millis(10)) {
+        while tb.try_consume(1452, t2) {
             burst += 1452;
         }
         assert!(
-            (124_000..=127_000).contains(&burst),
-            "expected ~125 KB 1 ms burst at 1 Gbit/s, got {burst}"
+            (249_000..=253_000).contains(&burst),
+            "expected ~250 KB for 2 ms at 1 Gbit/s, got {burst}"
+        );
+    }
+
+    /// When a 1.45 ms GSO quantum sleep wakes at 2.0 ms due to 1 ms timer-wheel
+    /// rounding, all 2.0 ms of credit are preserved so the average send rate
+    /// matches `rate_bps` with zero under-pacing.
+    #[test]
+    fn timer_wheel_rounding_does_not_underpace_gso_quantum() {
+        let start = Instant::now();
+        let rate_bps = 3_500_000; // 3.5 MB/s -> gso_quantum = 3,500 B
+        let pkt_size = 1_452u32;
+        let mut tb = TokenBucket::new(rate_bps, pkt_size, start);
+        assert!(tb.try_consume(INITIAL_BUCKET_BYTES as u32, start));
+
+        let mut now = start;
+        let end = start + Duration::from_secs(1);
+        let mut bytes_sent = 0u64;
+        while now < end {
+            tb.refill(now);
+            let d = tb.delay();
+            if d.is_zero() {
+                while tb.try_consume(pkt_size, now) {
+                    bytes_sent += u64::from(pkt_size);
+                }
+            } else {
+                // Simulate Tokio's 1 ms timer wheel rounding every sleep up to whole ms.
+                let rounded_ms = d.as_nanos().div_ceil(1_000_000) as u64;
+                now += Duration::from_millis(rounded_ms);
+            }
+        }
+        assert!(
+            (3_400_000..=3_600_000).contains(&bytes_sent),
+            "expected ~3,500,000 B/s with 1 ms timer rounding, sent {bytes_sent} B"
         );
     }
 
