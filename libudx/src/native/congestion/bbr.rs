@@ -877,11 +877,13 @@ mod tests {
             state.main(&rs, &mut l);
         }
         // Round completes (prior_delivered >= 100) with high loss -> exits Startup with inflight_hi set.
+        // Keep inflight above 1.0 * BDP so BBR enters Drain before ProbeBW.
         let mut rs = make_rs(20, 50_000, 100, false);
         rs.losses = 1;
         rs.tx_in_flight = 100;
         rs.lost_in_flight = 5;
         l.delivered = 180;
+        l.inflight = 200;
         state.main(&rs, &mut l);
         assert!(state.full_bw_reached);
         assert_eq!(state.mode, BbrMode::Drain);
