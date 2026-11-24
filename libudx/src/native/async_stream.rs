@@ -7,6 +7,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
+use super::receive_window::{ReadMeter, ReceiveWindow};
 use super::stream::{StreamEvent, StreamInner};
 
 /// Terminal stream event deferred until bytes already copied into the caller's
@@ -32,6 +33,11 @@ enum TerminalEvent {
 /// without `shutdown` abandons data the peer has not ACKed yet.
 pub struct UdxAsyncStream {
     inner: Arc<Mutex<StreamInner>>,
+    /// The same window as `inner`'s, kept outside the lock so a poll can
+    /// count bytes without holding it.
+    receive_window: Arc<ReceiveWindow>,
+    /// Measures the one reader; a fast reader doubles the window.
+    read_meter: ReadMeter,
     read_rx: mpsc::UnboundedReceiver<StreamEvent>,
     read_buf: Bytes,
     read_eof: bool,
@@ -44,12 +50,21 @@ pub struct UdxAsyncStream {
 impl UdxAsyncStream {
     pub(crate) fn new(
         inner: Arc<Mutex<StreamInner>>,
+        read_meter: ReadMeter,
         read_rx: mpsc::UnboundedReceiver<StreamEvent>,
         processor: Option<tokio::task::JoinHandle<()>>,
         close_rx: Option<oneshot::Receiver<()>>,
     ) -> Self {
+        let receive_window = Arc::clone(
+            &inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .receive_window,
+        );
         Self {
             inner,
+            receive_window,
+            read_meter,
             read_rx,
             read_buf: Bytes::new(),
             read_eof: false,
@@ -108,31 +123,40 @@ fn poll_all_acked(inner: &mut StreamInner, cx: &mut Context<'_>) -> Poll<io::Res
 
 impl AsyncRead for UdxAsyncStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.read_eof {
+        // One projection, so the window and the meter are borrowed as
+        // separate fields.
+        let this = self.get_mut();
+        if this.read_eof {
             return Poll::Ready(Ok(()));
         }
 
         let mut copied = 0usize;
-        if !self.read_buf.is_empty() {
-            let n = self.read_buf.len().min(buf.remaining());
-            let chunk = self.read_buf.split_to(n);
+        if !this.read_buf.is_empty() {
+            let n = this.read_buf.len().min(buf.remaining());
+            let chunk = this.read_buf.split_to(n);
             buf.put_slice(&chunk);
             copied += n;
             if buf.remaining() == 0 {
+                if this.receive_window.taken(copied, &mut this.read_meter) {
+                    this.lock().request_window_update();
+                }
                 return Poll::Ready(Ok(()));
             }
         }
 
-        if let Some(terminal) = self.pending_terminal.take() {
+        if let Some(terminal) = this.pending_terminal.take() {
             if copied > 0 {
-                self.pending_terminal = Some(terminal);
+                this.pending_terminal = Some(terminal);
+                if this.receive_window.taken(copied, &mut this.read_meter) {
+                    this.lock().request_window_update();
+                }
                 return Poll::Ready(Ok(()));
             }
-            self.read_eof = true;
+            this.read_eof = true;
             return match terminal {
                 TerminalEvent::End => Poll::Ready(Ok(())),
                 TerminalEvent::Error(kind) => {
@@ -146,12 +170,12 @@ impl AsyncRead for UdxAsyncStream {
         // buffer in one read instead of returning one packet at a time.
         while buf.remaining() > 0 {
             let event = if copied == 0 {
-                match self.read_rx.poll_recv(cx) {
+                match this.read_rx.poll_recv(cx) {
                     Poll::Ready(ev) => ev,
                     Poll::Pending => return Poll::Pending,
                 }
             } else {
-                match self.read_rx.try_recv() {
+                match this.read_rx.try_recv() {
                     Ok(ev) => Some(ev),
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => None,
@@ -164,27 +188,30 @@ impl AsyncRead for UdxAsyncStream {
                     buf.put_slice(&head);
                     copied += n;
                     if !data.is_empty() {
-                        self.read_buf = data;
+                        this.read_buf = data;
                         break;
                     }
                 }
                 Some(StreamEvent::Error(kind)) => {
                     if copied > 0 {
-                        self.pending_terminal = Some(TerminalEvent::Error(kind));
+                        this.pending_terminal = Some(TerminalEvent::Error(kind));
                         break;
                     }
-                    self.read_eof = true;
+                    this.read_eof = true;
                     return Poll::Ready(Err(io::Error::new(kind, "UDX stream failed")));
                 }
                 Some(StreamEvent::End) | None => {
                     if copied > 0 {
-                        self.pending_terminal = Some(TerminalEvent::End);
+                        this.pending_terminal = Some(TerminalEvent::End);
                         break;
                     }
-                    self.read_eof = true;
+                    this.read_eof = true;
                     return Poll::Ready(Ok(()));
                 }
             }
+        }
+        if copied > 0 && this.receive_window.taken(copied, &mut this.read_meter) {
+            this.lock().request_window_update();
         }
         Poll::Ready(Ok(()))
     }
