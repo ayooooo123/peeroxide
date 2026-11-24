@@ -18,6 +18,28 @@ pub struct Datagram {
     pub addr: SocketAddr,
 }
 
+/// Whether `next` supersedes `prev` as a redundant intermediate pure ACK.
+///
+/// Both must be pure cumulative ACKs (`type_flags == 0`, empty body) for the
+/// same stream and source address, with `next.ack` strictly advancing past
+/// `prev.ack` and `next.recv_window >= prev.recv_window`. Duplicate ACKs,
+/// SACKs, DATA/END/DESTROY/HEARTBEAT/MESSAGE packets, and window reductions
+/// are never coalesced.
+#[inline]
+fn can_coalesce_pure_ack(
+    prev: &super::header::Header,
+    prev_addr: SocketAddr,
+    next: &super::header::Header,
+    next_addr: SocketAddr,
+) -> bool {
+    prev.type_flags == 0
+        && next.type_flags == 0
+        && prev.remote_id == next.remote_id
+        && prev_addr == next_addr
+        && (next.ack.wrapping_sub(prev.ack) as i32) > 0
+        && next.recv_window >= prev.recv_window
+}
+
 /// What the receive loop does with one datagram.
 enum Route {
     /// Handed to a live stream's queue.
@@ -111,6 +133,54 @@ impl UdxSocketInner {
                     let mut streams_guard: Option<
                         std::sync::MutexGuard<'_, HashMap<u32, StreamEntry>>,
                     > = None;
+                    // Coalesce consecutive redundant pure cumulative ACKs within
+                    // one `recv_batch` (e.g. from stock C peers that ACK every
+                    // single DATA packet) so the stream processor runs BBR and
+                    // locking once per ACK burst instead of once per packet.
+                    let mut pending_ack: Option<(
+                        mpsc::Sender<super::stream::IncomingPacket>,
+                        super::header::Header,
+                        SocketAddr,
+                    )> = None;
+
+                    let flush_pending_ack = |pending: &mut Option<(
+                        mpsc::Sender<super::stream::IncomingPacket>,
+                        super::header::Header,
+                        SocketAddr,
+                    )>,
+                                             batch_socket: &mut Option<Arc<UdxSocketInner>>|
+                     -> bool {
+                        let Some((tx, header, addr)) = pending.take() else {
+                            return true;
+                        };
+                        let inner = match batch_socket {
+                            Some(inner) => Arc::clone(inner),
+                            None => {
+                                let Some(upgraded) = socket.upgrade() else {
+                                    return false;
+                                };
+                                let cloned = Arc::clone(&upgraded);
+                                *batch_socket = Some(upgraded);
+                                cloned
+                            }
+                        };
+                        let packet = super::stream::IncomingPacket {
+                            header,
+                            body: Bytes::new(),
+                            addr,
+                            socket: UdxSocket { inner },
+                            udp_ptr,
+                        };
+                        if let Err(mpsc::error::TrySendError::Full(packet)) = tx.try_send(packet) {
+                            packet
+                                .socket
+                                .inner
+                                .dropped_stream_packets
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        true
+                    };
+
                     for (index, range, addr) in datagrams.drain(..) {
                         // Decode from the receive buffer: no copy, and no lock
                         // for a datagram that is not a UDX packet.
@@ -127,63 +197,108 @@ impl UdxSocketInner {
                                 });
                                 match guard.get(&header.remote_id) {
                                     Some(StreamEntry::Stream(tx)) => {
-                                        let inner = match &batch_socket {
-                                            Some(inner) => Arc::clone(inner),
-                                            None => {
-                                                let Some(upgraded) = socket.upgrade() else {
-                                                    break 'receive;
-                                                };
-                                                let cloned = Arc::clone(&upgraded);
-                                                batch_socket = Some(upgraded);
-                                                cloned
-                                            }
-                                        };
                                         stream_packet = true;
-                                        // Copy once into the slab without the
-                                        // header; empty bodies (plain ACKs) do
-                                        // not touch the slab or allocate.
                                         let body_slice = &datagram[super::header::HEADER_SIZE..];
-                                        let body = if body_slice.is_empty() {
-                                            Bytes::new()
+                                        if header.type_flags == 0 && body_slice.is_empty() {
+                                            if let Some((_, ref mut prev_hdr, prev_addr)) =
+                                                pending_ack
+                                            {
+                                                if can_coalesce_pure_ack(
+                                                    prev_hdr, prev_addr, &header, addr,
+                                                ) {
+                                                    *prev_hdr = header;
+                                                    Route::Stream
+                                                } else {
+                                                    if !flush_pending_ack(
+                                                        &mut pending_ack,
+                                                        &mut batch_socket,
+                                                    ) {
+                                                        break 'receive;
+                                                    }
+                                                    pending_ack =
+                                                        Some((tx.clone(), header, addr));
+                                                    Route::Stream
+                                                }
+                                            } else {
+                                                pending_ack = Some((tx.clone(), header, addr));
+                                                Route::Stream
+                                            }
                                         } else {
-                                            if rx_slab.capacity() < body_slice.len() {
-                                                rx_slab = BytesMut::with_capacity(
-                                                    RX_SLAB_BYTES.max(body_slice.len()),
-                                                );
+                                            if !flush_pending_ack(
+                                                &mut pending_ack,
+                                                &mut batch_socket,
+                                            ) {
+                                                break 'receive;
                                             }
-                                            rx_slab.extend_from_slice(body_slice);
-                                            rx_slab.split().freeze()
-                                        };
-                                        let packet = super::stream::IncomingPacket {
-                                            header,
-                                            body,
-                                            addr,
-                                            socket: UdxSocket { inner },
-                                            udp_ptr,
-                                        };
-                                        match tx.try_send(packet) {
-                                            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-                                            // A full queue drops the packet like any
-                                            // UDP overflow; the sender retransmits.
-                                            Err(mpsc::error::TrySendError::Full(packet)) => {
-                                                packet
-                                                    .socket
-                                                    .inner
-                                                    .dropped_stream_packets
-                                                    .fetch_add(1, Ordering::Relaxed);
+                                            let inner = match &batch_socket {
+                                                Some(inner) => Arc::clone(inner),
+                                                None => {
+                                                    let Some(upgraded) = socket.upgrade() else {
+                                                        break 'receive;
+                                                    };
+                                                    let cloned = Arc::clone(&upgraded);
+                                                    batch_socket = Some(upgraded);
+                                                    cloned
+                                                }
+                                            };
+                                            // Copy once into the slab without the
+                                            // header; empty bodies do not allocate.
+                                            let body = if body_slice.is_empty() {
+                                                Bytes::new()
+                                            } else {
+                                                if rx_slab.capacity() < body_slice.len() {
+                                                    rx_slab = BytesMut::with_capacity(
+                                                        RX_SLAB_BYTES.max(body_slice.len()),
+                                                    );
+                                                }
+                                                rx_slab.extend_from_slice(body_slice);
+                                                rx_slab.split().freeze()
+                                            };
+                                            let packet = super::stream::IncomingPacket {
+                                                header,
+                                                body,
+                                                addr,
+                                                socket: UdxSocket { inner },
+                                                udp_ptr,
+                                            };
+                                            match tx.try_send(packet) {
+                                                Ok(())
+                                                | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                                // A full queue drops the packet like any
+                                                // UDP overflow; the sender retransmits.
+                                                Err(mpsc::error::TrySendError::Full(packet)) => {
+                                                    packet
+                                                        .socket
+                                                        .inner
+                                                        .dropped_stream_packets
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                }
                                             }
+                                            Route::Stream
                                         }
-                                        Route::Stream
                                     }
                                     // C `process_timewait`: answered or ignored,
                                     // never handed on.
                                     Some(StreamEntry::Timewait(timewait)) => {
+                                        if !flush_pending_ack(&mut pending_ack, &mut batch_socket) {
+                                            break 'receive;
+                                        }
                                         Route::Timewait(Arc::clone(timewait), header.type_flags)
                                     }
-                                    None => Route::Fallback,
+                                    None => {
+                                        if !flush_pending_ack(&mut pending_ack, &mut batch_socket) {
+                                            break 'receive;
+                                        }
+                                        Route::Fallback
+                                    }
                                 }
                             }
-                            None => Route::Fallback,
+                            None => {
+                                if !flush_pending_ack(&mut pending_ack, &mut batch_socket) {
+                                    break 'receive;
+                                }
+                                Route::Fallback
+                            }
                         };
                         match route {
                             Route::Stream => continue,
@@ -204,6 +319,9 @@ impl UdxSocketInner {
                                 addr,
                             });
                         }
+                    }
+                    if !flush_pending_ack(&mut pending_ack, &mut batch_socket) {
+                        break 'receive;
                     }
                 }
                 if stream_packet && bufs.len() == 1 {
@@ -637,5 +755,67 @@ mod tests {
             rx.try_recv().is_err(),
             "the queue accepted more than its capacity"
         );
+    }
+
+    #[test]
+    fn pure_ack_coalesce_rules_keep_dups_sacks_and_window_shrinks() {
+        use super::super::header::FLAG_SACK;
+        let a: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        let mk = |flags, id, rwnd, ack| Header {
+            type_flags: flags,
+            data_offset: 0,
+            remote_id: id,
+            recv_window: rwnd,
+            seq: 0,
+            ack,
+        };
+        // Strictly advancing pure ACK on same stream/addr with same/larger rwnd coalesces.
+        assert!(can_coalesce_pure_ack(
+            &mk(0, 10, 4096, 1),
+            a,
+            &mk(0, 10, 4096, 2),
+            a
+        ));
+        assert!(can_coalesce_pure_ack(
+            &mk(0, 10, 4096, 1),
+            a,
+            &mk(0, 10, 8192, 5),
+            a
+        ));
+        // Duplicate ACK must NOT coalesce.
+        assert!(!can_coalesce_pure_ack(
+            &mk(0, 10, 4096, 2),
+            a,
+            &mk(0, 10, 4096, 2),
+            a
+        ));
+        // SACK or DATA must NOT coalesce.
+        assert!(!can_coalesce_pure_ack(
+            &mk(0, 10, 4096, 1),
+            a,
+            &mk(FLAG_SACK, 10, 4096, 2),
+            a
+        ));
+        // Window reduction must NOT coalesce.
+        assert!(!can_coalesce_pure_ack(
+            &mk(0, 10, 4096, 1),
+            a,
+            &mk(0, 10, 0, 2),
+            a
+        ));
+        // Different stream or peer address must NOT coalesce.
+        assert!(!can_coalesce_pure_ack(
+            &mk(0, 10, 4096, 1),
+            a,
+            &mk(0, 11, 4096, 2),
+            a
+        ));
+        assert!(!can_coalesce_pure_ack(
+            &mk(0, 10, 4096, 1),
+            a,
+            &mk(0, 10, 4096, 2),
+            b
+        ));
     }
 }
