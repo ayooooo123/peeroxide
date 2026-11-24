@@ -1,19 +1,24 @@
 //! Deficit-tracking microsecond pacer for BBR send-rate gating.
 //!
 //! Replaces the 1 ms reset bucket (which enforced a minimum of one full packet
-//! per millisecond, ~11.6 Mbit/s, overshot film-rate pacing by ~45%, and dumped
-//! ~125 KiB bursts at 1 Gbit/s) with exact nanosecond token accrual and deficit
-//! carry-over. Burst capacity scales with the pacing rate up to one UDP GSO
-//! send (`65_507` bytes), keeping GSO batching intact at high rates while pacing
-//! smoothly down to low bitrates.
+//! per millisecond, ~11.6 Mbit/s, and overshot film-rate pacing by ~45%) with
+//! exact nanosecond token accrual and deficit carry-over. At rates above
+//! `2 * MSS / ms`, a quantum hysteresis latch waits for one ~1 ms UDP GSO
+//! burst (capped at `65_507` bytes) before waking the sender again, so
+//! mid-millisecond ACK arrivals never shatter UDP GSO into 1-packet sends.
+//! Idle burst accrual scales with 1 ms of rate so multi-Gbit/s loopback/LAN
+//! paths are never throttled by 1 ms async timer granularity.
 
 use std::time::{Duration, Instant};
 
 /// Bytes in the bucket of a new stream (C `UDX_INIT_PACING_RATE`).
 const INITIAL_BUCKET_BYTES: u64 = 25_000;
 
-/// Largest burst the pacer accumulates while idle: one max UDP GSO send.
-const MAX_BURST_BYTES: u64 = 65_507;
+/// Largest GSO burst quantum waited for between sends: one max UDP GSO send.
+const MAX_GSO_QUANTUM_BYTES: u64 = 65_507;
+
+/// Upper bound on 1 ms idle token accrual (4 MiB -> >32 Gbit/s).
+const MAX_IDLE_BURST_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Minimum pacing rate (bytes/s) to prevent division by zero or infinite waits.
 const MIN_RATE_BPS: u64 = 1_200;
@@ -43,6 +48,10 @@ pub(crate) struct TokenBucket {
     rate_bps: u64,
     /// Current payload size (for minimum burst sizing).
     mss: u32,
+    /// Hysteresis latch set once `tokens_ub <= 0` at GSO-capable rates; cleared
+    /// only when `tokens_ub` accrues a full `gso_quantum_bytes()` burst so
+    /// intervening ACK wakeups do not emit 1-packet sends.
+    waiting_for_quantum: bool,
 }
 
 impl TokenBucket {
@@ -53,80 +62,94 @@ impl TokenBucket {
             last_refill: now,
             rate_bps: rate_bps.max(MIN_RATE_BPS),
             mss: mss.max(1),
+            waiting_for_quantum: false,
         }
     }
 
     /// Set the pacing rate in bytes per second.
     pub(crate) fn set_rate_bps(&mut self, rate_bps: u64) {
         self.rate_bps = rate_bps.max(MIN_RATE_BPS);
+        if self.gso_quantum_bytes() == 0 {
+            self.waiting_for_quantum = false;
+        }
     }
 
     /// Update MSS after a PMTU step.
     pub(crate) fn set_mss(&mut self, mss: u32) {
         self.mss = mss.max(1);
+        if self.gso_quantum_bytes() == 0 {
+            self.waiting_for_quantum = false;
+        }
     }
 
     /// Maximum burst credit in bytes: ~1 ms of traffic at the current rate,
     /// floored at 2 packets (so low rates stay smooth without overshooting)
-    /// and capped at one max UDP GSO burst (`65_507` bytes).
+    /// and bounded by `MAX_IDLE_BURST_BYTES`. Keeping 1 ms of credit prevents
+    /// 1 ms async timer granularity from throttling loopback or 1+ Gbit/s LAN
+    /// paths; `udp::send_batch` segments each send into <= 64 KiB GSO calls.
     fn burst_cap_bytes(&self) -> u64 {
         let one_ms = self.rate_bps / 1_000;
         let min_burst = u64::from(self.mss).saturating_mul(2);
-        one_ms.clamp(min_burst, MAX_BURST_BYTES)
+        one_ms.clamp(min_burst, MAX_IDLE_BURST_BYTES)
     }
 
     /// Refill tokens for the exact nanoseconds elapsed since the last refill.
     pub(crate) fn refill(&mut self, now: Instant) {
         let elapsed_ns = now.saturating_duration_since(self.last_refill).as_nanos();
-        if elapsed_ns == 0 {
-            return;
+        if elapsed_ns > 0 {
+            // `bytes * 1e6 = elapsed_ns * rate_bps / 1e3` (since 1 s = 1e9 ns).
+            let added_ub = (elapsed_ns.saturating_mul(u128::from(self.rate_bps)) / 1_000)
+                .min(i128::MAX as u128) as i128;
+            if added_ub > 0 {
+                self.last_refill = now;
+                let cap_ub = i128::from(self.burst_cap_bytes()) * MICRO_BYTES;
+                // Preserve the larger initial burst until it has been spent, and cap
+                // idle accumulation at `burst_cap_bytes`.
+                let ceiling = self.tokens_ub.max(cap_ub);
+                self.tokens_ub = self.tokens_ub.saturating_add(added_ub).min(ceiling);
+            }
         }
-        // `bytes * 1e6 = elapsed_ns * rate_bps / 1e3` (since 1 s = 1e9 ns).
-        let added_ub = (elapsed_ns.saturating_mul(u128::from(self.rate_bps)) / 1_000)
-            .min(i128::MAX as u128) as i128;
-        if added_ub == 0 {
-            // Very tiny elapsed time at a low rate: leave `last_refill` alone
-            // so sub-microbyte time accumulates cleanly on the next call.
-            return;
+        if self.waiting_for_quantum {
+            let quantum_ub = i128::from(self.gso_quantum_bytes()) * MICRO_BYTES;
+            if quantum_ub == 0 || self.tokens_ub >= quantum_ub {
+                self.waiting_for_quantum = false;
+            }
         }
-        self.last_refill = now;
-        let cap_ub = i128::from(self.burst_cap_bytes()) * MICRO_BYTES;
-        // Preserve the larger initial burst until it has been spent, and cap
-        // idle accumulation at `burst_cap_bytes`.
-        let ceiling = self.tokens_ub.max(cap_ub);
-        self.tokens_ub = self.tokens_ub.saturating_add(added_ub).min(ceiling);
     }
 
-    /// Spend `bytes` on a packet. Refills first. Returns false when no positive
-    /// credit is available; otherwise subtracts `bytes` (carrying any deficit
-    /// forward) and returns true.
+    /// Spend `bytes` on a packet. Refills first. Returns false while waiting
+    /// for the next GSO quantum or when no positive credit is available;
+    /// otherwise subtracts `bytes` (carrying any deficit forward) and returns true.
     pub(crate) fn try_consume(&mut self, bytes: u32, now: Instant) -> bool {
         self.refill(now);
-        if self.tokens_ub <= 0 {
+        if self.waiting_for_quantum || self.tokens_ub <= 0 {
             return false;
         }
         self.tokens_ub -= i128::from(bytes) * MICRO_BYTES;
+        if self.tokens_ub <= 0 && self.gso_quantum_bytes() > 0 {
+            self.waiting_for_quantum = true;
+        }
         true
     }
 
     /// Target send burst in bytes for UDP GSO batching: ~1 ms of traffic at
-    /// rates above 2 packets/ms (~3 MB/s), capped at `MAX_BURST_BYTES`. Below
-    /// that rate returns 0 so low-bitrate pacing stays smooth packet-by-packet.
+    /// rates above 2 packets/ms (~3 MB/s), capped at `MAX_GSO_QUANTUM_BYTES`.
+    /// Below that rate returns 0 so low-bitrate pacing stays smooth packet-by-packet.
     fn gso_quantum_bytes(&self) -> u64 {
         let one_ms = self.rate_bps / 1_000;
         let min_gso = u64::from(self.mss).saturating_mul(2);
         if one_ms >= min_gso {
-            one_ms.min(MAX_BURST_BYTES)
+            one_ms.min(MAX_GSO_QUANTUM_BYTES)
         } else {
             0
         }
     }
 
-    /// Delay before the next packet may go out: zero while credit is positive,
-    /// otherwise the time to pay back the deficit plus (at high rates) accrue
-    /// one ~1 ms GSO burst quantum so UDP GSO batching stays intact.
+    /// Delay before the next packet may go out: zero while credit is positive
+    /// and not latched for a GSO quantum, otherwise the time to pay back any
+    /// deficit and accrue one GSO quantum so UDP GSO batching stays intact.
     pub(crate) fn delay(&self) -> Duration {
-        if self.tokens_ub > 0 {
+        if !self.waiting_for_quantum && self.tokens_ub > 0 {
             return Duration::ZERO;
         }
         let target_ub = i128::from(self.gso_quantum_bytes()) * MICRO_BYTES;
@@ -232,10 +255,10 @@ mod tests {
         );
     }
 
-    /// At 1 Gbit/s, the burst cap stays bounded at MAX_BURST_BYTES (65,507 B)
-    /// rather than dumping 125 KiB bursts, while allowing full UDP GSO batches.
+    /// At 1 Gbit/s (125 MB/s), 1 ms idle credit holds ~125 KiB so 1 ms async
+    /// timer ticks never throttle multi-Gbit/s loopback/LAN paths.
     #[test]
-    fn high_rate_caps_burst_to_one_gso_send() {
+    fn high_rate_allows_one_ms_burst_across_timer_ticks() {
         let start = Instant::now();
         let mut tb = TokenBucket::new(125_000_000, 1452, start);
         assert!(tb.try_consume(INITIAL_BUCKET_BYTES as u32, start));
@@ -244,20 +267,44 @@ mod tests {
         while tb.try_consume(1452, start + Duration::from_millis(10)) {
             burst += 1452;
         }
-        assert!(burst >= 64_000 && burst <= MAX_BURST_BYTES as u32 + 1452);
+        assert!(
+            (124_000..=127_000).contains(&burst),
+            "expected ~125 KB 1 ms burst at 1 Gbit/s, got {burst}"
+        );
     }
 
     /// At 100 Mbit/s (12.5 MB/s), delay() sleeps until a ~1 ms UDP GSO quantum
-    /// accrues (~12.5 KB) rather than waking after 50 us for a single packet.
+    /// accrues (~12.5 KB), and intervening ACK wakeups mid-millisecond do NOT
+    /// release 1-packet sends and break UDP GSO batching.
     #[test]
-    fn high_rate_delay_accumulates_gso_quantum() {
+    fn mid_quantum_ack_wakeup_does_not_break_gso_batch() {
         let start = Instant::now();
         let mut tb = TokenBucket::new(12_500_000, 1452, start);
         assert!(tb.try_consume(INITIAL_BUCKET_BYTES as u32, start));
-        let d = tb.delay();
+        let d0 = tb.delay();
         assert!(
-            d >= Duration::from_micros(950) && d <= Duration::from_micros(1_050),
-            "expected ~1 ms GSO quantum delay at 12.5 MB/s, got {d:?}"
+            d0 >= Duration::from_micros(950) && d0 <= Duration::from_micros(1_050),
+            "expected ~1 ms GSO quantum delay at 12.5 MB/s, got {d0:?}"
+        );
+
+        // ACK arrives 200 us later: tokens_ub is positive (~2.5 KB), but
+        // waiting_for_quantum keeps delay non-zero and refuses 1-packet sends.
+        let t_ack = start + Duration::from_micros(200);
+        tb.refill(t_ack);
+        assert!(tb.delay() >= Duration::from_micros(750));
+        assert!(!tb.try_consume(1452, t_ack));
+
+        // Once the full 1 ms quantum accrues, an entire ~9-packet GSO burst goes out.
+        let t_full = start + Duration::from_micros(1_000);
+        tb.refill(t_full);
+        assert_eq!(tb.delay(), Duration::ZERO);
+        let mut pkts = 0u32;
+        while tb.try_consume(1452, t_full) {
+            pkts += 1;
+        }
+        assert!(
+            (8..=10).contains(&pkts),
+            "expected 8..=10 packet GSO burst, got {pkts}"
         );
     }
 }

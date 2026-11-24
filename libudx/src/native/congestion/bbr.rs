@@ -333,6 +333,17 @@ impl BbrState {
         }
     }
 
+    /// True when standing queueing delay is at least `0.5 * min_rtt` on a
+    /// non-loopback path (`min_rtt >= 2 ms`). This identifies deep bottleneck
+    /// queues filled by competing loss-agnostic flows (such as stock BBRv1
+    /// peers), where capping `inflight_hi` below `2 * BDP` starves this flow;
+    /// shallow queues (`queue < 0.5 * BDP`) still get full BBRv3 loss bounding.
+    fn in_deep_queue(&self, link: &Link) -> bool {
+        self.min_rtt_us < u64::MAX
+            && self.min_rtt_us >= 2_000
+            && link.srtt_us >= self.min_rtt_us.saturating_mul(3) / 2
+    }
+
     /// Update `bw_filter`, `inflight_hi`, and lower bounds (`bw_lo`, `inflight_lo`).
     fn update_congestion_signals(&mut self, rs: &RateSample, link: &Link) {
         if rs.delivered > 0 && rs.interval_us > 0 {
@@ -345,6 +356,11 @@ impl BbrState {
         if rs.losses > 0 {
             self.loss_in_round = true;
             self.loss_events_in_round = self.loss_events_in_round.saturating_add(1);
+        }
+        if self.in_deep_queue(link) {
+            self.inflight_hi = u32::MAX;
+            self.reset_lower_bounds();
+            return;
         }
         if !self.loss_round_start {
             return;
@@ -459,6 +475,7 @@ impl BbrState {
         }
         // BBRv3 high-loss startup exit: avoid overflowing shallow queues for 3 RTTs.
         if self.loss_round_start
+            && !self.in_deep_queue(link)
             && self.loss_events_in_round >= BBR_FULL_LOSS_CNT
             && self.is_inflight_too_high(rs)
         {
@@ -468,7 +485,6 @@ impl BbrState {
                 .max(self.inflight_latest)
                 .max(BBR_CWND_MIN_TARGET);
             self.inflight_hi = safe_hi;
-            let _ = link;
         }
     }
 
@@ -588,11 +604,13 @@ impl BbrState {
                 }
             }
             ProbeBwPhase::Up => {
+                let deep_queue = self.in_deep_queue(link);
                 let half_rtt_done =
                     self.min_rtt_us == u64::MAX || elapsed_us >= self.min_rtt_us / 2;
-                // Hit loss ceiling -> pin `inflight_hi` and drain immediately,
-                // once we have probed long enough for Up's own packets to land.
-                if (half_rtt_done || link.inflight >= target_inflight)
+                // Hit loss ceiling on a shallow queue -> pin `inflight_hi` and
+                // drain immediately, once Up's own packets have landed.
+                if !deep_queue
+                    && (half_rtt_done || link.inflight >= target_inflight)
                     && self.is_inflight_too_high(rs)
                 {
                     let safe = rs
@@ -608,7 +626,12 @@ impl BbrState {
                 let min_rtt_done =
                     self.min_rtt_us < u64::MAX && elapsed_us > self.min_rtt_us;
                 let probe_target = self.bdp(self.max_bw(), BBR_PROBE_BW_UP_GAIN);
-                if min_rtt_done && (link.inflight >= probe_target || rs.losses > 0) {
+                let done_probing = if deep_queue {
+                    min_rtt_done && self.round_start
+                } else {
+                    min_rtt_done && (link.inflight >= probe_target || rs.losses > 0)
+                };
+                if done_probing {
                     if !self.loss_in_round
                         && self.inflight_hi < u32::MAX
                         && link.inflight >= self.inflight_hi
@@ -791,7 +814,7 @@ impl BbrState {
         let mut cwnd = link.cwnd;
         if acked > 0 && !self.set_cwnd_to_recover_or_restore(rs, acked, &mut cwnd, link) {
             let target = self
-                .bdp(bw, gain)
+                .cwnd_bdp(bw, gain)
                 .saturating_add(self.ack_aggregation_cwnd());
             if self.full_bw_reached {
                 cwnd = cwnd.saturating_add(acked).min(target);
@@ -813,6 +836,24 @@ impl BbrState {
             return 10;
         }
         let packets = bw * (self.min_rtt_us as f64) * gain;
+        if !packets.is_finite() || packets < 1.0 {
+            1
+        } else if packets >= f64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            packets as u32
+        }
+    }
+
+    /// BDP × gain for cwnd sizing, flooring RTT at 1 ms so sub-millisecond
+    /// loopback/LAN paths keep deep pipelining across async wakeups while
+    /// pacing and RACK keep exact microsecond resolution.
+    fn cwnd_bdp(&self, bw: f64, gain: f64) -> u32 {
+        if self.min_rtt_us == u64::MAX {
+            return 10;
+        }
+        let rtt_us = self.min_rtt_us.max(1_000);
+        let packets = bw * (rtt_us as f64) * gain;
         if !packets.is_finite() || packets < 1.0 {
             1
         } else if packets >= f64::from(u32::MAX) {
@@ -965,6 +1006,33 @@ mod tests {
         state.main(&rs, &mut l);
         assert_eq!(state.min_rtt_us(), 300);
         assert_eq!(state.bdp(state.bw(), 1.0), 50);
+        // cwnd_bdp floors RTT at 1 ms so sub-ms loopback keeps full pipelining.
+        assert!(state.cwnd_bdp(state.bw(), 2.0) >= 300);
         assert!(state.pacing_rate_bps() > 200_000_000);
+    }
+
+    #[test]
+    fn deep_queue_clears_inflight_hi_to_avoid_bbrv1_starvation() {
+        let mut state = BbrState::new(0, 10, MSS);
+        state.min_rtt_us = 50_000;
+        state.bw_filter.apply_max(BBR_BW_FILTER_ROUNDS, 0, 0.001); // BDP = 50 pkts
+        state.full_bw_reached = true;
+        state.mode = BbrMode::ProbeBw;
+        state.probe_bw_phase = ProbeBwPhase::Up;
+        state.inflight_hi = 60;
+        state.cycle_stamp_us = 100_000;
+
+        // Standing queue pushes srtt to 120 ms (2.4x min_rtt >= 1.5x): deep queue.
+        let mut rs = make_rs(50, 120_000, 0, false);
+        rs.tx_in_flight = 80;
+        rs.lost_in_flight = 8;
+        rs.losses = 8;
+        let mut l = link(80, 100, 80, 180_000);
+        l.srtt_us = 120_000;
+        state.main(&rs, &mut l);
+
+        assert_eq!(state.inflight_hi, u32::MAX);
+        assert_eq!(state.inflight_lo, u32::MAX);
+        assert!(state.bw_lo.is_infinite());
     }
 }
