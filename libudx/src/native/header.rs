@@ -193,22 +193,31 @@ pub fn encode_sack(ranges: &[SackRange], buf: &mut [u8]) -> usize {
     needed
 }
 
+/// Decodes SACK bytes stored after the fixed UDX header into `out`, reusing its
+/// allocation.
+pub(crate) fn decode_sack_into(buf: &[u8], out: &mut Vec<SackRange>) -> Result<(), HeaderError> {
+    out.clear();
+    if buf.len() % 8 != 0 {
+        return Err(HeaderError::InvalidSack(buf.len()));
+    }
+    out.reserve(buf.len() / 8);
+    for chunk in buf.chunks_exact(8) {
+        out.push(SackRange {
+            start: u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+            end: u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
+        });
+    }
+    Ok(())
+}
+
 /// Decodes SACK bytes stored after the fixed UDX header.
 ///
 /// The input must be an exact sequence of 8-byte little-endian `(start, end)`
 /// pairs, where each pair describes a half-open acknowledged sequence range
 /// `start..end`.
 pub fn decode_sack(buf: &[u8]) -> Result<Vec<SackRange>, HeaderError> {
-    if buf.len() % 8 != 0 {
-        return Err(HeaderError::InvalidSack(buf.len()));
-    }
-    let mut ranges = Vec::with_capacity(buf.len() / 8);
-    for chunk in buf.chunks_exact(8) {
-        ranges.push(SackRange {
-            start: u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
-            end: u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
-        });
-    }
+    let mut ranges = Vec::new();
+    decode_sack_into(buf, &mut ranges)?;
     Ok(ranges)
 }
 

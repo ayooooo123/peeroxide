@@ -9,7 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The receive loop decodes a stream packet's header from the receive buffer, holds the stream table lock once for a run of stream packets, coalesces redundant intermediate pure cumulative ACKs within a receive batch (preserving duplicate ACKs, SACKs, window shrinks, and non-ACK packets), and slices packet bodies from a 64 KiB `BytesMut` slab into refcounted `Bytes` values. A datagram for no stream, and a stream in time-wait, release the table before the fallback channel or the time-wait answer.
+- The stream hot path replaces the `BTreeMap` outgoing buffer with an O(1) sequence-indexed `VecDeque` ring buffer, backs outbound packets with a 64 KiB `BytesMut` slab (cloning `Bytes` handles instead of copying each packet on send/retransmit), processes incoming bursts under a single `StreamInner` lock, sends immediately on write notifications without an extra pacing-timer round-trip, keeps plain 20-byte ACKs/heartbeats and up to 8-range SACK ACKs inline on the stack, reuses ACK/SACK/send scratch buffers, takes post-BBR sends in the same pass, and coalesces queued DATA packets in `UdxAsyncStream::poll_read`.
 - Upgraded congestion control from BBRv1 to BBRv3 (`draft-ietf-ccwg-bbr`) with microsecond RTT, RACK reorder window, and rate sampling, a fixed-point nanosecond deficit-tracking pacer that sleeps for ~1 ms UDP GSO quanta at high bitrates while pacing smoothly packet-by-packet at low bitrates, and dynamic send-buffer backpressure scaling with the active send window (1 MiB to 16 MiB) so SACK recovery and high-BDP paths do not stall `poll_write`. Wire format is unchanged.
+- The receive window follows what the reader has not taken: the window in ACK and data headers is the limit minus the payload held in order and out of order (C `recv_rwnd_max - get_read_buffer_size`, `udx.c:267-283`), and the receiver sends one extra ACK when a read makes the window at least half of the starting window larger than the value the peer last received. The JS wrapper never uses C's callback (`udx-native` 1.22.1 has no `get_read_buffer_size`), so a stock JS peer still advertises 4 MiB; a Rust receiver now stops such a peer at the window instead of growing its queue.
+- In-order data is accepted up to twice the starting window, so a paused reader does not kill a stream that follows the tail loss probe, and out-of-order data is stored only up to the starting window in bytes. A packet past either limit is dropped and not acknowledged.
+- The window maximum doubles, up to four times the starting window, when the reader takes a whole window inside the measurement period; a reader that waits keeps it.
+- `UdxStream::write` resolves only when the peer acknowledges every byte, which with a peer that follows the window also means that it waits for that peer's reader; the doc comment says so.
+
+### Added
+
+- `UdxSocket::dropped_stream_packets`: the number of stream packets dropped because the stream's incoming queue (1,024 packets) was full. The count was invisible before; a packet refused because the stream is gone is not counted.
+
+### Fixed
+
+- The receive-window counters no longer use `AtomicUsize::fetch_update`, which new compilers mark deprecated: a compare-exchange loop gives the same "stop at zero" result, so the crate builds without warnings on stable and on the minimum Rust version.
 
 ### Changed (review 2026-11-15)
 
@@ -71,6 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unreliable datagrams send immediately when the socket is writable, reserving allocation and a task for backpressure.
 - Per-packet bookkeeping no longer walks every unacknowledged packet: `inflight()` is a counter, RACK loss detection reads a send-time-ordered queue, fast retransmit visits only the packets marked lost, and SACK processing skips blocks it has already applied. A seeder serving four loopback peers on Linux went from about 30 to 8 CPU-seconds per GiB with the changes below.
 - On Linux and Android a paced burst to one peer leaves in one UDP GSO `sendmsg`, and the socket reads up to eight datagram buffers per call (`recvmmsg`, GRO) via `quinn-udp`. On macOS one stream sends its burst at a time, which removed kernel lock contention between worker threads (about 3x the CPU per packet with four peers).
+- The GSO send builds its packet run in one buffer for each thread, reserved once to the size of the run and reused (at most 65,507 bytes), instead of a new `Vec` for every send; the Linux receive path builds its `IoSliceMut` array on the stack.
 - Sockets ask for 8 MiB kernel send and receive buffers (falling back to 4 and 2 MiB, as PearTube's JS `tuneUdxSocket`), so a full congestion window sent at once is not dropped by a 208 KiB default.
 - A receiver ACKs in-order data once per receive burst, at most every 8 packets; out-of-order data and END are still ACKed at once. C libudx ACKs every packet; both peers now handle about a third fewer datagrams per MiB.
 
