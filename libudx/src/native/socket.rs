@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
 
 use super::stream::{StreamEntry, Timewait};
@@ -77,10 +78,17 @@ impl UdxSocketInner {
 
         let handle = tokio::spawn(async move {
             use super::udp::{DATAGRAM_SIZE, Udp};
+            /// Size of the slab that backs received stream packet bodies.
+            /// About 44 full-MTU payloads share one heap allocation instead
+            /// of allocating per datagram, while keeping retained memory per
+            /// slab small.
+            const RX_SLAB_BYTES: usize = 65_536;
+            let udp_ptr = Arc::as_ptr(&udp) as usize;
             // Probe-only sockets (holepunch) keep one buffer; a batch is allocated
             // once stream traffic arrives.
             let mut bufs = vec![vec![0u8; DATAGRAM_SIZE]];
             let mut datagrams = Vec::new();
+            let mut rx_slab = BytesMut::new();
             'receive: loop {
                 if let Err(err) = udp.recv_batch(&mut bufs, &mut datagrams).await {
                     // C logs a receive error and keeps reading (udx.c:1950).
@@ -93,6 +101,9 @@ impl UdxSocketInner {
                     continue;
                 }
                 let mut stream_packet = false;
+                // Upgrade the weak owner once per receive batch instead of on
+                // every packet.
+                let mut batch_socket: Option<Arc<UdxSocketInner>> = None;
                 // One guard serves a run of stream packets; anything else
                 // releases it. The block ends (and the guard drops) before
                 // the next `.await`.
@@ -116,17 +127,39 @@ impl UdxSocketInner {
                                 });
                                 match guard.get(&header.remote_id) {
                                     Some(StreamEntry::Stream(tx)) => {
-                                        let Some(inner) = socket.upgrade() else {
-                                            break 'receive;
+                                        let inner = match &batch_socket {
+                                            Some(inner) => Arc::clone(inner),
+                                            None => {
+                                                let Some(upgraded) = socket.upgrade() else {
+                                                    break 'receive;
+                                                };
+                                                let cloned = Arc::clone(&upgraded);
+                                                batch_socket = Some(upgraded);
+                                                cloned
+                                            }
                                         };
                                         stream_packet = true;
-                                        // Copy once, without the header: the
-                                        // stream's processor has it decoded.
+                                        // Copy once into the slab without the
+                                        // header; empty bodies (plain ACKs) do
+                                        // not touch the slab or allocate.
+                                        let body_slice = &datagram[super::header::HEADER_SIZE..];
+                                        let body = if body_slice.is_empty() {
+                                            Bytes::new()
+                                        } else {
+                                            if rx_slab.capacity() < body_slice.len() {
+                                                rx_slab = BytesMut::with_capacity(
+                                                    RX_SLAB_BYTES.max(body_slice.len()),
+                                                );
+                                            }
+                                            rx_slab.extend_from_slice(body_slice);
+                                            rx_slab.split().freeze()
+                                        };
                                         let packet = super::stream::IncomingPacket {
                                             header,
-                                            body: datagram[super::header::HEADER_SIZE..].to_vec(),
+                                            body,
                                             addr,
                                             socket: UdxSocket { inner },
+                                            udp_ptr,
                                         };
                                         match tx.try_send(packet) {
                                             Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
@@ -534,8 +567,8 @@ mod tests {
         })
         .await
         .expect("stream packets did not arrive in order");
-        assert_eq!((one.header.seq, one.body.as_slice()), (0, &b"first"[..]));
-        assert_eq!((two.header.seq, two.body.as_slice()), (1, &b"second"[..]));
+        assert_eq!((one.header.seq, one.body.as_ref()), (0, &b"first"[..]));
+        assert_eq!((two.header.seq, two.body.as_ref()), (1, &b"second"[..]));
 
         let datagram = tokio::time::timeout(Duration::from_secs(1), fallback.recv())
             .await
@@ -597,7 +630,7 @@ mod tests {
             "the three packets refused by the full queue, and only those"
         );
         let queued: Vec<Vec<u8>> = (0..2)
-            .map(|_| rx.try_recv().expect("queued packet").body)
+            .map(|_| rx.try_recv().expect("queued packet").body.to_vec())
             .collect();
         assert_eq!(queued, [vec![0], vec![1]]);
         assert!(

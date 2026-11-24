@@ -84,7 +84,10 @@ impl Udp {
     /// retransmits what the network loses. Returns the datagram size of a
     /// GSO run the kernel refused with `EMSGSIZE` (segment plus headers above
     /// the route MTU); that run went out again one datagram at a time.
-    pub(crate) async fn send_batch(&self, packets: &[(Vec<u8>, SocketAddr)]) -> Option<usize> {
+    pub(crate) async fn send_batch<P: AsRef<[u8]>>(
+        &self,
+        packets: &[(P, SocketAddr)],
+    ) -> Option<usize> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let mut too_big = None;
@@ -96,18 +99,19 @@ impl Udp {
                 rest = tail;
                 let destination = batch[0].1;
                 if run == 1 {
-                    let _ = self.socket.send_to(&batch[0].0, destination).await;
+                    let _ = self.socket.send_to(batch[0].0.as_ref(), destination).await;
                     continue;
                 }
                 scratch.clear();
                 for (packet, _) in batch {
-                    scratch.extend_from_slice(packet);
+                    scratch.extend_from_slice(packet.as_ref());
                 }
+                let segment_size = batch[0].0.as_ref().len();
                 let transmit = quinn_udp::Transmit {
                     destination,
                     ecn: None,
                     contents: &scratch,
-                    segment_size: Some(batch[0].0.len()),
+                    segment_size: Some(segment_size),
                     src_ip: None,
                 };
                 // `try_send`, not `send`: `send` reports EMSGSIZE as success.
@@ -118,9 +122,9 @@ impl Udp {
                     })
                     .await;
                 if matches!(&sent, Err(e) if e.raw_os_error() == Some(EMSGSIZE)) {
-                    too_big = Some(batch[0].0.len());
+                    too_big = Some(segment_size);
                     for (packet, to) in batch {
-                        let _ = self.socket.send_to(packet, *to).await;
+                        let _ = self.socket.send_to(packet.as_ref(), *to).await;
                     }
                 }
             }
@@ -133,7 +137,7 @@ impl Udp {
                 {
                     let _burst = self.send_lock.lock().unwrap_or_else(|e| e.into_inner());
                     while let Some((packet, destination)) = packets.get(sent) {
-                        match self.socket.try_send_to(packet, *destination) {
+                        match self.socket.try_send_to(packet.as_ref(), *destination) {
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             _ => sent += 1,
                         }
@@ -208,18 +212,19 @@ impl Udp {
 /// packet the size of the first except a shorter last one, within the
 /// kernel's segment and byte limits.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn gso_run(packets: &[(Vec<u8>, SocketAddr)], max_segments: usize) -> usize {
-    let (first, destination) = (&packets[0].0, packets[0].1);
+fn gso_run<P: AsRef<[u8]>>(packets: &[(P, SocketAddr)], max_segments: usize) -> usize {
+    let (first, destination) = (packets[0].0.as_ref(), packets[0].1);
     let size = first.len();
     let limit = max_segments.min(GSO_MAX_BYTES / size.max(1)).max(1);
     let mut run = 1;
     while run < packets.len() && run < limit {
         let (packet, to) = &packets[run];
-        if *to != destination || packet.len() > size {
+        let len = packet.as_ref().len();
+        if *to != destination || len > size {
             break;
         }
         run += 1;
-        if packet.len() < size {
+        if len < size {
             break;
         }
     }
