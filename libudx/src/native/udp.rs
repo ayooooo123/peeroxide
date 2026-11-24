@@ -3,8 +3,9 @@
 //! On Linux and Android a paced burst to one peer leaves in one `sendmsg`
 //! (UDP GSO) and the receive loop reads many datagrams per call (`recvmmsg`
 //! with GRO): a stream's packets are almost all the same size, so this turns
-//! one system call per packet into one per burst. Other platforms send and
-//! receive one datagram per call.
+//! one system call per packet into one per burst. Other platforms still send
+//! one datagram per call, but a receive waits for one datagram and then takes
+//! the datagrams that already wait, one for each buffer.
 
 use std::io;
 use std::net::SocketAddr;
@@ -17,6 +18,23 @@ const GSO_MAX_BYTES: usize = 65_507;
 /// not depend on `libc` directly).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const EMSGSIZE: i32 = 90;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+thread_local! {
+    /// The packets of one GSO send joined into one slice of bytes, kept for
+    /// the thread between calls: one buffer for each thread that sends, not
+    /// one for each stream, and never larger than one GSO send
+    /// ([`GSO_MAX_BYTES`]). A call reserves the bytes of its run in one step
+    /// before it appends the packets, so a steady burst on a thread allocates
+    /// the buffer once and then reuses it.
+    static SEND_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The send buffer's allocation address and capacity, for the tests.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+fn send_scratch() -> (*const u8, usize) {
+    SEND_SCRATCH.with_borrow_mut(|scratch| (scratch.as_ptr(), scratch.capacity()))
+}
 
 /// Receive buffer for one datagram (UDX packets are at most 1500 bytes; DHT
 /// messages are smaller than 64 KiB).
@@ -88,7 +106,6 @@ impl Udp {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let mut too_big = None;
-            let mut scratch = Vec::new();
             let mut rest = packets;
             while !rest.is_empty() {
                 let run = gso_run(rest, self.state.max_gso_segments());
@@ -99,26 +116,36 @@ impl Udp {
                     let _ = self.socket.send_to(&batch[0].0, destination).await;
                     continue;
                 }
-                scratch.clear();
-                for (packet, _) in batch {
-                    scratch.extend_from_slice(packet);
-                }
-                let transmit = quinn_udp::Transmit {
-                    destination,
-                    ecn: None,
-                    contents: &scratch,
-                    segment_size: Some(batch[0].0.len()),
-                    src_ip: None,
-                };
+                // The bytes of the whole run in one reservation: the first
+                // burst on a thread allocates once instead of growing step by
+                // step, and a later burst of the same shape allocates nothing.
+                let bytes: usize = batch.iter().map(|(packet, _)| packet.len()).sum();
+                let segment_size = batch[0].0.len();
                 // `try_send`, not `send`: `send` reports EMSGSIZE as success.
                 let sent = self
                     .socket
                     .async_io(tokio::io::Interest::WRITABLE, || {
-                        self.state.try_send((&self.socket).into(), &transmit)
+                        SEND_SCRATCH.with_borrow_mut(|scratch| {
+                            // A retry after `WouldBlock` fills the buffer
+                            // again: the kernel took none of it.
+                            scratch.clear();
+                            scratch.reserve_exact(bytes);
+                            for (packet, _) in batch {
+                                scratch.extend_from_slice(packet);
+                            }
+                            let transmit = quinn_udp::Transmit {
+                                destination,
+                                ecn: None,
+                                contents: scratch.as_slice(),
+                                segment_size: Some(segment_size),
+                                src_ip: None,
+                            };
+                            self.state.try_send((&self.socket).into(), &transmit)
+                        })
                     })
                     .await;
                 if matches!(&sent, Err(e) if e.raw_os_error() == Some(EMSGSIZE)) {
-                    too_big = Some(batch[0].0.len());
+                    too_big = Some(segment_size);
                     for (packet, to) in batch {
                         let _ = self.socket.send_to(packet, *to).await;
                     }
@@ -147,9 +174,11 @@ impl Udp {
         }
     }
 
-    /// Wait for datagrams and append each to `out` as `(range in buffer, source)`.
-    /// `bufs` holds one or more receive buffers of [`DATAGRAM_SIZE`] bytes; with
-    /// GRO one buffer can carry several datagrams.
+    /// Wait for datagrams and append each to `out` as
+    /// `(buffer index, range in buffer, source)`. `bufs` holds one or more
+    /// receive buffers of [`DATAGRAM_SIZE`] bytes; with GRO one buffer can
+    /// carry several datagrams. Elsewhere each buffer carries one datagram:
+    /// the first read waits and the datagrams already waiting fill the rest.
     pub(crate) async fn recv_batch(
         &self,
         bufs: &mut [Vec<u8>],
@@ -163,12 +192,17 @@ impl Udp {
             let received = self
                 .socket
                 .async_io(tokio::io::Interest::READABLE, || {
-                    let mut slices: Vec<io::IoSliceMut<'_>> = bufs[..count]
-                        .iter_mut()
-                        .map(|b| io::IoSliceMut::new(b))
-                        .collect();
-                    self.state
-                        .recv((&self.socket).into(), &mut slices, &mut meta[..count])
+                    let mut rest = bufs[..count].iter_mut();
+                    let mut slices: [io::IoSliceMut<'_>; quinn_udp::BATCH_SIZE] =
+                        std::array::from_fn(|_| match rest.next() {
+                            Some(buf) => io::IoSliceMut::new(buf),
+                            None => io::IoSliceMut::new(&mut []),
+                        });
+                    self.state.recv(
+                        (&self.socket).into(),
+                        &mut slices[..count],
+                        &mut meta[..count],
+                    )
                 })
                 .await?;
             for (index, meta) in meta[..received].iter().enumerate() {
@@ -184,9 +218,7 @@ impl Udp {
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
-            let (len, addr) = self.socket.recv_from(&mut bufs[0]).await?;
-            out.push((0, 0..len, addr));
-            Ok(())
+            receive_waiting(&self.socket, bufs, out).await
         }
     }
 
@@ -199,9 +231,44 @@ impl Udp {
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
-            1
+            // No receive offload here, so one datagram for each buffer: 16
+            // buffers of 64 KiB take a burst of 16 in one wake.
+            16
         }
     }
+}
+
+/// Wait for one datagram, then take the datagrams that already wait in
+/// `socket`, one for each further buffer of `bufs`.
+///
+/// A failure of the first read is returned: nothing was taken. An error on a
+/// later buffer (including `WouldBlock`, which means that nothing waits) ends
+/// the call with `Ok(())` so that the datagrams already taken reach the
+/// caller; an error that stays shows again at the next wait on the first
+/// buffer.
+#[cfg(any(test, not(any(target_os = "linux", target_os = "android"))))]
+async fn receive_waiting(
+    socket: &tokio::net::UdpSocket,
+    bufs: &mut [Vec<u8>],
+    out: &mut Vec<(usize, std::ops::Range<usize>, SocketAddr)>,
+) -> io::Result<()> {
+    // The caller keeps `bufs` non-empty, as the read of `bufs[0]` required;
+    // a missing buffer still takes nothing and succeeds.
+    let Some((first, rest)) = bufs.split_first_mut() else {
+        return Ok(());
+    };
+    let (len, addr) = socket.recv_from(first.as_mut_slice()).await?;
+    out.push((0, 0..len, addr));
+    for (index, buf) in rest.iter_mut().enumerate() {
+        // Stop at the first error, also `WouldBlock` (nothing waits): the
+        // datagrams already taken must reach the caller, and an error that
+        // stays shows again at the next wait on the first buffer.
+        match socket.try_recv_from(buf.as_mut_slice()) {
+            Ok((len, addr)) => out.push((index + 1, 0..len, addr)),
+            Err(_) => break,
+        }
+    }
+    Ok(())
 }
 
 /// Length of the GSO run at the front of `packets`: one destination, every
@@ -253,24 +320,311 @@ mod tests {
         assert_eq!(gso_run(&packets(&[1500; 60], &[1; 60]), 64), 43);
     }
 
+    /// A limit that turns a lost datagram into a failure instead of a hang.
+    const LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Send `sent` from `sender`, then read at `receiver` until every packet
+    /// has arrived; return each payload with its source in arrival order.
+    async fn exchanged(
+        sender: &Udp,
+        receiver: &Udp,
+        sent: &[(Vec<u8>, SocketAddr)],
+    ) -> Vec<(Vec<u8>, SocketAddr)> {
+        sender.send_batch(sent).await;
+        let mut bufs = vec![vec![0; DATAGRAM_SIZE]; Udp::batch_buffers()];
+        let mut out = Vec::new();
+        let mut got = Vec::with_capacity(sent.len());
+        while got.len() < sent.len() {
+            tokio::time::timeout(LIMIT, receiver.recv_batch(&mut bufs, &mut out))
+                .await
+                .expect("a datagram of the batch did not arrive")
+                .unwrap();
+            for (index, range, addr) in &out {
+                got.push((bufs[*index][range.clone()].to_vec(), *addr));
+            }
+        }
+        got
+    }
+
     #[tokio::test]
     async fn batch_send_arrives_as_separate_datagrams() {
+        // Catches a run joined into one datagram or reordered, and a received
+        // datagram labelled with a source other than the sender's address.
         let a = Udp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let b = Udp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let source = a.local_addr().unwrap();
         let to = b.local_addr().unwrap();
         let sent: Vec<(Vec<u8>, SocketAddr)> = (0..10u8)
             .map(|i| (vec![i; if i == 9 { 300 } else { 1200 }], to))
             .collect();
-        a.send_batch(&sent).await;
-        let mut bufs = vec![vec![0; DATAGRAM_SIZE]; Udp::batch_buffers()];
-        let mut got = Vec::new();
-        let mut out = Vec::new();
-        while got.len() < sent.len() {
-            b.recv_batch(&mut bufs, &mut out).await.unwrap();
-            for (index, range, _) in &out {
-                got.push(bufs[*index][range.clone()].to_vec());
-            }
+        let got = exchanged(&a, &b, &sent).await;
+        for (_, addr) in &got {
+            assert_eq!(*addr, source);
         }
-        assert_eq!(got, sent.into_iter().map(|(p, _)| p).collect::<Vec<_>>());
+        assert_eq!(
+            got.into_iter()
+                .map(|(payload, _)| payload)
+                .collect::<Vec<_>>(),
+            sent.into_iter()
+                .map(|(payload, _)| payload)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_batch_arrives_whole_over_ipv6_loopback() {
+        // Catches a GSO send and a receive that work over IPv4 loopback but
+        // lose, join or reorder the datagrams of a batch on an IPv6 socket,
+        // and a source address reported for the wrong family.
+        let host = "[::1]:0";
+        let a = match Udp::bind(host.parse().unwrap()).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                eprintln!("skipping the IPv6 check: {host} cannot be bound ({error})");
+                return;
+            }
+        };
+        let b = match Udp::bind(host.parse().unwrap()).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                eprintln!("skipping the IPv6 check: {host} cannot be bound ({error})");
+                return;
+            }
+        };
+        let source = a.local_addr().unwrap();
+        let to = b.local_addr().unwrap();
+        let sent: Vec<(Vec<u8>, SocketAddr)> = (0..10u8)
+            .map(|i| (vec![i; if i == 9 { 300 } else { 1200 }], to))
+            .collect();
+        let got = exchanged(&a, &b, &sent).await;
+        for (_, addr) in &got {
+            assert_eq!(*addr, source);
+        }
+        assert_eq!(
+            got.into_iter()
+                .map(|(payload, _)| payload)
+                .collect::<Vec<_>>(),
+            sent.into_iter()
+                .map(|(payload, _)| payload)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sixty_thousand_byte_datagram_in_a_batch_arrives_whole() {
+        // Catches a run that cuts the large datagram at a segment or byte
+        // limit, or drops it after `EMSGSIZE`, and a datagram before or after
+        // it that is lost or reordered.
+        let a = Udp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = Udp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let to = b.local_addr().unwrap();
+        let sent: Vec<(Vec<u8>, SocketAddr)> = vec![
+            (vec![1; 1_200], to),
+            (vec![2; 60_000], to),
+            (vec![3; 1_200], to),
+        ];
+        let got = exchanged(&a, &b, &sent).await;
+        assert_eq!(
+            got.into_iter()
+                .map(|(payload, _)| payload)
+                .collect::<Vec<_>>(),
+            sent.into_iter()
+                .map(|(payload, _)| payload)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_send_buffer_is_kept_for_the_next_burst() {
+        // Catches a buffer made new for every `send_batch` call instead of
+        // kept for the thread, which pays one allocation and one free for
+        // each burst.
+        let a = Udp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = Udp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        if a.state.max_gso_segments() < 20 {
+            eprintln!("skipping: this kernel does not join a burst into one GSO send");
+            return;
+        }
+        let to = b.local_addr().unwrap();
+        let burst: Vec<(Vec<u8>, SocketAddr)> = (0..20).map(|_| (vec![0; 1_200], to)).collect();
+        a.send_batch(&burst).await;
+        let (first_pointer, first_capacity) = send_scratch();
+        assert!(
+            first_capacity >= 24_000,
+            "a 20-packet burst of 1,200 bytes needs 24,000 bytes, got {first_capacity}"
+        );
+        a.send_batch(&burst).await;
+        let (second_pointer, second_capacity) = send_scratch();
+        assert_eq!(second_capacity, first_capacity);
+        assert_eq!(second_pointer, first_pointer);
+    }
+
+    #[tokio::test]
+    async fn the_first_burst_reserves_its_run_in_one_step() {
+        // Catches a buffer that grows step by step while the packets of the
+        // first burst are appended instead of being reserved at once: 20
+        // packets of 1,200 bytes appended one by one to an empty `Vec` that
+        // doubles end at 38,400 bytes; one reservation for the run ends at
+        // 24,000.
+        let a = Udp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = Udp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        if a.state.max_gso_segments() < 20 {
+            eprintln!("skipping: this kernel does not join a burst into one GSO send");
+            return;
+        }
+        let to = b.local_addr().unwrap();
+        let burst: Vec<(Vec<u8>, SocketAddr)> = (0..20).map(|_| (vec![0; 1_200], to)).collect();
+        a.send_batch(&burst).await;
+        let (_, capacity) = send_scratch();
+        assert!(
+            capacity >= 24_000,
+            "the buffer is smaller than the burst that filled it: {capacity}"
+        );
+        assert!(
+            capacity < 38_400,
+            "the first burst grew the buffer step by step past its 24,000-byte run: {capacity}"
+        );
+    }
+}
+
+/// [`receive_waiting`] on loopback, compiled on every system: the module
+/// above needs a Linux or Android socket for `send_batch` and `recv_batch`.
+#[cfg(test)]
+mod receive_waiting_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A limit that turns a wrong version into a failure instead of a hang.
+    const LIMIT: Duration = Duration::from_secs(5);
+
+    async fn bind() -> tokio::net::UdpSocket {
+        tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_burst_that_waits_is_read_in_one_call() {
+        // Catches a call that returns only the first datagram, one that loses
+        // an empty datagram, and one that labels a datagram with the wrong
+        // buffer index.
+        let receiver = bind().await;
+        let sender = bind().await;
+        let from = sender.local_addr().unwrap();
+        let to = receiver.local_addr().unwrap();
+        let sent: Vec<Vec<u8>> = [1200usize, 0, 1, 9000, 1200]
+            .into_iter()
+            .enumerate()
+            .map(|(fill, len)| vec![fill as u8 + 1; len])
+            .collect();
+        for datagram in &sent {
+            sender.send_to(datagram, to).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut bufs = vec![vec![0; DATAGRAM_SIZE]; 8];
+        let mut out = Vec::new();
+        tokio::time::timeout(LIMIT, receive_waiting(&receiver, &mut bufs, &mut out))
+            .await
+            .expect("receive_waiting timed out")
+            .unwrap();
+
+        assert_eq!(out.len(), sent.len());
+        for (index, ((buffer, range, addr), datagram)) in out.iter().zip(&sent).enumerate() {
+            assert_eq!(*buffer, index);
+            assert_eq!(*range, 0..datagram.len());
+            assert_eq!(*addr, from);
+            assert_eq!(&bufs[*buffer][range.clone()], datagram.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_burst_larger_than_the_buffers_takes_two_calls() {
+        // Catches a read past the last buffer, and a datagram lost or repeated
+        // at the border between two calls.
+        let receiver = bind().await;
+        let sender = bind().await;
+        let to = receiver.local_addr().unwrap();
+        let sent: Vec<Vec<u8>> = (0..6u8)
+            .map(|fill| vec![fill + 1; 1000 + usize::from(fill)])
+            .collect();
+        for datagram in &sent {
+            sender.send_to(datagram, to).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut bufs = vec![vec![0; DATAGRAM_SIZE]; 4];
+        let mut out = Vec::new();
+        tokio::time::timeout(LIMIT, receive_waiting(&receiver, &mut bufs, &mut out))
+            .await
+            .expect("first receive_waiting timed out")
+            .unwrap();
+        assert_eq!(out.len(), 4);
+        let mut got: Vec<Vec<u8>> = out
+            .iter()
+            .map(|(buffer, range, _)| bufs[*buffer][range.clone()].to_vec())
+            .collect();
+        out.clear();
+
+        tokio::time::timeout(LIMIT, receive_waiting(&receiver, &mut bufs, &mut out))
+            .await
+            .expect("second receive_waiting timed out")
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        got.extend(
+            out.iter()
+                .map(|(buffer, range, _)| bufs[*buffer][range.clone()].to_vec()),
+        );
+        assert_eq!(got, sent);
+    }
+
+    #[tokio::test]
+    async fn one_buffer_reads_one_datagram() {
+        // Catches an index outside the buffers when the socket holds only one.
+        let receiver = bind().await;
+        let sender = bind().await;
+        let to = receiver.local_addr().unwrap();
+        let sent = [vec![1u8; 100], vec![2u8; 200]];
+        for datagram in &sent {
+            sender.send_to(datagram, to).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut bufs = vec![vec![0; DATAGRAM_SIZE]; 1];
+        let mut out = Vec::new();
+        for datagram in sent {
+            tokio::time::timeout(LIMIT, receive_waiting(&receiver, &mut bufs, &mut out))
+                .await
+                .expect("receive_waiting timed out")
+                .unwrap();
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].0, 0);
+            assert_eq!(&bufs[0][out[0].1.clone()], datagram.as_slice());
+            out.clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_call_waits_for_the_first_datagram() {
+        // Catches a call that returns with no datagram, and one whose loop
+        // does not wait for the first datagram.
+        let receiver = bind().await;
+        let sender = bind().await;
+        let to = receiver.local_addr().unwrap();
+        let mut bufs = vec![vec![0; DATAGRAM_SIZE]; 4];
+        let mut out = Vec::new();
+
+        let started = Instant::now();
+        let send = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            sender.send_to(&[42u8; 100], to).await.unwrap();
+        });
+        tokio::time::timeout(LIMIT, receive_waiting(&receiver, &mut bufs, &mut out))
+            .await
+            .expect("receive_waiting timed out")
+            .unwrap();
+        send.await.unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(25));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 0);
     }
 }
