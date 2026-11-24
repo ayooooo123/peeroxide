@@ -17,20 +17,20 @@
 //!   crushing cwnd to 4 packets, avoiding periodic stalls during video streams.
 
 use super::{
-    BBR_BETA, BBR_CWND_GAIN, BBR_CWND_MIN_TARGET, BBR_DRAIN_GAIN, BBR_EXTRA_ACKED_GAIN,
-    BBR_EXTRA_ACKED_MAX_US, BBR_EXTRA_ACKED_WIN_RTTS, BBR_FULL_BW_COUNT, BBR_FULL_BW_THRESH,
-    BBR_FULL_LOSS_CNT, BBR_HEADROOM, BBR_LOSS_THRESH, BBR_MIN_RTT_INTERVAL_US,
+    BBR_BETA, BBR_BW_FILTER_ROUNDS, BBR_CWND_GAIN, BBR_CWND_MIN_TARGET, BBR_DRAIN_GAIN,
+    BBR_EXTRA_ACKED_GAIN, BBR_EXTRA_ACKED_MAX_US, BBR_EXTRA_ACKED_WIN_RTTS, BBR_FULL_BW_COUNT,
+    BBR_FULL_BW_THRESH, BBR_FULL_LOSS_CNT, BBR_HEADROOM, BBR_LOSS_THRESH, BBR_MIN_RTT_INTERVAL_US,
     BBR_PACING_MARGIN_PERCENT, BBR_PROBE_BW_CRUISE_GAIN, BBR_PROBE_BW_DOWN_GAIN,
     BBR_PROBE_BW_REFILL_GAIN, BBR_PROBE_BW_UP_GAIN, BBR_PROBE_RTT_CWND_GAIN,
     BBR_PROBE_RTT_INTERVAL_US, BBR_PROBE_RTT_MODE_US, BBR_STARTUP_CWND_GAIN,
-    BBR_STARTUP_PACING_GAIN, BbrMode, CaState, rate::RateSample,
+    BBR_STARTUP_PACING_GAIN, BbrMode, CaState, filter::WinFilter, rate::RateSample,
 };
 
-/// Maximum probe wait in `ProbeBwCruise` (microseconds). Bounded at 1.5 s
-/// (and at least `min_rtt * 4`, up to `min_rtt * 8` on WAN links) so the flow
-/// keeps queues shallow without yielding excessive share to BBRv1 peers.
-const PROBE_WAIT_MIN_US: u64 = 200_000;
-const PROBE_WAIT_MAX_US: u64 = 1_500_000;
+/// Probe wait bounds in `ProbeBwCruise` (microseconds). Keeps probing on an
+/// ~6–8 RTT cadence (150–400 ms) so queues stay shallow on constrained paths
+/// without letting loss-ignoring BBRv1 peers starve the flow.
+const PROBE_WAIT_MIN_US: u64 = 150_000;
+const PROBE_WAIT_MAX_US: u64 = 400_000;
 
 /// Four phases of BBRv3's `ProbeBW` state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,8 +74,8 @@ pub(crate) struct BbrState {
     probe_bw_phase: ProbeBwPhase,
     prev_ca_state: CaState,
 
-    // Bandwidth model (2-phase max filter + short-term lower bound)
-    bw_max: [f64; 2],
+    // Bandwidth model (windowed max filter + short-term lower bound)
+    bw_filter: WinFilter<f64>,
     bw_latest: f64,
     bw_lo: f64,
 
@@ -145,7 +145,7 @@ impl BbrState {
             mode: BbrMode::Startup,
             probe_bw_phase: ProbeBwPhase::Cruise,
             prev_ca_state: CaState::Open,
-            bw_max: [0.0; 2],
+            bw_filter: WinFilter::new(0, 0.0),
             bw_latest: 0.0,
             bw_lo: f64::INFINITY,
             inflight_hi: u32::MAX,
@@ -262,7 +262,7 @@ impl BbrState {
 
     /// Long-term windowed maximum bandwidth in packets/µs.
     fn max_bw(&self) -> f64 {
-        self.bw_max[0].max(self.bw_max[1])
+        self.bw_filter.get()
     }
 
     #[cfg(test)]
@@ -333,12 +333,13 @@ impl BbrState {
         }
     }
 
-    /// Update `bw_max`, `inflight_hi`, and lower bounds (`bw_lo`, `inflight_lo`).
+    /// Update `bw_filter`, `inflight_hi`, and lower bounds (`bw_lo`, `inflight_lo`).
     fn update_congestion_signals(&mut self, rs: &RateSample, link: &Link) {
         if rs.delivered > 0 && rs.interval_us > 0 {
             let bw = f64::from(rs.delivered) / (rs.interval_us as f64);
-            if (!rs.is_app_limited || bw >= self.max_bw()) && bw > self.bw_max[0] {
-                self.bw_max[0] = bw;
+            if !rs.is_app_limited || bw >= self.max_bw() {
+                self.bw_filter
+                    .apply_max(BBR_BW_FILTER_ROUNDS, u64::from(self.round_count), bw);
             }
         }
         if rs.losses > 0 {
@@ -348,7 +349,7 @@ impl BbrState {
         if !self.loss_round_start {
             return;
         }
-        // Adapt short-term lower bounds on sustained >2% loss outside Startup/Up.
+        // Adapt short-term lower bounds on sustained >3% loss outside Startup/Up.
         if self.mode == BbrMode::ProbeBw
             && self.probe_bw_phase != ProbeBwPhase::Up
             && self.loss_in_round
@@ -358,40 +359,35 @@ impl BbrState {
         }
     }
 
-    /// Advance the 2-phase `bw_max` filter at the start of a new ProbeBW cycle.
-    fn advance_max_bw_filter(&mut self) {
-        if self.bw_max[0] == 0.0 {
-            return;
-        }
-        self.cycle_count = self.cycle_count.wrapping_add(1);
-        self.bw_max[1] = self.bw_max[0];
-        self.bw_max[0] = 0.0;
-    }
-
     /// BBRv3 `is_inflight_too_high`: true when the flight experienced more than
-    /// `BBR_LOSS_THRESH` (2%) packet loss (with at least 2 lost packets so an
-    /// isolated random drop in a small flight does not cap the path).
+    /// `BBR_LOSS_THRESH` (3%) packet loss (with at least 3 lost packets so 1%
+    /// random loss variance does not falsely cap the path).
     fn is_inflight_too_high(&self, rs: &RateSample) -> bool {
-        if rs.lost_in_flight < 2 || rs.tx_in_flight == 0 {
+        if rs.lost_in_flight < 3 || rs.tx_in_flight == 0 {
             return false;
         }
         (rs.lost_in_flight as f64) > (rs.tx_in_flight as f64) * BBR_LOSS_THRESH
     }
 
-    /// Multiplicative backoff of short-term lower bounds (`beta = 0.7`),
-    /// bounded below by the actual latest delivered rate/volume.
+    /// Gentle short-term lower-bound backoff (`beta = 0.85`), floored at the
+    /// latest delivery signals and 1.0×BDP / 0.75×max_bw so loss-ignoring
+    /// BBRv1 peers sharing a drop-tail queue cannot collapse this flow.
     fn adapt_lower_bounds(&mut self, link: &Link) {
+        let max_bw = self.max_bw();
         if !self.bw_lo.is_finite() {
-            self.bw_lo = self.max_bw();
+            self.bw_lo = max_bw;
         }
-        self.bw_lo = (self.bw_lo * BBR_BETA).max(self.bw_latest);
+        self.bw_lo = (self.bw_lo * BBR_BETA)
+            .max(self.bw_latest)
+            .max(max_bw * 0.75);
 
+        let bdp_floor = self.bdp(max_bw, 1.0).max(BBR_CWND_MIN_TARGET);
         if self.inflight_lo == u32::MAX {
             self.inflight_lo = link.cwnd;
         }
         let beta_inflight = ((f64::from(self.inflight_lo) * BBR_BETA) as u32)
             .max(self.inflight_latest)
-            .max(BBR_CWND_MIN_TARGET);
+            .max(bdp_floor);
         self.inflight_lo = beta_inflight;
     }
 
@@ -525,7 +521,7 @@ impl BbrState {
     }
 
     fn start_probe_bw_up(&mut self, link: &Link) {
-        self.advance_max_bw_filter();
+        self.cycle_count = self.cycle_count.wrapping_add(1);
         self.probe_bw_phase = ProbeBwPhase::Up;
         self.cycle_stamp_us = link.now_us;
         self.bw_probe_up_rounds = 0;
@@ -592,8 +588,13 @@ impl BbrState {
                 }
             }
             ProbeBwPhase::Up => {
-                // Hit loss ceiling -> pin `inflight_hi` and drain immediately.
-                if self.is_inflight_too_high(rs) {
+                let half_rtt_done =
+                    self.min_rtt_us == u64::MAX || elapsed_us >= self.min_rtt_us / 2;
+                // Hit loss ceiling -> pin `inflight_hi` and drain immediately,
+                // once we have probed long enough for Up's own packets to land.
+                if (half_rtt_done || link.inflight >= target_inflight)
+                    && self.is_inflight_too_high(rs)
+                {
                     let safe = rs
                         .tx_in_flight
                         .saturating_sub(rs.lost_in_flight)
@@ -608,6 +609,12 @@ impl BbrState {
                     self.min_rtt_us < u64::MAX && elapsed_us > self.min_rtt_us;
                 let probe_target = self.bdp(self.max_bw(), BBR_PROBE_BW_UP_GAIN);
                 if min_rtt_done && (link.inflight >= probe_target || rs.losses > 0) {
+                    if !self.loss_in_round
+                        && self.inflight_hi < u32::MAX
+                        && link.inflight >= self.inflight_hi
+                    {
+                        self.inflight_hi = u32::MAX;
+                    }
                     self.start_probe_bw_down(link);
                 }
             }
@@ -897,11 +904,11 @@ mod tests {
         rs.tx_in_flight = 100;
         rs.lost_in_flight = 1;
         assert!(!state.is_inflight_too_high(&rs));
-        // 2% exact is NOT strictly greater than 2%.
-        rs.lost_in_flight = 2;
-        assert!(!state.is_inflight_too_high(&rs));
-        // 3% IS strictly greater than 2%.
+        // 3% exact is NOT strictly greater than 3%.
         rs.lost_in_flight = 3;
+        assert!(!state.is_inflight_too_high(&rs));
+        // 4% IS strictly greater than 3%.
+        rs.lost_in_flight = 4;
         assert!(state.is_inflight_too_high(&rs));
         // Even with 1% loss, state stays unbounded in startup.
         let mut l = link(100, 100, 50, 50_000);
@@ -916,7 +923,7 @@ mod tests {
         let mut state = BbrState::new(0, 10, MSS);
         state.min_rtt_us = 50_000;
         // 1 pkt / 1000 us = 1000 pkt/s -> BDP = 50 packets -> 0.5 * BDP = 25 packets.
-        state.bw_max[0] = 0.001;
+        state.bw_filter.apply_max(BBR_BW_FILTER_ROUNDS, 0, 0.001);
         state.full_bw_reached = true;
         state.mode = BbrMode::ProbeBw;
         let mut l = link(100, 200, 60, BBR_PROBE_RTT_INTERVAL_US + 1);
@@ -929,7 +936,7 @@ mod tests {
     fn probe_bw_up_pins_inflight_hi_and_drains_on_high_loss() {
         let mut state = BbrState::new(0, 10, MSS);
         state.min_rtt_us = 20_000;
-        state.bw_max[0] = 0.005; // BDP = 100 pkts
+        state.bw_filter.apply_max(BBR_BW_FILTER_ROUNDS, 0, 0.005); // BDP = 100 pkts
         state.full_bw_reached = true;
         state.mode = BbrMode::ProbeBw;
         state.probe_bw_phase = ProbeBwPhase::Up;
@@ -944,8 +951,8 @@ mod tests {
 
         assert_eq!(state.probe_bw_phase, ProbeBwPhase::Down);
         assert_eq!(state.inflight_hi, 120);
-        // Cruise/Down applies 15% headroom: 120 - 18 = 102.
-        assert!(l.cwnd <= 102, "expected cwnd <= 102, got {}", l.cwnd);
+        // Cruise/Down applies 10% headroom: 120 - 12 = 108.
+        assert!(l.cwnd <= 108, "expected cwnd <= 108, got {}", l.cwnd);
     }
 
     #[test]

@@ -849,8 +849,20 @@ impl StreamInner {
     }
 
     /// Send-buffer bytes still free for `UdxAsyncStream::poll_write`.
+    ///
+    /// Scales with twice the active send window (`min(cwnd * mss, send_rwnd)`),
+    /// floored at `SEND_BUFFER_MAX` (1 MiB) and capped at 16 MiB (matching C
+    /// `UDX_HIGH_WATERMARK + send_window`), so SACK recovery on lossy links and
+    /// high-BDP paths do not stall `poll_write`.
     pub(crate) fn send_buffer_room(&self) -> usize {
-        SEND_BUFFER_MAX.saturating_sub(self.queued_bytes + self.unacked_bytes)
+        const SEND_BUFFER_CEILING: usize = 16 * 1024 * 1024;
+        let window = (self.congestion.cwnd as usize)
+            .saturating_mul(self.max_payload())
+            .min(self.send_rwnd as usize);
+        let limit = window
+            .saturating_mul(2)
+            .clamp(SEND_BUFFER_MAX, SEND_BUFFER_CEILING);
+        limit.saturating_sub(self.queued_bytes + self.unacked_bytes)
     }
 
     pub(crate) fn set_write_waker(&mut self, waker: &Waker) {
@@ -1669,6 +1681,11 @@ impl StreamInner {
                 self.rtt_min_us.get(),
                 now_us,
             );
+        }
+        if self.send_buffer_room() > 0 {
+            if let Some(w) = self.write_waker.take() {
+                w.wake();
+            }
         }
         AckOutcome {
             completed,

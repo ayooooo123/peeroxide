@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Upgraded congestion control from BBRv1 to BBRv3 (`draft-ietf-ccwg-bbr`) with microsecond RTT, RACK reorder window, and rate sampling, plus a fixed-point nanosecond deficit-tracking pacer that preserves UDP GSO bursts up to 65,507 B while pacing accurately down to low bitrates. Wire format is unchanged.
+- Upgraded congestion control from BBRv1 to BBRv3 (`draft-ietf-ccwg-bbr`) with microsecond RTT, RACK reorder window, and rate sampling, a fixed-point nanosecond deficit-tracking pacer that sleeps for ~1 ms UDP GSO quanta at high bitrates while pacing smoothly packet-by-packet at low bitrates, and dynamic send-buffer backpressure scaling with the active send window (1 MiB to 16 MiB) so SACK recovery and high-BDP paths do not stall `poll_write`. Wire format is unchanged.
 
 ### Changed (review 2026-11-15)
 

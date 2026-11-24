@@ -7,12 +7,15 @@ use std::time::{Duration, Instant};
 
 /// Minimum interval between min-RTT filter expirations, in microseconds (10 s).
 pub(crate) const BBR_MIN_RTT_INTERVAL_US: u64 = 10_000_000;
-/// Interval between ProbeRTT entries, in microseconds (5 s, BBRv3).
-pub(crate) const BBR_PROBE_RTT_INTERVAL_US: u64 = 5_000_000;
+/// Interval between ProbeRTT entries, in microseconds (10 s, matching BBRv1
+/// cadence so flows sharing a queue with stock peers do not yield twice as often).
+pub(crate) const BBR_PROBE_RTT_INTERVAL_US: u64 = 10_000_000;
 /// Maximum time spent in ProbeRTT, in microseconds (200 ms).
 pub(crate) const BBR_PROBE_RTT_MODE_US: u64 = 200_000;
 /// BBRv3 ProbeRTT cwnd gain (`0.5 * BDP`, min 4 packets).
 pub(crate) const BBR_PROBE_RTT_CWND_GAIN: f64 = 0.5;
+/// Bandwidth filter window length in rounds.
+pub(crate) const BBR_BW_FILTER_ROUNDS: u32 = 10;
 /// Default pacing margin (1% headroom below estimated delivery rate).
 pub(crate) const BBR_PACING_MARGIN_PERCENT: f64 = 0.99;
 /// Startup pacing gain (BBRv3).
@@ -28,12 +31,13 @@ pub(crate) const BBR_PROBE_BW_DOWN_GAIN: f64 = 0.90;
 pub(crate) const BBR_PROBE_BW_CRUISE_GAIN: f64 = 1.0;
 pub(crate) const BBR_PROBE_BW_REFILL_GAIN: f64 = 1.0;
 pub(crate) const BBR_PROBE_BW_UP_GAIN: f64 = 1.25;
-/// Loss-aware backoff factor (`beta = 0.7`, BBRv3).
-pub(crate) const BBR_BETA: f64 = 0.7;
-/// Headroom fraction reserved below `inflight_hi` (`15%`, BBRv3).
-pub(crate) const BBR_HEADROOM: f64 = 0.15;
-/// Flight loss-rate threshold above which BBRv3 bounds inflight (`2%`).
-pub(crate) const BBR_LOSS_THRESH: f64 = 0.02;
+/// Loss-aware short-term backoff factor (tuned for BBRv1 peer coexistence).
+pub(crate) const BBR_BETA: f64 = 0.85;
+/// Headroom fraction reserved below `inflight_hi` in Cruise/Down (`10%`).
+pub(crate) const BBR_HEADROOM: f64 = 0.10;
+/// Flight loss-rate threshold above which BBRv3 bounds inflight (`3%`,
+/// avoiding false caps under 1% random loss while catching queue overflow).
+pub(crate) const BBR_LOSS_THRESH: f64 = 0.03;
 /// Loss events in one round that exit Startup when loss exceeds `BBR_LOSS_THRESH`.
 pub(crate) const BBR_FULL_LOSS_CNT: u32 = 6;
 /// Minimum BBR cwnd target.

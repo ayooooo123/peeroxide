@@ -109,15 +109,29 @@ impl TokenBucket {
         true
     }
 
+    /// Target send burst in bytes for UDP GSO batching: ~1 ms of traffic at
+    /// rates above 2 packets/ms (~3 MB/s), capped at `MAX_BURST_BYTES`. Below
+    /// that rate returns 0 so low-bitrate pacing stays smooth packet-by-packet.
+    fn gso_quantum_bytes(&self) -> u64 {
+        let one_ms = self.rate_bps / 1_000;
+        let min_gso = u64::from(self.mss).saturating_mul(2);
+        if one_ms >= min_gso {
+            one_ms.min(MAX_BURST_BYTES)
+        } else {
+            0
+        }
+    }
+
     /// Delay before the next packet may go out: zero while credit is positive,
-    /// otherwise the exact time needed to pay back the current deficit.
+    /// otherwise the time to pay back the deficit plus (at high rates) accrue
+    /// one ~1 ms GSO burst quantum so UDP GSO batching stays intact.
     pub(crate) fn delay(&self) -> Duration {
         if self.tokens_ub > 0 {
             return Duration::ZERO;
         }
-        // Need `tokens_ub + added_ub >= 1`, i.e. `added_ub >= (-tokens_ub) + 1`.
-        let deficit_ub = (-self.tokens_ub) as u128 + 1;
-        let wait_ns = deficit_ub
+        let target_ub = i128::from(self.gso_quantum_bytes()) * MICRO_BYTES;
+        let needed_ub = target_ub.saturating_sub(self.tokens_ub).max(1) as u128;
+        let wait_ns = needed_ub
             .saturating_mul(1_000)
             .div_ceil(u128::from(self.rate_bps));
         let clamped = (wait_ns.min(u128::from(MAX_SLEEP_NS)) as u64).max(MIN_SLEEP_NS);
@@ -231,5 +245,19 @@ mod tests {
             burst += 1452;
         }
         assert!(burst >= 64_000 && burst <= MAX_BURST_BYTES as u32 + 1452);
+    }
+
+    /// At 100 Mbit/s (12.5 MB/s), delay() sleeps until a ~1 ms UDP GSO quantum
+    /// accrues (~12.5 KB) rather than waking after 50 us for a single packet.
+    #[test]
+    fn high_rate_delay_accumulates_gso_quantum() {
+        let start = Instant::now();
+        let mut tb = TokenBucket::new(12_500_000, 1452, start);
+        assert!(tb.try_consume(INITIAL_BUCKET_BYTES as u32, start));
+        let d = tb.delay();
+        assert!(
+            d >= Duration::from_micros(950) && d <= Duration::from_micros(1_050),
+            "expected ~1 ms GSO quantum delay at 12.5 MB/s, got {d:?}"
+        );
     }
 }
