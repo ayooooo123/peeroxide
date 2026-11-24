@@ -24,13 +24,14 @@ enum TerminalEvent {
 /// (e.g. SecretStream) wrap this for encrypted I/O.
 ///
 /// Writes are pipelined: `poll_write` queues data and returns as soon as it
-/// is staged, applying back-pressure once about
-/// [`SEND_BUFFER_MAX`](super::stream::SEND_BUFFER_MAX) bytes are queued or in
-/// flight (the bound is checked against payload, so it can be exceeded by
-/// the packet headers and MTU-probe padding of one write). `poll_flush`
-/// resolves when the peer has ACKed everything; `poll_shutdown` queues the
-/// FIN behind the data and resolves when it is ACKed. Dropping the stream
-/// without `shutdown` abandons data the peer has not ACKed yet.
+/// is staged, applying back-pressure once queued plus in-flight payload
+/// reaches the stream's dynamic send-buffer limit (1 MiB minimum, scaling
+/// with the active send window up to 16 MiB; the bound is checked against
+/// payload, so it can be exceeded by the packet headers and MTU-probe padding
+/// of one write). `poll_flush` resolves when the peer has ACKed everything;
+/// `poll_shutdown` queues the FIN behind the data and resolves when it is
+/// ACKed. Dropping the stream without `shutdown` abandons data the peer has
+/// not ACKed yet.
 pub struct UdxAsyncStream {
     inner: Arc<Mutex<StreamInner>>,
     /// The same window as `inner`'s, kept outside the lock so a poll can

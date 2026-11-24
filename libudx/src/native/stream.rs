@@ -90,10 +90,12 @@ const ACK_EVERY: u32 = 8;
 
 /// Maximum accepted RTT sample (ms) — prevents outlier corruption.
 const MAX_RTT_MS: u32 = 30_000;
+/// Maximum accepted RTT sample (µs).
+const MAX_RTT_US: u64 = 30_000_000;
 
 /// Window of the minimum-RTT filter RACK's reorder window reads (C
-/// `UDX_RTT_MIN_WINDOW_MS`, the Linux default).
-const RTT_MIN_WINDOW_MS: u32 = 300_000;
+/// `UDX_RTT_MIN_WINDOW_MS`, the Linux default), in microseconds.
+const RTT_MIN_WINDOW_US: u32 = 300_000_000;
 
 /// Far-future duration used to effectively disable a timer.
 const FAR_FUTURE: std::time::Duration = std::time::Duration::from_secs(86_400);
@@ -614,11 +616,11 @@ pub(crate) struct StreamInner {
     /// `rack_next_seq - 1`). A retransmission counts only when its RTT is
     /// at least the minimum RTT: its ACK could be for the original copy.
     rack: Option<(Instant, u32)>,
-    /// RTT (ms) of the delivery that last set `rack` (C `rack_rtt`).
-    rack_rtt: u32,
-    /// RACK RTT of the newest packet the current ACK delivered, for its
-    /// rate sample (C `rs->rtt_ms`); 0 for none.
-    rs_rtt: u32,
+    /// RTT (µs) of the delivery that last set `rack` (C `rack_rtt`).
+    rack_rtt_us: u64,
+    /// RACK RTT (µs) of the newest packet the current ACK delivered, for its
+    /// rate sample; 0 for none.
+    rs_rtt_us: u64,
     /// A write landed on an idle zero-window stream: probe at once.
     zwp_wanted: bool,
     /// One past the highest seq delivered so far (C `rack_fack`).
@@ -626,10 +628,10 @@ pub(crate) struct StreamInner {
     /// A never-retransmitted packet was delivered below `rack_fack`: the
     /// path reorders, so the reorder window stays open (C `reordering_seen`).
     reordering_seen: bool,
-    /// Minimum RTT over `RTT_MIN_WINDOW_MS`, on the `epoch` millisecond
-    /// clock (C `rtt_min`); `u32::MAX` before the first sample.
-    rtt_min: WinFilter<u32>,
-    /// Origin of the millisecond clock `rtt_min` runs on.
+    /// Minimum RTT (µs) over `RTT_MIN_WINDOW_US`, on the `epoch` microsecond
+    /// clock (C `rtt_min`); `u64::MAX` before the first sample.
+    rtt_min_us: WinFilter<u64>,
+    /// Origin of the microsecond clock `rtt_min_us` and BBR run on.
     epoch: Instant,
     /// Fake clock for state-machine tests (`now()`).
     #[cfg(test)]
@@ -644,9 +646,11 @@ pub(crate) struct StreamInner {
     /// reader handles that count what they take.
     pub(crate) receive_window: Arc<ReceiveWindow>,
 
-    // ── RTT estimation (Jacobson/Karels, matching C libudx constants) ──
+    // ── RTT estimation (Jacobson/Karels in µs, ms snapshot kept for stats/RTO) ──
     srtt: u32,
+    srtt_us: u64,
     rttvar: u32,
+    rttvar_us: u64,
     rto: u32,
     rto_timeouts: u32,
     retransmits: u64,
@@ -1102,8 +1106,20 @@ impl StreamInner {
     }
 
     /// Send-buffer bytes still free for `UdxAsyncStream::poll_write`.
+    ///
+    /// Scales with twice the active send window (`min(cwnd * mss, send_rwnd)`),
+    /// floored at `SEND_BUFFER_MAX` (1 MiB) and capped at 16 MiB (matching C
+    /// `UDX_HIGH_WATERMARK + send_window`), so SACK recovery on lossy links and
+    /// high-BDP paths do not stall `poll_write`.
     pub(crate) fn send_buffer_room(&self) -> usize {
-        SEND_BUFFER_MAX.saturating_sub(self.queued_bytes + self.unacked_bytes)
+        const SEND_BUFFER_CEILING: usize = 16 * 1024 * 1024;
+        let window = (self.congestion.cwnd as usize)
+            .saturating_mul(self.max_payload())
+            .min(self.send_rwnd as usize);
+        let limit = window
+            .saturating_mul(2)
+            .clamp(SEND_BUFFER_MAX, SEND_BUFFER_CEILING);
+        limit.saturating_sub(self.queued_bytes + self.unacked_bytes)
     }
 
     pub(crate) fn set_write_waker(&mut self, waker: &Waker) {
@@ -1136,9 +1152,11 @@ impl StreamInner {
         Instant::now()
     }
 
-    /// `now` in whole milliseconds since `epoch` (C `uv_now`).
-    fn clock_ms(&self, now: Instant) -> u64 {
-        now.saturating_duration_since(self.epoch).as_millis() as u64
+    /// `now` in microseconds since `epoch`.
+    fn clock_us(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.epoch)
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64
     }
 
     // ── Outgoing packet registration ─────────────────────────────────────────
@@ -1153,12 +1171,15 @@ impl StreamInner {
     ) {
         let packet = packet.into();
         let now = self.now();
-        let now_ms = self.clock_ms(now);
+        let now_us = self.clock_us(now);
         let was_idle = self.inflight() == 0;
-        // C `udx__rate_pkt_sent`: nothing outstanding starts a new flight.
-        let rate_info = self
-            .congestion
-            .on_packet_sent(self.outgoing.is_empty(), now_ms);
+        let inflight_after = self.inflight_count.saturating_add(1);
+        // Nothing outstanding starts a new flight.
+        let rate_info = self.congestion.on_packet_sent(
+            self.outgoing.is_empty(),
+            inflight_after,
+            now_us,
+        );
         tracing::trace!(
             seq,
             is_mtu_probe,
@@ -1191,7 +1212,7 @@ impl StreamInner {
         self.send_order.push_back((now, seq));
         if was_idle {
             self.congestion
-                .on_transmit_start(self.srtt, self.inflight_count, now_ms);
+                .on_transmit_start(self.srtt_us, self.inflight_count, now_us);
         }
     }
 
@@ -1300,10 +1321,13 @@ impl StreamInner {
     /// flight if it was marked lost.
     fn retransmit(&mut self, seq: u32) -> Option<(Bytes, SocketAddr)> {
         let now = self.now();
-        let now_ms = self.clock_ms(now);
+        let now_us = self.clock_us(now);
         let was_idle = self.inflight_count == 0;
-        // C `_send_packet` takes the delivery state at every transmission.
-        let rate_info = self.congestion.on_packet_sent(false, now_ms);
+        let inflight_after = self.inflight_count.saturating_add(1);
+        // Take delivery state at every transmission.
+        let rate_info = self
+            .congestion
+            .on_packet_sent(false, inflight_after, now_us);
         let pkt = self.outgoing.get_mut(&seq)?;
         pkt.retransmit_count += 1;
         pkt.time_sent = now;
@@ -1317,7 +1341,7 @@ impl StreamInner {
         self.retransmits += 1;
         if was_idle {
             self.congestion
-                .on_transmit_start(self.srtt, self.inflight_count, now_ms);
+                .on_transmit_start(self.srtt_us, self.inflight_count, now_us);
         }
         Some(sent)
     }
@@ -1467,9 +1491,9 @@ impl StreamInner {
         self.tlp_in_flight = false;
         self.tlp_is_retrans = false;
         self.lost_queue.clear();
-        // C reads the reorder window after entering Loss (rack 6.3).
-        let wait = std::time::Duration::from_millis(
-            u64::from(self.rack_rtt) + u64::from(self.rack_reo_wnd()),
+        // Read the reorder window after entering Loss (rack 6.3), in µs.
+        let wait = std::time::Duration::from_micros(
+            self.rack_rtt_us.saturating_add(self.rack_reo_wnd_us()),
         );
         let mut newly_lost = Vec::new();
         for (seq, pkt) in self.outgoing.iter_mut() {
@@ -1506,63 +1530,61 @@ impl StreamInner {
 
     // ── RTT estimation (Jacobson/Karels) ─────────────────────────────────────
 
-    /// Update the RTT estimator with a sample already passed through
-    /// `clamp_rtt` and floored at 1 ms (C `ack_packet`).
-    ///
-    /// Uses standard constants matching C libudx:
-    ///   α = 1/8 (SRTT smoothing)
-    ///   β = 1/4 (RTTVAR smoothing)
-    ///   K = 4   (RTO multiplier for RTTVAR)
-    ///   G = 1000ms (minimum RTO granularity)
-    fn update_rtt(&mut self, rtt: u32) {
-        if self.srtt == 0 {
-            // First sample
-            self.srtt = rtt;
-            self.rttvar = rtt / 2;
+    /// Update the RTT estimator with a sample in microseconds already passed
+    /// through `clamp_rtt_us` and floored at 1 µs.
+    fn update_rtt_us(&mut self, rtt_us: u64) {
+        if self.srtt_us == 0 {
+            self.srtt_us = rtt_us;
+            self.rttvar_us = rtt_us / 2;
         } else {
-            let delta = self.srtt.abs_diff(rtt);
-            // RTTVAR <- (3/4) * RTTVAR + (1/4) * |SRTT - R|
-            self.rttvar = (3 * self.rttvar + delta) / 4;
-            // SRTT <- (7/8) * SRTT + (1/8) * R
-            self.srtt = (7 * self.srtt + rtt) / 8;
+            let delta = self.srtt_us.abs_diff(rtt_us);
+            self.rttvar_us = (3 * self.rttvar_us + delta) / 4;
+            self.srtt_us = (7 * self.srtt_us + rtt_us) / 8;
         }
+        self.srtt = (self.srtt_us / 1_000).clamp(1, u64::from(MAX_RTT_MS)) as u32;
+        self.rttvar = (self.rttvar_us / 1_000).min(u64::from(MAX_RTT_MS)) as u32;
         self.tlp_permitted = true;
-        // RTO <- SRTT + max(G, K * RTTVAR) where K=4, G=1000ms
-        self.rto = (self.srtt + 4 * self.rttvar).clamp(1_000, MAX_RTO_MS);
+        let rto_ms = ((self.srtt_us + 4 * self.rttvar_us) / 1_000).clamp(1_000, u64::from(MAX_RTO_MS));
+        self.rto = rto_ms as u32;
     }
 
-    /// An RTT sample as C `clamp_rtt` takes it: the first is capped at
-    /// `MAX_RTT_MS`; later ones only when they look like a suspend (over
-    /// 5 s and over `srtt + 5 * rttvar`), down to that bound.
-    fn clamp_rtt(&self, rtt: u64) -> u32 {
-        if self.srtt == 0 {
-            return rtt.min(u64::from(MAX_RTT_MS)) as u32;
-        }
-        let outlier = u64::from(self.srtt) + 5 * u64::from(self.rttvar);
-        if rtt > outlier && rtt > 5_000 {
-            return outlier.min(u64::from(MAX_RTT_MS)) as u32;
-        }
-        rtt as u32
+    #[cfg(test)]
+    fn update_rtt(&mut self, rtt_ms: u32) {
+        self.update_rtt_us(u64::from(rtt_ms) * 1_000);
     }
 
-    /// RACK §6.2 for one packet the peer delivered, cumulatively or by SACK
-    /// (C `ack_packet`, udx.c:1351-1404): RTT sample, minimum RTT, the RACK
-    /// packet and reordering detection.
+    /// An RTT sample in microseconds as C `clamp_rtt` takes it: the first is
+    /// capped at `MAX_RTT_US`; later ones only when they look like a suspend
+    /// (over 5 s and over `srtt_us + 5 * rttvar_us`), down to that bound.
+    fn clamp_rtt_us(&self, rtt_us: u64) -> u64 {
+        if self.srtt_us == 0 {
+            return rtt_us.min(MAX_RTT_US);
+        }
+        let outlier = self.srtt_us.saturating_add(5 * self.rttvar_us);
+        if rtt_us > outlier && rtt_us > 5_000_000 {
+            return outlier.min(MAX_RTT_US);
+        }
+        rtt_us
+    }
+
+    /// RACK §6.2 for one packet the peer delivered, cumulatively or by SACK,
+    /// in microseconds.
     fn on_packet_acked(&mut self, seq: u32, time_sent: Instant, retransmitted: bool, now: Instant) {
-        let mut rtt = self.clamp_rtt(now.saturating_duration_since(time_sent).as_millis() as u64);
+        let elapsed_us = now
+            .saturating_duration_since(time_sent)
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        let mut rtt_us = self.clamp_rtt_us(elapsed_us);
         if !retransmitted {
-            // A 1 ms clock: 0 means "under a millisecond", and srtt 0 means
-            // no sample yet.
-            rtt = rtt.max(1);
-            let t = self.clock_ms(now);
-            self.rtt_min.apply_min(RTT_MIN_WINDOW_MS, t, rtt);
-            self.update_rtt(rtt);
+            rtt_us = rtt_us.max(1);
+            let t = self.clock_us(now);
+            self.rtt_min_us.apply_min(RTT_MIN_WINDOW_US, t, rtt_us);
+            self.update_rtt_us(rtt_us);
         }
         // Step 2: the delivered packet sent last.
-        if !retransmitted || rtt >= self.rtt_min.get() {
-            self.rack_rtt = rtt;
-            // C `rs->rtt_ms`: the ACK's rate sample takes this RTT.
-            self.rs_rtt = rtt;
+        if !retransmitted || rtt_us >= self.rtt_min_us.get() {
+            self.rack_rtt_us = rtt_us;
+            self.rs_rtt_us = rtt_us;
             self.rack_advance(time_sent, seq);
         }
         // Step 3: a never-retransmitted packet delivered below the highest
@@ -1575,16 +1597,16 @@ impl StreamInner {
         }
     }
 
-    /// RACK §6.2.4 reorder window in ms (C `rack_update_reo_wnd`): closed in
-    /// recovery and after three SACKed packets until reordering is seen,
-    /// else a quarter of the minimum RTT, at most `srtt`.
-    fn rack_reo_wnd(&self) -> u32 {
+    /// RACK §6.2.4 reorder window in microseconds: closed in recovery and
+    /// after three SACKed packets until reordering is seen, else a quarter of
+    /// the minimum RTT, at most `srtt_us`.
+    fn rack_reo_wnd_us(&self) -> u64 {
         if !self.reordering_seen
             && (self.congestion.ca_state != CaState::Open || self.sacked_count >= 3)
         {
             return 0;
         }
-        (self.rtt_min.get() / 4).min(self.srtt)
+        (self.rtt_min_us.get() / 4).min(self.srtt_us)
     }
 
     // ── ACK processing ───────────────────────────────────────────────────────
@@ -1655,7 +1677,7 @@ impl StreamInner {
                 if let Some(info) = pkt.rate_info {
                     acked_rate_info.push(Delivered {
                         seq,
-                        time_sent: self.clock_ms(pkt.time_sent),
+                        time_sent_us: self.clock_us(pkt.time_sent),
                         info,
                     });
                 }
@@ -1771,10 +1793,11 @@ impl StreamInner {
                         if let Some(info) = pkt.rate_info {
                             sack_rate_info.push(Delivered {
                                 seq,
-                                time_sent: pkt
+                                time_sent_us: pkt
                                     .time_sent
                                     .saturating_duration_since(epoch)
-                                    .as_millis() as u64,
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX)) as u64,
                                 info,
                             });
                         }
@@ -1835,8 +1858,8 @@ impl StreamInner {
         let Some((rack_time_sent, rack_seq)) = self.rack else {
             return (0, None);
         };
-        let wait = std::time::Duration::from_millis(
-            u64::from(self.rack_rtt) + u64::from(self.rack_reo_wnd()),
+        let wait = std::time::Duration::from_micros(
+            self.rack_rtt_us.saturating_add(self.rack_reo_wnd_us()),
         );
 
         // Send times never decrease along `send_order`, so the scan stops at
@@ -1953,7 +1976,7 @@ impl StreamInner {
         // passes `high_seq`, before this ACK's packets are counted.
         self.congestion.on_cumulative_ack(header.ack);
         let data_inflight = self.remote_acked != self.next_seq;
-        self.rs_rtt = 0;
+        self.rs_rtt_us = 0;
         let prev_acked = self.remote_acked;
         self.on_cumulative_ack_into(header.ack, completed, acked_rate_info);
         if let Some(ranges) = sacks {
@@ -1973,19 +1996,19 @@ impl StreamInner {
         } else {
             (0, None, None, false)
         };
-        // C runs the rate sample and BBR on every ACK that found data in
+        // Run the rate sample and BBRv3 on every ACK that found data in
         // flight, whatever it delivered.
         if data_inflight {
             let inflight = self.inflight();
-            let now_ms = self.clock_ms(now);
+            let now_us = self.clock_us(now);
             self.congestion.on_ack(
                 acked_rate_info,
                 lost_count,
                 inflight,
-                self.srtt,
-                self.rs_rtt,
-                self.rtt_min.get(),
-                now_ms,
+                self.srtt_us,
+                self.rs_rtt_us,
+                self.rtt_min_us.get(),
+                now_us,
             );
         }
         // If `bbr_main` or a window update opened more room while packets are
@@ -1995,6 +2018,11 @@ impl StreamInner {
             let (stop, more_new_data) = self.take_send_batch_into(batch);
             send_stop = Some(stop);
             send_new_data |= more_new_data;
+        }
+        if self.send_buffer_room() > 0 {
+            if let Some(w) = self.write_waker.take() {
+                w.wake();
+            }
         }
         AckOutcome {
             #[cfg(test)]
@@ -2262,12 +2290,12 @@ impl StreamInner {
             next_remote_seq: 0,
             remote_acked: 0,
             rack: None,
-            rack_rtt: 0,
-            rs_rtt: 0,
+            rack_rtt_us: 0,
+            rs_rtt_us: 0,
             zwp_wanted: false,
             rack_fack: 0,
             reordering_seen: false,
-            rtt_min: WinFilter::new(0, u32::MAX),
+            rtt_min_us: WinFilter::new(0, u64::MAX),
             epoch,
             #[cfg(test)]
             clock: None,
@@ -2275,7 +2303,9 @@ impl StreamInner {
             recv_ranges: Vec::new(),
             receive_window: Arc::new(ReceiveWindow::new()),
             srtt: 0,
+            srtt_us: 0,
             rttvar: 0,
+            rttvar_us: 0,
             rto: INITIAL_RTO_MS,
             rto_timeouts: 0,
             retransmits: 0,
@@ -4252,8 +4282,8 @@ mod mtu_tests {
                         Some(r) => r,
                         None => continue,
                     };
-                    let wait = std::time::Duration::from_millis(
-                        u64::from(inner.rack_rtt) + u64::from(inner.rack_reo_wnd()),
+                    let wait = std::time::Duration::from_micros(
+                        inner.rack_rtt_us.saturating_add(inner.rack_reo_wnd_us()),
                     );
                     let mut waiting = None;
                     let expected: Vec<u32> = inner
@@ -5973,7 +6003,7 @@ mod rack_tests {
         let t1 = t0 + ms(20);
         inner.clock = Some(t1);
         inner.on_ack_packet(&ack_header(1), None);
-        assert_eq!((inner.srtt, inner.rtt_min.get()), (20, 20));
+        assert_eq!((inner.srtt, inner.rtt_min_us.get()), (20, 20_000));
         for seq in 1..4u32 {
             inner.clock = Some(t1 + ms(u64::from(seq) - 1));
             inner.register_sent(seq, build_data_packet(1, seq, 0, b"x"), addr, false);
@@ -6056,7 +6086,9 @@ mod rack_tests {
         let mut inner = StreamInner::new(0, read_tx, None, None, Registrations::default(), None);
         let t0 = Instant::now();
         inner.srtt = 100;
+        inner.srtt_us = 100_000;
         inner.rttvar = 50;
+        inner.rttvar_us = 50_000;
         inner.on_packet_acked(0, t0, false, t0 + ms(60_000));
         // 350 ms, not 60 s (nor the 30 s cap).
         assert_eq!(
@@ -6065,7 +6097,9 @@ mod rack_tests {
         );
 
         inner.srtt = 100;
+        inner.srtt_us = 100_000;
         inner.rttvar = 50;
+        inner.rttvar_us = 50_000;
         inner.on_packet_acked(1, t0, false, t0 + ms(4_000));
         assert_eq!(inner.srtt, (7 * 100 + 4_000) / 8);
     }
@@ -6087,8 +6121,8 @@ mod c_order_tests {
         inner.clock = Some(t0);
         inner.update_rtt(rtt);
         inner
-            .rtt_min
-            .apply_min(RTT_MIN_WINDOW_MS, inner.clock_ms(t0), rtt);
+            .rtt_min_us
+            .apply_min(RTT_MIN_WINDOW_US, inner.clock_us(t0), u64::from(rtt) * 1_000);
         (inner, t0)
     }
 
