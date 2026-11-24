@@ -27,7 +27,7 @@ thread_local! {
     /// ([`GSO_MAX_BYTES`]). A call reserves the bytes of its run in one step
     /// before it appends the packets, so a steady burst on a thread allocates
     /// the buffer once and then reuses it.
-    static SEND_SCRATCH: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+    static SEND_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The send buffer's allocation address and capacity, for the tests.
