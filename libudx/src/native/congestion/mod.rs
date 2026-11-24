@@ -14,9 +14,9 @@ pub(crate) const BBR_PROBE_RTT_INTERVAL_US: u64 = 10_000_000;
 pub(crate) const BBR_PROBE_RTT_MODE_US: u64 = 200_000;
 /// BBRv3 ProbeRTT cwnd gain (`0.5 * BDP`, min 4 packets).
 pub(crate) const BBR_PROBE_RTT_CWND_GAIN: f64 = 0.5;
-/// Bandwidth filter window length in ProbeBW cycles (BBRv3 `max_bw` spans 2
-/// full ProbeBW cycles so `max_bw` never expires during `ProbeBwCruise`).
-pub(crate) const BBR_BW_FILTER_CYCLES: u32 = 2;
+/// Bandwidth filter window length in rounds (ages out Startup delivery spikes
+/// within 10 RTTs so pacing never stays inflated over long queues).
+pub(crate) const BBR_BW_FILTER_ROUNDS: u32 = 10;
 /// Default pacing margin (1% headroom below estimated delivery rate).
 pub(crate) const BBR_PACING_MARGIN_PERCENT: f64 = 0.99;
 /// Startup pacing gain (BBRv3).

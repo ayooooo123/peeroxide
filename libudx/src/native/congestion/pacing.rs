@@ -66,10 +66,10 @@ impl TokenBucket {
         }
     }
 
-    /// Set the pacing rate in bytes per second.
+    /// Set the pacing rate in bytes per second (`u64::MAX` = unpaced).
     pub(crate) fn set_rate_bps(&mut self, rate_bps: u64) {
         self.rate_bps = rate_bps.max(MIN_RATE_BPS);
-        if self.gso_quantum_bytes() == 0 {
+        if self.rate_bps == u64::MAX || self.gso_quantum_bytes() == 0 {
             self.waiting_for_quantum = false;
         }
     }
@@ -122,6 +122,11 @@ impl TokenBucket {
     /// for the next GSO quantum or when no positive credit is available;
     /// otherwise subtracts `bytes` (carrying any deficit forward) and returns true.
     pub(crate) fn try_consume(&mut self, bytes: u32, now: Instant) -> bool {
+        if self.rate_bps == u64::MAX {
+            self.last_refill = now;
+            self.waiting_for_quantum = false;
+            return true;
+        }
         self.refill(now);
         if self.waiting_for_quantum || self.tokens_ub <= 0 {
             return false;
@@ -146,11 +151,12 @@ impl TokenBucket {
         }
     }
 
-    /// Delay before the next packet may go out: zero while credit is positive
-    /// and not latched for a GSO quantum, otherwise the time to pay back any
-    /// deficit and accrue one GSO quantum so UDP GSO batching stays intact.
+    /// Delay before the next packet may go out: zero while unpaced, or while
+    /// credit is positive and not latched for a GSO quantum; otherwise the time
+    /// to pay back any deficit and accrue one GSO quantum so UDP GSO batching
+    /// stays intact.
     pub(crate) fn delay(&self) -> Duration {
-        if !self.waiting_for_quantum && self.tokens_ub > 0 {
+        if self.rate_bps == u64::MAX || (!self.waiting_for_quantum && self.tokens_ub > 0) {
             return Duration::ZERO;
         }
         let target_ub = i128::from(self.gso_quantum_bytes()) * MICRO_BYTES;

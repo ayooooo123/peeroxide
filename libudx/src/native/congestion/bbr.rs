@@ -17,7 +17,7 @@
 //!   crushing cwnd to 4 packets, avoiding periodic stalls during video streams.
 
 use super::{
-    BBR_BETA, BBR_BW_FILTER_CYCLES, BBR_CWND_GAIN, BBR_CWND_MIN_TARGET, BBR_DRAIN_GAIN,
+    BBR_BETA, BBR_BW_FILTER_ROUNDS, BBR_CWND_GAIN, BBR_CWND_MIN_TARGET, BBR_DRAIN_GAIN,
     BBR_EXTRA_ACKED_GAIN, BBR_EXTRA_ACKED_MAX_US, BBR_EXTRA_ACKED_WIN_RTTS, BBR_FULL_BW_COUNT,
     BBR_FULL_BW_THRESH, BBR_FULL_LOSS_CNT, BBR_HEADROOM, BBR_LOSS_THRESH, BBR_MIN_RTT_INTERVAL_US,
     BBR_PACING_MARGIN_PERCENT, BBR_PROBE_BW_CRUISE_GAIN, BBR_PROBE_BW_DOWN_GAIN,
@@ -333,15 +333,16 @@ impl BbrState {
         }
     }
 
-    /// True when standing queueing delay is at least `0.5 * min_rtt` on a
+    /// True when standing queueing delay is at least `0.8 * min_rtt` on a
     /// non-loopback path (`min_rtt >= 2 ms`). This identifies deep bottleneck
     /// queues filled by competing loss-agnostic flows (such as stock BBRv1
     /// peers), where capping `inflight_hi` below `2 * BDP` starves this flow;
-    /// shallow queues (`queue < 0.5 * BDP`) still get full BBRv3 loss bounding.
+    /// shallow queues (`queue < 0.5 * BDP`) and normal single-flow links still
+    /// get full BBRv3 loss bounding.
     fn in_deep_queue(&self, link: &Link) -> bool {
         self.min_rtt_us < u64::MAX
             && self.min_rtt_us >= 2_000
-            && link.srtt_us >= self.min_rtt_us.saturating_mul(3) / 2
+            && link.srtt_us >= self.min_rtt_us.saturating_mul(9) / 5
     }
 
     /// Update `bw_filter`, `inflight_hi`, and lower bounds (`bw_lo`, `inflight_lo`).
@@ -350,7 +351,7 @@ impl BbrState {
             let bw = f64::from(rs.delivered) / (rs.interval_us as f64);
             if !rs.is_app_limited || bw >= self.max_bw() {
                 self.bw_filter
-                    .apply_max(BBR_BW_FILTER_CYCLES, u64::from(self.cycle_count), bw);
+                    .apply_max(BBR_BW_FILTER_ROUNDS, u64::from(self.round_count), bw);
             }
         }
         if rs.losses > 0 {
@@ -763,7 +764,35 @@ impl BbrState {
     }
 
     fn set_pacing_rate(&mut self, bw: f64, gain: f64, link: &Link) {
-        let rate = Self::bw_to_pacing_rate_bps(bw, link.mss, gain);
+        // Sub-millisecond loopback / local IPC paths with no loss are CPU-bound:
+        // pacing at 0.99x measured BW introduces spurious sub-ms async timer
+        // sleeps without preventing any network queue. Let cwnd bound inflight
+        // unless loss engages `inflight_hi`.
+        if self.min_rtt_us < 1_000 && self.inflight_hi == u32::MAX && !self.loss_in_round {
+            self.pacing_rate_bps = u64::MAX;
+            return;
+        }
+        // In a deep shared queue already held full by competing loss-agnostic
+        // peers, draining at 0.90x or applying the 1% pacing haircut only hands
+        // queue occupancy to the competitor without emptying the bottleneck.
+        let (eff_gain, margin) = if self.in_deep_queue(link) && self.mode == BbrMode::ProbeBw {
+            let g = if self.probe_bw_phase == ProbeBwPhase::Down {
+                1.0
+            } else {
+                gain
+            };
+            (g, 1.0)
+        } else {
+            (gain, BBR_PACING_MARGIN_PERCENT)
+        };
+        let bps = bw * 1_000_000.0 * f64::from(link.mss) * eff_gain * margin;
+        let rate = if !bps.is_finite() || bps < 1_200.0 {
+            1_200
+        } else if bps >= (u64::MAX as f64) {
+            u64::MAX
+        } else {
+            bps as u64
+        };
         if !self.has_seen_rtt && link.srtt_us > 0 {
             self.init_pacing_rate_from_rtt(link.srtt_us, link.cwnd, link.mss);
         }
@@ -970,7 +999,7 @@ mod tests {
         let mut state = BbrState::new(0, 10, MSS);
         state.min_rtt_us = 50_000;
         // 1 pkt / 1000 us = 1000 pkt/s -> BDP = 50 packets -> 0.5 * BDP = 25 packets.
-        state.bw_filter.apply_max(BBR_BW_FILTER_CYCLES, 0, 0.001);
+        state.bw_filter.apply_max(BBR_BW_FILTER_ROUNDS, 0, 0.001);
         state.full_bw_reached = true;
         state.mode = BbrMode::ProbeBw;
         let mut l = link(100, 200, 60, BBR_PROBE_RTT_INTERVAL_US + 1);
@@ -983,7 +1012,7 @@ mod tests {
     fn probe_bw_up_pins_inflight_hi_and_drains_on_high_loss() {
         let mut state = BbrState::new(0, 10, MSS);
         state.min_rtt_us = 20_000;
-        state.bw_filter.apply_max(BBR_BW_FILTER_CYCLES, 0, 0.005); // BDP = 100 pkts
+        state.bw_filter.apply_max(BBR_BW_FILTER_ROUNDS, 0, 0.005); // BDP = 100 pkts
         state.full_bw_reached = true;
         state.mode = BbrMode::ProbeBw;
         state.probe_bw_phase = ProbeBwPhase::Up;
@@ -1021,7 +1050,7 @@ mod tests {
     fn deep_queue_clears_inflight_hi_to_avoid_bbrv1_starvation() {
         let mut state = BbrState::new(0, 10, MSS);
         state.min_rtt_us = 50_000;
-        state.bw_filter.apply_max(BBR_BW_FILTER_CYCLES, 0, 0.001); // BDP = 50 pkts
+        state.bw_filter.apply_max(BBR_BW_FILTER_ROUNDS, 0, 0.001); // BDP = 50 pkts
         state.full_bw_reached = true;
         state.mode = BbrMode::ProbeBw;
         state.probe_bw_phase = ProbeBwPhase::Up;
