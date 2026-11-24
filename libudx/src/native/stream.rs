@@ -1085,8 +1085,10 @@ impl StreamInner {
         self.queued_bytes += write.data.len();
         self.unacked_written += write.data.len();
         self.write_queue.push_back(write);
-        if (!was_unsent || is_end || self.zwp_wanted)
-            && let Some(tx) = &self.notify_tx
+        if let Some(tx) = self
+            .notify_tx
+            .as_ref()
+            .filter(|_| !was_unsent || is_end || self.zwp_wanted)
         {
             let _ = tx.send(StreamNotify::DataQueued);
         }
