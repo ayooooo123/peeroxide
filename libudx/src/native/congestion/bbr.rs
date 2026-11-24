@@ -864,21 +864,24 @@ mod tests {
     fn startup_exits_early_on_high_loss() {
         let mut state = BbrState::new(0, 10, MSS);
         let mut l = link(100, 100, 100, 50_000);
-        // Simulate 6 loss events in one round with 5% flight loss (> 2%).
-        for i in 0..6u32 {
-            let mut rs = make_rs(20, 50_000, i * 20, false);
+        // First ACK starts loss round 1 (delivered = 100).
+        let rs0 = make_rs(100, 50_000, 0, false);
+        state.main(&rs0, &mut l);
+        // Six loss events within the SAME round (prior_delivered < 100) with 5% flight loss.
+        for i in 1..=6u32 {
+            let mut rs = make_rs(10, 50_000, i * 10, false);
             rs.losses = 1;
             rs.tx_in_flight = 100;
             rs.lost_in_flight = 5;
-            l.delivered = (i + 1) * 20;
+            l.delivered = 100 + i * 10;
             state.main(&rs, &mut l);
         }
-        // Next round completes -> Startup exits to Drain with bounded inflight_hi.
-        let mut rs = make_rs(20, 50_000, 120, false);
+        // Round completes (prior_delivered >= 100) with high loss -> exits Startup with inflight_hi set.
+        let mut rs = make_rs(20, 50_000, 100, false);
         rs.losses = 1;
         rs.tx_in_flight = 100;
         rs.lost_in_flight = 5;
-        l.delivered = 140;
+        l.delivered = 180;
         state.main(&rs, &mut l);
         assert!(state.full_bw_reached);
         assert_eq!(state.mode, BbrMode::Drain);

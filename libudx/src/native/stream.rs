@@ -1247,8 +1247,8 @@ impl StreamInner {
             self.rttvar_us = (3 * self.rttvar_us + delta) / 4;
             self.srtt_us = (7 * self.srtt_us + rtt_us) / 8;
         }
-        self.srtt = ((self.srtt_us + 500) / 1_000).clamp(1, u64::from(MAX_RTT_MS)) as u32;
-        self.rttvar = ((self.rttvar_us + 500) / 1_000).min(u64::from(MAX_RTT_MS)) as u32;
+        self.srtt = (self.srtt_us / 1_000).clamp(1, u64::from(MAX_RTT_MS)) as u32;
+        self.rttvar = (self.rttvar_us / 1_000).min(u64::from(MAX_RTT_MS)) as u32;
         self.tlp_permitted = true;
         let rto_ms = ((self.srtt_us + 4 * self.rttvar_us) / 1_000).clamp(1_000, u64::from(MAX_RTO_MS));
         self.rto = rto_ms as u32;
