@@ -458,7 +458,7 @@ impl BbrState {
 
     /// Startup exit: either bandwidth plateaued for 3 rounds OR loss exceeded
     /// 2% across >= 6 loss events in a round (BBRv3 startup loss exit).
-    fn check_startup_done(&mut self, rs: &RateSample, link: &Link) {
+    fn check_startup_done(&mut self, rs: &RateSample, _link: &Link) {
         if self.mode != BbrMode::Startup || self.full_bw_reached {
             return;
         }
@@ -474,9 +474,10 @@ impl BbrState {
                 }
             }
         }
-        // BBRv3 high-loss startup exit: avoid overflowing shallow queues for 3 RTTs.
+        // BBRv3 high-loss startup exit: avoid overflowing bottleneck queues for
+        // 3 full RTTs during Startup (even on deep queues, Startup's 2.77x gain
+        // would otherwise dump thousands of packets before plateauing).
         if self.loss_round_start
-            && !self.in_deep_queue(link)
             && self.loss_events_in_round >= BBR_FULL_LOSS_CNT
             && self.is_inflight_too_high(rs)
         {
@@ -775,7 +776,12 @@ impl BbrState {
         // In a deep shared queue already held full by competing loss-agnostic
         // peers, draining at 0.90x or applying the 1% pacing haircut only hands
         // queue occupancy to the competitor without emptying the bottleneck.
-        let (eff_gain, margin) = if self.in_deep_queue(link) && self.mode == BbrMode::ProbeBw {
+        // Below 1.5 MB/s (~12 Mbit/s), stock UDX v1 peers are unpaced (1 pkt/ms
+        // token-bucket floor); match cwnd-governed transmission while a deep
+        // standing queue is present so low-rate shared links stay 50/50 while
+        // solo low-bitrate streams still get exact deficit pacing.
+        let deep_queue = self.in_deep_queue(link);
+        let (eff_gain, margin) = if deep_queue && self.mode == BbrMode::ProbeBw {
             let g = if self.probe_bw_phase == ProbeBwPhase::Down {
                 1.0
             } else {
@@ -786,7 +792,9 @@ impl BbrState {
             (gain, BBR_PACING_MARGIN_PERCENT)
         };
         let bps = bw * 1_000_000.0 * f64::from(link.mss) * eff_gain * margin;
-        let rate = if !bps.is_finite() || bps < 1_200.0 {
+        let rate = if deep_queue && self.mode == BbrMode::ProbeBw && bps < 1_500_000.0 {
+            u64::MAX
+        } else if !bps.is_finite() || bps < 1_200.0 {
             1_200
         } else if bps >= (u64::MAX as f64) {
             u64::MAX
@@ -880,14 +888,18 @@ impl BbrState {
         }
     }
 
-    /// BDP × gain for cwnd sizing, flooring RTT at 1 ms so sub-millisecond
-    /// loopback/LAN paths keep deep pipelining across async wakeups while
+    /// BDP × gain for cwnd sizing, flooring sub-ms loopback/LAN RTT at 2 ms so
+    /// high-rate local paths keep full pipelining across async wakeups while
     /// pacing and RACK keep exact microsecond resolution.
     fn cwnd_bdp(&self, bw: f64, gain: f64) -> u32 {
         if self.min_rtt_us == u64::MAX {
             return 10;
         }
-        let rtt_us = self.min_rtt_us.max(1_000);
+        let rtt_us = if self.min_rtt_us < 1_000 {
+            2_000
+        } else {
+            self.min_rtt_us
+        };
         let packets = bw * (rtt_us as f64) * gain;
         if !packets.is_finite() || packets < 1.0 {
             1
