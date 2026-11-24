@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Upgraded congestion control from BBRv1 to BBRv3 (`draft-ietf-ccwg-bbr`) with microsecond RTT, RACK reorder window, and rate sampling, plus a fixed-point nanosecond deficit-tracking pacer that preserves UDP GSO bursts up to 65,507 B while pacing accurately down to low bitrates. Wire format is unchanged.
+
 ### Changed (review 2026-11-15)
 
 - A stream closes by itself once both sides have ended and everything it sent is ACKed (C `close_stream` on `UDX_STREAM_ALL_ENDED`): `closed()`, `is_alive()` and the close notification report it while the owner still holds the stream. By then every write has completed and the peer's data and EOF are queued for the reader, which may not have read them yet; they stay readable after the close. DATA arriving after the peer's END is dropped (C `SHOULD_READ`). The side that ended first answers the peer's ACK of its END with one more ACK and then keeps a TIMEWAIT entry for its id for 5 s (C `stream_timewait`): a late DATA or END gets the final ACK from the stream's last socket to its last remote, other packets are ignored, and nothing reaches whatever had the id. A new stream may take an id in TIMEWAIT, as in C. Dropping or destroying a closed stream sends no DESTROY.
