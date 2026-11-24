@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The receive loop decodes a stream packet's header from the receive buffer, holds the stream table lock once for a run of stream packets, and copies only the packet body into the stream's queue. A datagram for no stream, and a stream in time-wait, release the table before the fallback channel or the time-wait answer.
+- The receive loop decodes a stream packet's header from the receive buffer, holds the stream table lock once for a run of stream packets, and slices packet bodies from a 64 KiB `BytesMut` slab into refcounted `Bytes` values. A datagram for no stream, and a stream in time-wait, release the table before the fallback channel or the time-wait answer.
+- The stream hot path backs outbound packets with a 64 KiB `BytesMut` slab (cloning `Bytes` handles instead of copying each packet on send/retransmit), collapses per-packet `StreamInner` and `UdxSocket` locks to a single `StreamInner` lock on the fast path, drains up to 32 incoming packets per wake, keeps plain 20-byte ACKs/heartbeats inline on the stack, reuses ACK/send scratch buffers, takes post-BBR sends in the same pass, and coalesces queued DATA packets in `UdxAsyncStream::poll_read`.
 
 ### Added
 
