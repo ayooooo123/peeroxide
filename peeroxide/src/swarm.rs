@@ -362,6 +362,22 @@ impl SwarmHandle {
         reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
     }
 
+    /// Trigger an immediate DHT announce and/or lookup refresh on an already
+    /// joined topic, waiting until that refresh round completes.
+    ///
+    /// Mirrors Node `swarm.status(topic).refresh()`: if a refresh for this
+    /// topic is already in flight, callers coalesce onto it instead of running
+    /// duplicate DHT queries. Calling this on a topic that is not joined, or
+    /// while the swarm is suspended, is a no-op.
+    pub async fn refresh(&self, topic: [u8; 32]) -> Result<(), SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::Refresh { topic, reply_tx })
+            .await
+            .map_err(|_| SwarmError::Destroyed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
+    }
+
     /// Wait until all joined topics have completed their initial discovery.
     pub async fn flush(&self) -> Result<(), SwarmError> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -497,6 +513,10 @@ enum SwarmCommand {
         topic: [u8; 32],
         reply_tx: oneshot::Sender<Result<(), SwarmError>>,
     },
+    Refresh {
+        topic: [u8; 32],
+        reply_tx: oneshot::Sender<Result<(), SwarmError>>,
+    },
     Listen {
         reply_tx: oneshot::Sender<Result<(), SwarmError>>,
     },
@@ -527,6 +547,9 @@ struct TopicState {
     is_server: bool,
     is_client: bool,
     cancel_tx: Option<oneshot::Sender<()>>,
+    refresh_tx: Option<mpsc::UnboundedSender<u64>>,
+    refresh_seq: u64,
+    refresh_waiters: Vec<oneshot::Sender<Result<(), SwarmError>>>,
     refreshed: bool,
     /// Discovery task for this topic. Kept so a suspend/destroy can stop it
     /// instead of letting it keep announcing.
@@ -785,6 +808,9 @@ impl SwarmActor {
         }
 
         for (_, state) in self.topics.drain() {
+            for waiter in state.refresh_waiters {
+                let _ = waiter.send(Err(SwarmError::Destroyed));
+            }
             if let Some(cancel) = state.cancel_tx {
                 let _ = cancel.send(());
             }
@@ -820,6 +846,10 @@ impl SwarmActor {
             SwarmCommand::Leave { topic, reply_tx } => {
                 let result = self.do_leave(topic).await;
                 let _ = reply_tx.send(result);
+                false
+            }
+            SwarmCommand::Refresh { topic, reply_tx } => {
+                self.do_refresh_topic(topic, reply_tx);
                 false
             }
             SwarmCommand::Listen { reply_tx } => {
@@ -891,12 +921,25 @@ impl SwarmActor {
         server: bool,
         client: bool,
     ) -> Result<(), SwarmError> {
-        if let Some(state) = self.topics.remove(&topic) {
+        if let Some(mut state) = self.topics.remove(&topic) {
             let server = server || state.is_server;
             let client = client || state.is_client;
             if server == state.is_server && client == state.is_client {
+                // Mirror Node `swarm.join()` -> `discovery.session()` ->
+                // `discovery.refresh()`: trigger a refresh if idle.
+                if !self.suspended && state.refreshed {
+                    if let Some(tx) = &state.refresh_tx {
+                        let next_seq = state.refresh_seq.wrapping_add(1).max(1);
+                        state.refresh_seq = next_seq;
+                        state.refreshed = false;
+                        let _ = tx.send(next_seq);
+                    }
+                }
                 self.topics.insert(topic, state);
                 return Ok(());
+            }
+            for waiter in state.refresh_waiters.drain(..) {
+                let _ = waiter.send(Ok(()));
             }
             if let Some(cancel) = state.cancel_tx {
                 let _ = cancel.send(());
@@ -914,6 +957,9 @@ impl SwarmActor {
                         is_server: server,
                         is_client: client,
                         cancel_tx: None,
+                        refresh_tx: None,
+                        refresh_seq: 0,
+                        refresh_waiters: Vec::new(),
                         refreshed: false,
                         task: None,
                     },
@@ -934,6 +980,9 @@ impl SwarmActor {
                     is_server: server,
                     is_client: client,
                     cancel_tx: None,
+                    refresh_tx: None,
+                    refresh_seq: 0,
+                    refresh_waiters: Vec::new(),
                     refreshed: false,
                     task: None,
                 },
@@ -944,10 +993,39 @@ impl SwarmActor {
         Ok(())
     }
 
+    fn do_refresh_topic(
+        &mut self,
+        topic: [u8; 32],
+        reply_tx: oneshot::Sender<Result<(), SwarmError>>,
+    ) {
+        if self.suspended {
+            let _ = reply_tx.send(Ok(()));
+            return;
+        }
+        let Some(state) = self.topics.get_mut(&topic) else {
+            let _ = reply_tx.send(Ok(()));
+            return;
+        };
+        if !state.refreshed {
+            state.refresh_waiters.push(reply_tx);
+            return;
+        }
+        if let Some(tx) = &state.refresh_tx {
+            let next_seq = state.refresh_seq.wrapping_add(1).max(1);
+            state.refresh_seq = next_seq;
+            state.refreshed = false;
+            state.refresh_waiters.push(reply_tx);
+            let _ = tx.send(next_seq);
+        } else {
+            let _ = reply_tx.send(Ok(()));
+        }
+    }
+
     /// Start discovery for one topic and remember its task so suspend/destroy
     /// can stop it.
     fn spawn_discovery(&mut self, topic: [u8; 32], server: bool, client: bool) {
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
         let config = PeerDiscoveryConfig {
             topic,
             is_server: server,
@@ -970,7 +1048,10 @@ impl SwarmActor {
                     _ = &mut cancel_rx => return,
                 }
             }
-            run_discovery(config, dht, key_pair, relays, events, cancel_rx).await;
+            run_discovery(
+                config, dht, key_pair, relays, events, cancel_rx, refresh_rx,
+            )
+            .await;
         });
 
         self.topics.insert(
@@ -979,6 +1060,9 @@ impl SwarmActor {
                 is_server: server,
                 is_client: client,
                 cancel_tx: Some(cancel_tx),
+                refresh_tx: Some(refresh_tx),
+                refresh_seq: 0,
+                refresh_waiters: Vec::new(),
                 refreshed: false,
                 task: Some(task),
             },
@@ -1088,9 +1172,14 @@ impl SwarmActor {
         self.suspended = true;
 
         for state in self.topics.values_mut() {
+            for waiter in state.refresh_waiters.drain(..) {
+                let _ = waiter.send(Ok(()));
+            }
             if let Some(cancel) = state.cancel_tx.take() {
                 let _ = cancel.send(());
             }
+            state.refresh_tx = None;
+            state.refresh_seq = 0;
             if let Some(task) = state.task.take() {
                 task.abort();
             }
@@ -1184,6 +1273,9 @@ impl SwarmActor {
         self.suspended = true;
         self.server.close().await;
         for (_, mut state) in self.topics.drain() {
+            for waiter in state.refresh_waiters.drain(..) {
+                let _ = waiter.send(Err(SwarmError::Destroyed));
+            }
             if let Some(cancel) = state.cancel_tx.take() {
                 let _ = cancel.send(());
             }
@@ -1218,6 +1310,9 @@ impl SwarmActor {
 
     async fn do_leave(&mut self, topic: [u8; 32]) -> Result<(), SwarmError> {
         if let Some(state) = self.topics.remove(&topic) {
+            for waiter in state.refresh_waiters {
+                let _ = waiter.send(Ok(()));
+            }
             if let Some(cancel) = state.cancel_tx {
                 let _ = cancel.send(());
             }
@@ -1281,7 +1376,15 @@ impl SwarmActor {
                     info.topics.push(topic);
                 }
 
-                if !info.queued && !info.connecting && !info.banned && !info.is_waiting() {
+                // Match Node `Hyperswarm._handlePeer`: when a low-priority or
+                // exhausted peer is rediscovered during a lookup/refresh, reset
+                // its attempt counter so it gets a fresh dial immediately.
+                if info.priority < Priority::Normal || info.attempts > 3 {
+                    info.reset();
+                }
+
+                if !info.queued && !info.connecting && !info.banned {
+                    info.set_waiting(false);
                     info.queued = true;
                     info.priority = info.get_priority();
                     self.queue.push(public_key);
@@ -1296,9 +1399,14 @@ impl SwarmActor {
                     // info.relay_addresses is at its widest by then.
                 }
             }
-            DiscoveryEvent::RefreshComplete { topic } => {
+            DiscoveryEvent::RefreshComplete { topic, seq } => {
                 if let Some(state) = self.topics.get_mut(&topic) {
-                    state.refreshed = true;
+                    if state.refreshed || state.refresh_seq == 0 || seq >= state.refresh_seq {
+                        state.refreshed = true;
+                        for waiter in state.refresh_waiters.drain(..) {
+                            let _ = waiter.send(Ok(()));
+                        }
+                    }
                 }
                 self.attempt_connections();
                 self.check_flush_waiters();

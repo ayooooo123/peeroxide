@@ -1031,16 +1031,25 @@ impl HyperDhtHandle {
 
         // Node `Announcer._commit` adds a node to the relays only after its
         // ANNOUNCE resolved: `relays.push({ relayAddress: msg.from,
-        // peerAddress: msg.to })`, capped at 3.
+        // peerAddress: msg.to })`, capped at 3. Prefer the ANNOUNCE commit
+        // response's observed `to` address over the earlier LOOKUP reply so
+        // `peer_address` matches the exact mapping stored in the relay's
+        // ForwardEntry (critical behind symmetric NATs).
         let accepted_relays: Vec<RelayInfo> = committed
             .iter()
             .zip(&results)
-            .filter(|(_, r)| matches!(r, Ok(res) if res.error == 0))
-            .take(3)
-            .map(|(reply, _)| RelayInfo {
-                relay_address: reply.from.clone(),
-                peer_address: reply.to.clone(),
+            .filter_map(|(reply, r)| match r {
+                Ok(res) if res.error == 0 => Some(RelayInfo {
+                    relay_address: reply.from.clone(),
+                    peer_address: if res.to.port != 0 {
+                        res.to.clone()
+                    } else {
+                        reply.to.clone()
+                    },
+                }),
+                _ => None,
             })
+            .take(3)
             .collect();
 
         // Only update handle-state `current_relay_addresses` when announcing
@@ -3440,15 +3449,20 @@ impl HyperDhtServer {
         } else {
             None
         };
-        // HyperDHT must refresh server records before they expire.
+        // HyperDHT must keep NAT pinholes open to its relays (3 s pings) and
+        // refresh server records before they expire (100 * 3 s = 5 min),
+        // matching Node `hyperdht/lib/announcer.js`.
         self.announce_task = Some(tokio::spawn(async move {
             let mut empty = match first {
                 Some(empty) => empty,
                 None => announce(dht.clone(), key_pair.clone()).await,
             };
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(if empty { 3 } else { 300 }))
-                    .await;
+                if empty {
+                    tokio::time::sleep(RELAY_PING_INTERVAL).await;
+                } else {
+                    keep_relays_alive(&dht, RELAY_PING_INTERVAL, RELAY_PING_ROUNDS).await;
+                }
                 empty = announce(dht.clone(), key_pair.clone()).await;
             }
         }));
@@ -3477,6 +3491,74 @@ impl HyperDhtServer {
         self.key_pair = None;
         self.address = None;
     }
+}
+
+/// Interval between keepalive pings to our announced server relays, matching
+/// Node `hyperdht/lib/announcer.js`.
+const RELAY_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Number of 3 s keepalive ping rounds per 5-minute announce cycle, matching
+/// Node `hyperdht/lib/announcer.js`.
+const RELAY_PING_ROUNDS: usize = 100;
+
+/// Minimum active relays required before triggering an early refresh announce,
+/// matching Node `MIN_ACTIVE` in `hyperdht/lib/announcer.js`.
+const MIN_ACTIVE_RELAYS: usize = 3;
+
+/// Keep NAT pinholes open to each relay in `dht.current_relays()` by pinging
+/// them every `interval` for up to `rounds` iterations.
+///
+/// Returns `true` if all rounds completed with healthy relays and steady
+/// observed NAT addresses, or `false` when an early re-announce is needed
+/// because relays became empty, fewer than `min(len, MIN_ACTIVE_RELAYS)`
+/// answered, or our externally observed address at any relay changed.
+async fn keep_relays_alive(
+    dht: &HyperDhtHandle,
+    interval: std::time::Duration,
+    rounds: usize,
+) -> bool {
+    for _ in 0..rounds {
+        let relays = dht.current_relays();
+        if relays.is_empty() {
+            tokio::time::sleep(interval).await;
+            return false;
+        }
+        tokio::time::sleep(interval).await;
+
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, relay) in relays.iter().enumerate() {
+            let rpc = dht.dht().clone();
+            let host = relay.relay_address.host.clone();
+            let port = relay.relay_address.port;
+            set.spawn(async move { (idx, rpc.ping(&host, port).await) });
+        }
+
+        let mut active = 0usize;
+        let mut updated = relays.clone();
+        let mut address_changed = false;
+        while let Some(joined) = set.join_next().await {
+            if let Ok((idx, Ok(resp))) = joined {
+                active += 1;
+                if let Some(observed) = resp.to {
+                    if observed.port != 0 && observed != updated[idx].peer_address {
+                        updated[idx].peer_address = observed;
+                        address_changed = true;
+                    }
+                }
+            }
+        }
+
+        if address_changed {
+            if let Ok(mut guard) = dht.current_relays.lock() {
+                *guard = updated;
+            }
+            return false;
+        }
+        if active < relays.len().min(MIN_ACTIVE_RELAYS) {
+            return false;
+        }
+    }
+    true
 }
 
 impl Drop for HyperDhtServer {
@@ -7612,6 +7694,123 @@ mod tests {
                 .iter()
                 .map(|r| r.relay_address.clone())
                 .collect::<Vec<_>>()
+        );
+
+        let _ = handle.destroy().await;
+        let _ = bs.destroy().await;
+    }
+
+    /// `keep_relays_alive` sends periodic pings to keep relay NAT pinholes open
+    /// and returns early (triggering an immediate re-announce) if a relay stops
+    /// responding.
+    #[tokio::test]
+    async fn keep_relays_alive_pings_and_refreshes_early_when_relay_dies() {
+        use libudx::UdxRuntime;
+        use std::time::Duration;
+
+        let local = |bootstrap: Vec<String>, firewalled: bool| HyperDhtConfig {
+            dht: crate::rpc::DhtConfig {
+                bootstrap,
+                port: 0,
+                host: "127.0.0.1".to_string(),
+                firewalled,
+                ephemeral: Some(firewalled),
+                ..crate::rpc::DhtConfig::default()
+            },
+            ..HyperDhtConfig::default()
+        };
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let (_bs_task, bs, _bs_rx) = spawn(&runtime, local(vec![], false))
+            .await
+            .expect("spawn bootstrap");
+        let bs_port = bs.local_port().await.expect("bootstrap port");
+
+        let (_task, handle, _rx) = spawn(&runtime, local(vec![format!("127.0.0.1:{bs_port}")], true))
+            .await
+            .expect("spawn announcer");
+        handle.bootstrapped().await.expect("bootstrapped");
+
+        let key_pair = KeyPair::generate();
+        handle
+            .announce(hash(&key_pair.public_key), &key_pair, &[])
+            .await
+            .expect("announce");
+        assert!(!handle.current_relays().is_empty());
+
+        let (tx_before, rx_before) = bs.wire_stats();
+        let healthy = keep_relays_alive(&handle, Duration::from_millis(25), 3).await;
+        let (tx_after, rx_after) = bs.wire_stats();
+        assert!(healthy, "healthy relay should complete all keepalive rounds");
+        assert!(
+            tx_after > tx_before && rx_after > rx_before,
+            "bootstrap relay should receive and answer keepalive pings"
+        );
+
+        let _ = bs.destroy().await;
+        let still_healthy = keep_relays_alive(&handle, Duration::from_millis(25), 10).await;
+        assert!(
+            !still_healthy,
+            "dead relay must abort keepalive early so start_announcing re-announces"
+        );
+
+        let _ = handle.destroy().await;
+    }
+
+    /// If a keepalive ping observes a different reflexive `peer_address` (e.g.
+    /// symmetric NAT port rebinding), `keep_relays_alive` updates
+    /// `current_relays` in place and returns `false` so `start_announcing`
+    /// re-announces and refreshes the relay's ForwardEntry.
+    #[tokio::test]
+    async fn keep_relays_alive_updates_peer_address_and_refreshes_on_nat_change() {
+        use libudx::UdxRuntime;
+        use std::time::Duration;
+
+        let local = |bootstrap: Vec<String>, firewalled: bool| HyperDhtConfig {
+            dht: crate::rpc::DhtConfig {
+                bootstrap,
+                port: 0,
+                host: "127.0.0.1".to_string(),
+                firewalled,
+                ephemeral: Some(firewalled),
+                ..crate::rpc::DhtConfig::default()
+            },
+            ..HyperDhtConfig::default()
+        };
+
+        let runtime = UdxRuntime::new().expect("runtime");
+        let (_bs_task, bs, _bs_rx) = spawn(&runtime, local(vec![], false))
+            .await
+            .expect("spawn bootstrap");
+        let bs_port = bs.local_port().await.expect("bootstrap port");
+
+        let (_task, handle, _rx) = spawn(&runtime, local(vec![format!("127.0.0.1:{bs_port}")], true))
+            .await
+            .expect("spawn announcer");
+        handle.bootstrapped().await.expect("bootstrapped");
+
+        let key_pair = KeyPair::generate();
+        handle
+            .announce(hash(&key_pair.public_key), &key_pair, &[])
+            .await
+            .expect("announce");
+
+        let live_port = handle.current_relays()[0].peer_address.port;
+        assert_ne!(live_port, 0);
+        let stale_port = if live_port == 1 { 2 } else { live_port - 1 };
+        {
+            let mut guard = handle.current_relays.lock().expect("lock current_relays");
+            guard[0].peer_address.port = stale_port;
+        }
+
+        let steady = keep_relays_alive(&handle, Duration::from_millis(20), 10).await;
+        assert!(
+            !steady,
+            "observed peer_address change must trigger an early re-announce"
+        );
+        assert_eq!(
+            handle.current_relays()[0].peer_address.port, live_port,
+            "current_relays peer_address must be updated to the live observed port"
         );
 
         let _ = handle.destroy().await;

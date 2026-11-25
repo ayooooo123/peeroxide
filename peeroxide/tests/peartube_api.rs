@@ -666,3 +666,115 @@ async fn max_peers_prevents_outgoing_dial() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn eager_server_topic_announces_with_relays() {
+    with_timeout("eager server topic relays", async {
+        let net = Testnet::start().await?;
+
+        let mut config = SwarmConfig::default();
+        config.eager = true;
+        config.dht = local_dht(net.addrs.clone(), true);
+        let (_server_task, server, _server_connections) = spawn_swarm(config).await?;
+        let topic = [0xD5; 32];
+        server.join(topic, join_opts(true, false)).await?;
+
+        let (_probe_task, probe, _probe_connections) = net.swarm().await?;
+        let server_pk = server.key_pair().public_key;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_relays = false;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(results) = probe.dht().lookup(topic).await {
+                if results.iter().flat_map(|r| &r.peers).any(|peer| {
+                    peer.public_key == server_pk && !peer.relay_addresses.is_empty()
+                }) {
+                    saw_relays = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            saw_relays,
+            "eager server must re-announce topic with non-empty relay_addresses once self-announce finishes"
+        );
+
+        probe.destroy().await?;
+        server.destroy().await?;
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn refresh_discovers_late_peer_without_waiting_for_interval() {
+    with_timeout("topic refresh", async {
+        let net = Testnet::start().await?;
+        let topic = [0xD6; 32];
+
+        let (_client_task, client, mut client_conns) = net.swarm().await?;
+        // Refresh on an unjoined topic is a no-op.
+        client.refresh([0xD7; 32]).await?;
+
+        client.join(topic, join_opts(false, true)).await?;
+        client.flush().await?;
+
+        // A server joins AFTER the client already completed its initial lookup.
+        let (_server_task, server, mut server_conns) = net.swarm().await?;
+        let server_pk = server.key_pair().public_key;
+        server.join(topic, join_opts(true, false)).await?;
+        server.flush().await?;
+
+        // Without refresh, the client would sleep ~10 minutes. Refresh must
+        // find and connect to the new server immediately.
+        client.refresh(topic).await?;
+
+        let client_conn = next_conn(&mut client_conns, "refreshed client connection").await;
+        let server_conn = next_conn(&mut server_conns, "refreshed server connection").await;
+        assert_eq!(client_conn.remote_public_key(), &server_pk);
+        assert_eq!(
+            server_conn.remote_public_key(),
+            &client.key_pair().public_key
+        );
+
+        client.destroy().await?;
+        server.destroy().await?;
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rejoin_same_flags_refreshes_and_discovers_late_peer() {
+    with_timeout("rejoin refresh", async {
+        let net = Testnet::start().await?;
+        let topic = [0xD8; 32];
+
+        let (_client_task, client, mut client_conns) = net.swarm().await?;
+        client.join(topic, join_opts(false, true)).await?;
+        client.flush().await?;
+
+        let (_server_task, server, mut server_conns) = net.swarm().await?;
+        let server_pk = server.key_pair().public_key;
+        server.join(topic, join_opts(true, false)).await?;
+        server.flush().await?;
+
+        // Mirrors Node `swarm.join(topic, opts)` -> `discovery.refresh()`.
+        client.join(topic, join_opts(false, true)).await?;
+        client.flush().await?;
+
+        let client_conn = next_conn(&mut client_conns, "rejoined client connection").await;
+        let server_conn = next_conn(&mut server_conns, "rejoined server connection").await;
+        assert_eq!(client_conn.remote_public_key(), &server_pk);
+        assert_eq!(
+            server_conn.remote_public_key(),
+            &client.key_pair().public_key
+        );
+
+        client.destroy().await?;
+        server.destroy().await?;
+        Ok(())
+    })
+    .await;
+}
