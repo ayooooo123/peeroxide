@@ -666,3 +666,43 @@ async fn max_peers_prevents_outgoing_dial() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn eager_server_topic_announces_with_relays() {
+    with_timeout("eager server topic relays", async {
+        let net = Testnet::start().await?;
+
+        let mut config = SwarmConfig::default();
+        config.eager = true;
+        config.dht = local_dht(net.addrs.clone(), true);
+        let (_server_task, server, _server_connections) = spawn_swarm(config).await?;
+        let topic = [0xD5; 32];
+        server.join(topic, join_opts(true, false)).await?;
+
+        let (_probe_task, probe, _probe_connections) = net.swarm().await?;
+        let server_pk = server.key_pair().public_key;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_relays = false;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(results) = probe.dht().lookup(topic).await {
+                if results.iter().flat_map(|r| &r.peers).any(|peer| {
+                    peer.public_key == server_pk && !peer.relay_addresses.is_empty()
+                }) {
+                    saw_relays = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            saw_relays,
+            "eager server must re-announce topic with non-empty relay_addresses once self-announce finishes"
+        );
+
+        probe.destroy().await?;
+        server.destroy().await?;
+        Ok(())
+    })
+    .await;
+}
