@@ -43,6 +43,7 @@ pub(crate) enum DiscoveryEvent {
     },
     RefreshComplete {
         topic: [u8; 32],
+        seq: u64,
     },
 }
 
@@ -52,6 +53,16 @@ pub(crate) struct PeerDiscoveryConfig {
     pub is_client: bool,
 }
 
+fn drain_latest_refresh(rx: &mut mpsc::UnboundedReceiver<u64>, initial: u64) -> u64 {
+    let mut latest = initial;
+    while let Ok(seq) = rx.try_recv() {
+        if seq > latest {
+            latest = seq;
+        }
+    }
+    latest
+}
+
 pub(crate) async fn run_discovery(
     config: PeerDiscoveryConfig,
     dht: HyperDhtHandle,
@@ -59,8 +70,9 @@ pub(crate) async fn run_discovery(
     relay_addresses: Vec<Ipv4Peer>,
     event_tx: mpsc::UnboundedSender<DiscoveryEvent>,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    mut refresh_rx: mpsc::UnboundedReceiver<u64>,
 ) {
-    let mut state = do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx).await;
+    let mut state = do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx, 0).await;
     let mut retry_delay = ANNOUNCE_RETRY_INITIAL;
 
     loop {
@@ -69,12 +81,17 @@ pub(crate) async fn run_discovery(
                 let delay = retry_delay.min(REFRESH_INTERVAL);
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {
-                        state = do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx).await;
+                        state = do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx, 0).await;
                         if state == ServerAnnounceState::Failed {
                             retry_delay = retry_delay.saturating_mul(2).min(REFRESH_INTERVAL);
                         } else {
                             retry_delay = ANNOUNCE_RETRY_INITIAL;
                         }
+                    }
+                    Some(req_seq) = refresh_rx.recv() => {
+                        let seq = drain_latest_refresh(&mut refresh_rx, req_seq);
+                        retry_delay = ANNOUNCE_RETRY_INITIAL;
+                        state = do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx, seq).await;
                     }
                     _ = &mut cancel_rx => break,
                 }
@@ -90,6 +107,7 @@ pub(crate) async fn run_discovery(
                 poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut cancelled = false;
                 let mut relays_ready = false;
+                let mut manual_seq: Option<u64> = None;
 
                 loop {
                     tokio::select! {
@@ -99,6 +117,10 @@ pub(crate) async fn run_discovery(
                                 relays_ready = true;
                                 break;
                             }
+                        }
+                        Some(req_seq) = refresh_rx.recv() => {
+                            manual_seq = Some(drain_latest_refresh(&mut refresh_rx, req_seq));
+                            break;
                         }
                         _ = &mut cancel_rx => {
                             cancelled = true;
@@ -110,10 +132,12 @@ pub(crate) async fn run_discovery(
                     break;
                 }
                 retry_delay = ANNOUNCE_RETRY_INITIAL;
-                state = if relays_ready {
+                state = if let Some(seq) = manual_seq {
+                    do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx, seq).await
+                } else if relays_ready {
                     announce_server_topic(&config, &dht, &key_pair, &relay_addresses).await
                 } else {
-                    do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx).await
+                    do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx, 0).await
                 };
             }
             ServerAnnounceState::Complete => {
@@ -123,7 +147,11 @@ pub(crate) async fn run_discovery(
 
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {
-                        state = do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx).await;
+                        state = do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx, 0).await;
+                    }
+                    Some(req_seq) = refresh_rx.recv() => {
+                        let seq = drain_latest_refresh(&mut refresh_rx, req_seq);
+                        state = do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx, seq).await;
                     }
                     _ = &mut cancel_rx => break,
                 }
@@ -172,6 +200,7 @@ async fn do_refresh(
     key_pair: &KeyPair,
     relay_addresses: &[Ipv4Peer],
     event_tx: &mpsc::UnboundedSender<DiscoveryEvent>,
+    seq: u64,
 ) -> ServerAnnounceState {
     let server_state = announce_server_topic(config, dht, key_pair, relay_addresses).await;
 
@@ -217,6 +246,7 @@ async fn do_refresh(
 
     let _ = event_tx.send(DiscoveryEvent::RefreshComplete {
         topic: config.topic,
+        seq,
     });
     server_state
 }

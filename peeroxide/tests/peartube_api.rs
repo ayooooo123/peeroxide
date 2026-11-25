@@ -706,3 +706,75 @@ async fn eager_server_topic_announces_with_relays() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn refresh_discovers_late_peer_without_waiting_for_interval() {
+    with_timeout("topic refresh", async {
+        let net = Testnet::start().await?;
+        let topic = [0xD6; 32];
+
+        let (_client_task, client, mut client_conns) = net.swarm().await?;
+        // Refresh on an unjoined topic is a no-op.
+        client.refresh([0xD7; 32]).await?;
+
+        client.join(topic, join_opts(false, true)).await?;
+        client.flush().await?;
+
+        // A server joins AFTER the client already completed its initial lookup.
+        let (_server_task, server, mut server_conns) = net.swarm().await?;
+        let server_pk = server.key_pair().public_key;
+        server.join(topic, join_opts(true, false)).await?;
+        server.flush().await?;
+
+        // Without refresh, the client would sleep ~10 minutes. Refresh must
+        // find and connect to the new server immediately.
+        client.refresh(topic).await?;
+
+        let client_conn = next_conn(&mut client_conns, "refreshed client connection").await;
+        let server_conn = next_conn(&mut server_conns, "refreshed server connection").await;
+        assert_eq!(client_conn.remote_public_key(), &server_pk);
+        assert_eq!(
+            server_conn.remote_public_key(),
+            &client.key_pair().public_key
+        );
+
+        client.destroy().await?;
+        server.destroy().await?;
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rejoin_same_flags_refreshes_and_discovers_late_peer() {
+    with_timeout("rejoin refresh", async {
+        let net = Testnet::start().await?;
+        let topic = [0xD8; 32];
+
+        let (_client_task, client, mut client_conns) = net.swarm().await?;
+        client.join(topic, join_opts(false, true)).await?;
+        client.flush().await?;
+
+        let (_server_task, server, mut server_conns) = net.swarm().await?;
+        let server_pk = server.key_pair().public_key;
+        server.join(topic, join_opts(true, false)).await?;
+        server.flush().await?;
+
+        // Mirrors Node `swarm.join(topic, opts)` -> `discovery.refresh()`.
+        client.join(topic, join_opts(false, true)).await?;
+        client.flush().await?;
+
+        let client_conn = next_conn(&mut client_conns, "rejoined client connection").await;
+        let server_conn = next_conn(&mut server_conns, "rejoined server connection").await;
+        assert_eq!(client_conn.remote_public_key(), &server_pk);
+        assert_eq!(
+            server_conn.remote_public_key(),
+            &client.key_pair().public_key
+        );
+
+        client.destroy().await?;
+        server.destroy().await?;
+        Ok(())
+    })
+    .await;
+}

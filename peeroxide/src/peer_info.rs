@@ -123,6 +123,13 @@ impl PeerInfo {
         }
     }
 
+    /// Reset attempt counters when a low-priority peer is rediscovered,
+    /// matching Node `PeerInfo._reset()`.
+    pub(crate) fn reset(&mut self) {
+        self.proven = false;
+        self.attempts = 0;
+    }
+
     /// Returns `true` if this peer is eligible for garbage collection.
     pub fn should_gc(&self) -> bool {
         !self.banned && !self.queued && !self.connecting && !self.explicit && !self.waiting
