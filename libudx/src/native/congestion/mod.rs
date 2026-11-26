@@ -157,8 +157,7 @@ impl CongestionController {
         for packet in delivered {
             self.rate.pkt_delivered(packet, &mut rs);
         }
-        self.rate
-            .generate(count, lost, rtt_min_us, now_us, &mut rs);
+        self.rate.generate(count, lost, rtt_min_us, now_us, &mut rs);
         let mut link = self.link(srtt_us, inflight, now_us);
         if self.bbr.main(&rs, &mut link) {
             self.rate.app_limited = match self.rate.delivered.wrapping_add(inflight) {

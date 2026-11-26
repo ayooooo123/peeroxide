@@ -215,8 +215,7 @@ impl UdxSocketInner {
                                                     ) {
                                                         break 'receive;
                                                     }
-                                                    pending_ack =
-                                                        Some((tx.clone(), header, addr));
+                                                    pending_ack = Some((tx.clone(), header, addr));
                                                     Route::Stream
                                                 }
                                             } else {

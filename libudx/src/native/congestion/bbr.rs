@@ -438,9 +438,7 @@ impl BbrState {
                 self.extra_acked[self.extra_acked_idx] = 0;
             }
         }
-        let epoch_us = link
-            .delivered_ts_us
-            .saturating_sub(self.ack_epoch_start_us);
+        let epoch_us = link.delivered_ts_us.saturating_sub(self.ack_epoch_start_us);
         let mut expected_acked = (self.bw() * (epoch_us as f64)) as u32;
         if self.ack_epoch_acked <= expected_acked
             || u64::from(self.ack_epoch_acked) + u64::from(rs.acked_sacked) >= u64::from(u32::MAX)
@@ -555,7 +553,9 @@ impl BbrState {
     }
 
     fn raise_inflight_hi_slope(&mut self, link: &Link) {
-        let growth_this_round = 1u32.checked_shl(self.bw_probe_up_rounds.min(20)).unwrap_or(u32::MAX);
+        let growth_this_round = 1u32
+            .checked_shl(self.bw_probe_up_rounds.min(20))
+            .unwrap_or(u32::MAX);
         self.bw_probe_up_cnt = (link.cwnd / growth_this_round).max(1);
     }
 
@@ -592,8 +592,7 @@ impl BbrState {
                 // or after 1 min_rtt if inflight has not drained yet.
                 let drained = link.inflight <= target_inflight
                     || link.inflight <= self.inflight_with_headroom();
-                let timed_out =
-                    self.min_rtt_us < u64::MAX && elapsed_us >= self.min_rtt_us;
+                let timed_out = self.min_rtt_us < u64::MAX && elapsed_us >= self.min_rtt_us;
                 if drained || timed_out {
                     self.start_probe_bw_cruise();
                 }
@@ -631,8 +630,7 @@ impl BbrState {
                     return;
                 }
                 self.probe_inflight_hi_upward(rs, link);
-                let min_rtt_done =
-                    self.min_rtt_us < u64::MAX && elapsed_us > self.min_rtt_us;
+                let min_rtt_done = self.min_rtt_us < u64::MAX && elapsed_us > self.min_rtt_us;
                 let probe_target = self.bdp(self.max_bw(), BBR_PROBE_BW_UP_GAIN);
                 let done_probing = if deep_queue {
                     min_rtt_done && self.round_start
@@ -655,7 +653,8 @@ impl BbrState {
     /// Min-RTT filter (10 s) and BBRv3 ProbeRTT (5 s interval, `0.5 * BDP` cwnd).
     fn update_min_rtt(&mut self, rs: &RateSample, link: &mut Link) -> bool {
         let now = link.now_us;
-        let probe_expired = now.saturating_sub(self.probe_rtt_min_stamp_us) > BBR_PROBE_RTT_INTERVAL_US;
+        let probe_expired =
+            now.saturating_sub(self.probe_rtt_min_stamp_us) > BBR_PROBE_RTT_INTERVAL_US;
         if rs.rtt_us > 0 && (rs.rtt_us < self.probe_rtt_min_us || probe_expired) {
             self.probe_rtt_min_us = rs.rtt_us;
             self.probe_rtt_min_stamp_us = now;

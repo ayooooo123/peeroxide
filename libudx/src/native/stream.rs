@@ -251,7 +251,11 @@ impl Timewait {
             return;
         }
         if let Some(udp) = self.udp.upgrade() {
-            send_now(Some((udp, self.remote_addr, ControlBytes::inline_header(self.header))));
+            send_now(Some((
+                udp,
+                self.remote_addr,
+                ControlBytes::inline_header(self.header),
+            )));
         }
     }
 }
@@ -426,10 +430,7 @@ impl OutgoingMap {
             return None;
         }
         let seq = self.base.wrapping_add((self.slots.len() - 1) as u32);
-        self.slots
-            .back()
-            .and_then(|s| s.as_ref())
-            .map(|p| (seq, p))
+        self.slots.back().and_then(|s| s.as_ref()).map(|p| (seq, p))
     }
 
     #[inline]
@@ -1175,11 +1176,9 @@ impl StreamInner {
         let was_idle = self.inflight() == 0;
         let inflight_after = self.inflight_count.saturating_add(1);
         // Nothing outstanding starts a new flight.
-        let rate_info = self.congestion.on_packet_sent(
-            self.outgoing.is_empty(),
-            inflight_after,
-            now_us,
-        );
+        let rate_info =
+            self.congestion
+                .on_packet_sent(self.outgoing.is_empty(), inflight_after, now_us);
         tracing::trace!(
             seq,
             is_mtu_probe,
@@ -1351,10 +1350,7 @@ impl StreamInner {
     /// queued data. Retransmits ignore the peer's window, as in C
     /// `stream_may_send`. Returns why the batch ended and whether it held new
     /// data.
-    fn take_send_batch_into(
-        &mut self,
-        batch: &mut Vec<(Bytes, SocketAddr)>,
-    ) -> (SendStop, bool) {
+    fn take_send_batch_into(&mut self, batch: &mut Vec<(Bytes, SocketAddr)>) -> (SendStop, bool) {
         let mut new_data = false;
         // A hooked stream has no peer until its first packet commits one (C
         // `udx_stream_write` is ENOTCONN before that): sending now would
@@ -1544,7 +1540,8 @@ impl StreamInner {
         self.srtt = (self.srtt_us / 1_000).clamp(1, u64::from(MAX_RTT_MS)) as u32;
         self.rttvar = (self.rttvar_us / 1_000).min(u64::from(MAX_RTT_MS)) as u32;
         self.tlp_permitted = true;
-        let rto_ms = ((self.srtt_us + 4 * self.rttvar_us) / 1_000).clamp(1_000, u64::from(MAX_RTO_MS));
+        let rto_ms =
+            ((self.srtt_us + 4 * self.rttvar_us) / 1_000).clamp(1_000, u64::from(MAX_RTO_MS));
         self.rto = rto_ms as u32;
     }
 
@@ -1797,7 +1794,8 @@ impl StreamInner {
                                     .time_sent
                                     .saturating_duration_since(epoch)
                                     .as_micros()
-                                    .min(u128::from(u64::MAX)) as u64,
+                                    .min(u128::from(u64::MAX))
+                                    as u64,
                                 info,
                             });
                         }
@@ -6153,9 +6151,11 @@ mod c_order_tests {
         let t0 = inner.epoch + Duration::from_millis(1000);
         inner.clock = Some(t0);
         inner.update_rtt(rtt);
-        inner
-            .rtt_min_us
-            .apply_min(RTT_MIN_WINDOW_US, inner.clock_us(t0), u64::from(rtt) * 1_000);
+        inner.rtt_min_us.apply_min(
+            RTT_MIN_WINDOW_US,
+            inner.clock_us(t0),
+            u64::from(rtt) * 1_000,
+        );
         (inner, t0)
     }
 

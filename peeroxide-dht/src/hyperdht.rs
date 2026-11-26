@@ -6162,8 +6162,10 @@ mod tests {
             .expect("bind");
         let client_addr = client_sock.local_addr().await.expect("client addr");
         let mut client_rx = client_sock.recv_start().expect("recv_start");
-        let (client_id, client_stream) = runtime.create_random_stream().await.expect("client stream");
-        let (server_id, server_stream) = runtime.create_random_stream().await.expect("server stream");
+        let (client_id, client_stream) =
+            runtime.create_random_stream().await.expect("client stream");
+        let (server_id, server_stream) =
+            runtime.create_random_stream().await.expect("server stream");
 
         let client_noise = NoiseWrapResult {
             remote_public_key: [1; 32],
@@ -6198,7 +6200,12 @@ mod tests {
         )
         .await
         .expect("stage");
-        let primary_port = punch.socket.local_addr().await.expect("primary addr").port();
+        let primary_port = punch
+            .socket
+            .local_addr()
+            .await
+            .expect("primary addr")
+            .port();
         // Force server NAT classification to RANDOM so server_punch_round opens
         // birthday sockets and runs keep_alive_random_nat.
         punch.puncher.as_mut().expect("puncher").nat.firewall = FIREWALL_RANDOM;
@@ -6260,9 +6267,10 @@ mod tests {
                 .connect(&client_sock, server_id, birthday_addr)
                 .await
                 .expect("client connect");
-            let mut ss = secret_stream_from_session(true, client_stream.into_async_stream(), &client_noise)
-                .await
-                .expect("client secret stream");
+            let mut ss =
+                secret_stream_from_session(true, client_stream.into_async_stream(), &client_noise)
+                    .await
+                    .expect("client secret stream");
             ss.write(b"hello over birthday socket")
                 .await
                 .expect("client write");
@@ -6287,7 +6295,11 @@ mod tests {
             .await
             .expect("Punched event on birthday socket");
         assert_eq!(
-            landed_socket.local_addr().await.expect("landed addr").port(),
+            landed_socket
+                .local_addr()
+                .await
+                .expect("landed addr")
+                .port(),
             birthday_addr.port(),
             "firewall hook must deliver the winning birthday socket"
         );
@@ -6310,11 +6322,12 @@ mod tests {
             .expect("land")
             .expect("server conn");
 
-        let received = tokio::time::timeout(std::time::Duration::from_secs(3), server_conn.stream.read())
-            .await
-            .expect("read timeout")
-            .expect("read ok")
-            .expect("payload");
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(3), server_conn.stream.read())
+                .await
+                .expect("read timeout")
+                .expect("read ok")
+                .expect("payload");
         assert_eq!(received.as_slice(), b"hello over birthday socket");
 
         let _client_ss = client_task.await.expect("client task");
