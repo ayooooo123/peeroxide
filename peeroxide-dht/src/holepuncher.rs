@@ -123,6 +123,18 @@ pub struct Holepuncher {
     /// Feeds DHT replies that land on the primary socket (NAT pings and
     /// holepunch rounds) back to the DHT actor for TID matching.
     reply_forwarder: Option<JoinHandle<()>>,
+    /// Invoked on every extra socket acquired during birthday-attack punching
+    /// before any probe leaves it (so passive servers can arm their UDX stream
+    /// firewall hook on all 256 sockets, matching Node's per-UDX-instance hook).
+    on_socket: Option<Arc<dyn Fn(&UdxSocket) + Send + Sync>>,
+}
+
+/// Probe loop selected by [`Holepuncher::start_punch`] to run after
+/// any initial birthday sockets are opened.
+pub(crate) enum PunchPlan {
+    Consistent,
+    RandomProbes(Ipv4Peer),
+    KeepAliveRandomNat(Ipv4Peer),
 }
 
 impl Holepuncher {
@@ -164,7 +176,17 @@ impl Holepuncher {
             firewalled,
             dht: None,
             reply_forwarder: None,
+            on_socket: None,
         })
+    }
+
+    /// Register a callback invoked for every birthday socket opened by
+    /// `open_birthday_sockets`, before the first probe leaves it.
+    pub(crate) fn set_on_socket<F>(&mut self, f: F)
+    where
+        F: Fn(&UdxSocket) + Send + Sync + 'static,
+    {
+        self.on_socket = Some(Arc::new(f));
     }
 
     pub fn update_remote(
@@ -428,12 +450,28 @@ impl Holepuncher {
     }
 
     pub async fn punch(&mut self, pool: &SocketPool, runtime: &libudx::UdxRuntime) -> bool {
-        if self.done() || self.remote_addresses.is_empty() {
+        let Some(plan) = self.start_punch(pool, runtime).await else {
             return false;
+        };
+        self.run_punch(plan).await;
+        true
+    }
+
+    /// Commit to a punch strategy and, for a randomized local NAT, open and
+    /// arm all birthday sockets before returning the background probe plan.
+    /// Mirrors Node `Holepuncher#_punch`, which awaits `_openBirthdaySockets`
+    /// before returning `true` to the server's `PEER_HOLEPUNCH` handler.
+    pub(crate) async fn start_punch(
+        &mut self,
+        pool: &SocketPool,
+        runtime: &libudx::UdxRuntime,
+    ) -> Option<PunchPlan> {
+        if self.done() || self.remote_addresses.is_empty() {
+            return None;
         }
         if !self.reserve_random_punch() {
             self.destroy();
-            return false;
+            return None;
         }
 
         self.punching = true;
@@ -444,20 +482,16 @@ impl Holepuncher {
         let verified = self.first_verified_address();
 
         if local == FIREWALL_CONSISTENT && remote == FIREWALL_CONSISTENT {
-            self.consistent_probe().await;
-            return true;
+            return Some(PunchPlan::Consistent);
         }
 
-        let Some(verified_addr) = verified else {
-            return false;
-        };
+        let verified_addr = verified?;
 
         if local == FIREWALL_CONSISTENT && remote >= FIREWALL_RANDOM {
             if let Some(lease) = &mut self.random_punch {
                 lease.started = true;
             }
-            self.random_probes(&verified_addr).await;
-            return true;
+            return Some(PunchPlan::RandomProbes(verified_addr));
         }
 
         if local >= FIREWALL_RANDOM && remote == FIREWALL_CONSISTENT {
@@ -466,13 +500,23 @@ impl Holepuncher {
             }
             self.open_birthday_sockets(pool, runtime, &verified_addr)
                 .await;
-            if self.punching {
-                self.keep_alive_random_nat(&verified_addr).await;
-            }
-            return true;
+            return Some(PunchPlan::KeepAliveRandomNat(verified_addr));
         }
 
-        false
+        None
+    }
+
+    /// Run the probe loop selected by [`Self::start_punch`].
+    pub(crate) async fn run_punch(&mut self, plan: PunchPlan) {
+        match plan {
+            PunchPlan::Consistent => self.consistent_probe().await,
+            PunchPlan::RandomProbes(addr) => self.random_probes(&addr).await,
+            PunchPlan::KeepAliveRandomNat(addr) => {
+                if self.punching {
+                    self.keep_alive_random_nat(&addr).await;
+                }
+            }
+        }
     }
 
     fn first_verified_address(&self) -> Option<Ipv4Peer> {
@@ -554,6 +598,9 @@ impl Holepuncher {
         while self.punching && self.sockets.len() < BIRTHDAY_SOCKETS {
             match pool.acquire(runtime).await {
                 Ok(mut socket) => {
+                    if let Some(on_socket) = &self.on_socket {
+                        on_socket(&socket.socket);
+                    }
                     let _ = socket.send_holepunch(target, true);
                     // Cover this birthday socket's probe stream with its own
                     // recv-adapter task so a probe landing on it (rather than

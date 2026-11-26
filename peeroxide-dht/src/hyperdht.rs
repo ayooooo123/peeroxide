@@ -2459,7 +2459,9 @@ impl HyperDhtHandle {
         has_relay: bool,
     ) -> Result<ConnectResult, HyperDhtError> {
         /// Rust bound on the whole punch, rounds and landing included.
-        const HOLEPUNCH_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+        /// Random-NAT punching runs up to 1750 probes at 20 ms (~35 s), plus
+        /// initial probe/punch rounds, so keep the safety ceiling above that.
+        const HOLEPUNCH_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
 
         // hyperdht's socket pool binds to the DHT host (`index.js` `SocketPool`).
         let host = match self.server_socket().await {
@@ -3525,6 +3527,7 @@ impl HyperDhtHandle {
 /// SecurePayload and the listening UDX stream all persist across
 /// PEER_HOLEPUNCH rounds so the same socket and NAT mapping keep probing.
 struct ServerPassivePunch {
+    id: u64,
     payload: SecurePayload,
     /// Moved into the probe task on the first round that asks us to punch.
     puncher: Option<Holepuncher>,
@@ -3547,6 +3550,7 @@ struct ServerPassivePunch {
     firewall: u64,
     addresses: Vec<Ipv4Peer>,
     has_relay: bool,
+    events: mpsc::UnboundedSender<ServerPunchEvent>,
     abort: tokio::task::JoinHandle<()>,
 }
 
@@ -3661,6 +3665,16 @@ async fn stage_server_punch(
         }
         Ok(())
     })?;
+    // Randomized-NAT servers open up to 255 birthday sockets in `start_punch`.
+    // Register the stream's firewall hook on each one before its first probe
+    // leaves so the client's UDX handshake landing on any birthday port is
+    // accepted (Node's raw stream hears every socket of its UDX instance).
+    let birthday_remote = raced.remote.clone();
+    puncher.set_on_socket(move |birthday_socket| {
+        if let Err(err) = birthday_remote.listen_on(birthday_socket) {
+            tracing::debug!(%err, "server: failed to arm birthday socket");
+        }
+    });
     let timed_out = events.clone();
     // Expire unused handshake state after Node's ten-second acceptance window.
     let abort = tokio::spawn(async move {
@@ -3675,6 +3689,7 @@ async fn stage_server_punch(
     let same_host = addresses.iter().any(|a| a.host == client_host);
 
     Ok(ServerPassivePunch {
+        id,
         payload: SecurePayload::new(noise_result.holepunch_secret),
         puncher: probe.0.take(),
         punch_task: None,
@@ -3687,6 +3702,7 @@ async fn stage_server_punch(
         firewall,
         addresses,
         has_relay: false,
+        events: events.clone(),
         abort,
     })
 }
@@ -3744,20 +3760,33 @@ async fn server_punch_round(
         state.reply_socket = None;
         state.socket.shutdown().await;
     }
-    // `punch()` owns the puncher for the rest of the exchange; later rounds
-    // only rebuild the reply, as Node does once its probe loop is running.
+    // `start_punch()` opens any birthday sockets before we reply `punching: true`
+    // (Node `server.js:634` `await p.punch()`), and cancels the 10 s pre-punch
+    // timeout (Node `server.js:601` `clearTimeout(h.prepunching)`) so a 35 s
+    // randomized-NAT punch is not killed mid-flight.
+    let mut punch_failed = false;
     if remote_hp.punching && !try_later && state.puncher.is_some() {
-        if let Some(puncher) = state.puncher.take() {
-            let runtime = UdxRuntime::shared(runtime.handle());
-            state.punch_task = Some(tokio::spawn(async move {
-                let mut probe = ServerProbe(Some(puncher));
-                let pool = SocketPool::new("0.0.0.0".into());
-                probe.0.as_mut().unwrap().punch(&pool, &runtime).await;
-            }));
+        state.abort.abort();
+        if let Some(mut puncher) = state.puncher.take() {
+            let pool = SocketPool::new("0.0.0.0".into());
+            if let Some(plan) = puncher.start_punch(&pool, runtime).await {
+                let id = state.id;
+                let events = state.events.clone();
+                state.punch_task = Some(tokio::spawn(async move {
+                    let mut probe = ServerProbe(Some(puncher));
+                    probe.0.as_mut().unwrap().run_punch(plan).await;
+                    // Mirror Node `holepuncher.onabort`: once the probe loop
+                    // finishes without landing, release the staged handshake.
+                    let _ = events.send(ServerPunchEvent::Abort { id });
+                }));
+            } else {
+                puncher.destroy();
+                punch_failed = true;
+            }
         }
     }
 
-    let reply = if aborted || abort_for_budget {
+    let reply = if aborted || abort_for_budget || punch_failed {
         HolepunchPayload {
             error: if abort_for_budget {
                 ERROR_TRY_LATER
@@ -3802,7 +3831,7 @@ async fn server_punch_round(
         peer_address: Some(peer_address.clone()),
     })
     .ok()?;
-    let socket = if aborted || abort_for_budget {
+    let socket = if aborted || abort_for_budget || punch_failed {
         None
     } else {
         state.reply_socket.clone()
@@ -6110,6 +6139,198 @@ mod tests {
             ERROR_ABORTED
         );
         punch.abort.abort();
+        dht.destroy().await.expect("destroy");
+    }
+
+    #[tokio::test]
+    async fn server_birthday_socket_accepts_udx_stream_and_lands() {
+        let runtime = UdxRuntime::new().expect("runtime");
+        let config = HyperDhtConfig {
+            dht: DhtConfig {
+                bootstrap: vec![],
+                port: 0,
+                ..DhtConfig::default()
+            },
+            ..HyperDhtConfig::default()
+        };
+        let (_task, dht, _events) = spawn(&runtime, config).await.expect("spawn");
+
+        let client_sock = runtime.create_socket().await.expect("client socket");
+        client_sock
+            .bind("127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("bind");
+        let client_addr = client_sock.local_addr().await.expect("client addr");
+        let mut client_rx = client_sock.recv_start().expect("recv_start");
+        let (client_id, client_stream) =
+            runtime.create_random_stream().await.expect("client stream");
+        let (server_id, server_stream) =
+            runtime.create_random_stream().await.expect("server stream");
+
+        let client_noise = NoiseWrapResult {
+            remote_public_key: [1; 32],
+            tx: [2; 32],
+            rx: [3; 32],
+            handshake_hash: [4; 64],
+            holepunch_secret: [5; 32],
+            is_initiator: true,
+        };
+        let server_noise = NoiseWrapResult {
+            remote_public_key: [6; 32],
+            tx: [3; 32],
+            rx: [2; 32],
+            handshake_hash: [4; 64],
+            holepunch_secret: [5; 32],
+            is_initiator: false,
+        };
+
+        let raced = RacedStream::new(server_stream);
+        let (events, mut event_rx) = mpsc::unbounded_channel();
+        let mut punch = stage_server_punch(
+            &runtime,
+            dht.dht(),
+            None,
+            &server_noise,
+            "127.0.0.1",
+            FIREWALL_CONSISTENT,
+            7,
+            Arc::clone(&raced),
+            client_id,
+            &events,
+        )
+        .await
+        .expect("stage");
+        let primary_port = punch
+            .socket
+            .local_addr()
+            .await
+            .expect("primary addr")
+            .port();
+        // Force server NAT classification to RANDOM so server_punch_round opens
+        // birthday sockets and runs keep_alive_random_nat.
+        punch.puncher.as_mut().expect("puncher").nat.firewall = FIREWALL_RANDOM;
+        let abort_handle = punch.abort.abort_handle();
+
+        let sp = SecurePayload::new(server_noise.holepunch_secret);
+        let client_peer = Ipv4Peer {
+            host: "127.0.0.1".into(),
+            port: client_addr.port(),
+        };
+        let msg = HolepunchMessage {
+            mode: MODE_FROM_RELAY,
+            id: 7,
+            peer_address: None,
+            payload: sp
+                .encrypt(&HolepunchPayload {
+                    error: ERROR_NONE,
+                    firewall: FIREWALL_CONSISTENT,
+                    round: 1,
+                    connected: false,
+                    punching: true,
+                    addresses: Some(vec![client_peer.clone()]),
+                    remote_address: None,
+                    token: None,
+                    remote_token: None,
+                })
+                .expect("encrypt"),
+        };
+        let reply = server_punch_round(&runtime, &mut punch, &msg, &client_peer)
+            .await
+            .expect("reply");
+        let decoded =
+            crate::hyperdht_messages::decode_holepunch_msg_from_bytes(&reply.value).expect("msg");
+        let reply_hp = sp.decrypt(&decoded.payload).expect("decrypt");
+        assert_eq!(reply_hp.error, ERROR_NONE);
+        assert!(reply_hp.punching);
+
+        tokio::task::yield_now().await;
+        assert!(
+            abort_handle.is_finished(),
+            "starting the punch must cancel the 10 s pre-punch abort timer"
+        );
+
+        // Wait for a low-TTL probe from a non-primary birthday socket.
+        let birthday_addr = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let dgram = client_rx.recv().await.expect("probe");
+                if dgram.data == [0u8] && dgram.addr.port() != primary_port {
+                    break SocketAddr::new("127.0.0.1".parse().unwrap(), dgram.addr.port());
+                }
+            }
+        })
+        .await
+        .expect("birthday socket probe");
+
+        // Dial the non-primary birthday socket with a real UDX + SecretStream.
+        let client_task = tokio::spawn(async move {
+            client_stream
+                .connect(&client_sock, server_id, birthday_addr)
+                .await
+                .expect("client connect");
+            let mut ss =
+                secret_stream_from_session(true, client_stream.into_async_stream(), &client_noise)
+                    .await
+                    .expect("client secret stream");
+            ss.write(b"hello over birthday socket")
+                .await
+                .expect("client write");
+            ss
+        });
+
+        let (landed_addr, landed_socket) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    match event_rx.recv().await.expect("event") {
+                        ServerPunchEvent::Punched { id, addr, socket } => {
+                            assert_eq!(id, 7);
+                            break (addr, socket);
+                        }
+                        ServerPunchEvent::Abort { .. } => {
+                            panic!("unexpected abort while birthday socket is live");
+                        }
+                        ServerPunchEvent::Handshaken { .. } => {}
+                    }
+                }
+            })
+            .await
+            .expect("Punched event on birthday socket");
+        assert_eq!(
+            landed_socket
+                .local_addr()
+                .await
+                .expect("landed addr")
+                .port(),
+            birthday_addr.port(),
+            "firewall hook must deliver the winning birthday socket"
+        );
+
+        // Dropping ServerPassivePunch tears down the 255 unused birthday sockets
+        // while `landed_socket` keeps the winning port open for the connection.
+        drop(punch);
+        let mut server_conn = raced
+            .land(
+                Landing {
+                    socket: landed_socket,
+                    remote_id: client_id,
+                    addr: landed_addr,
+                    relay: None,
+                },
+                &server_noise,
+                false,
+            )
+            .await
+            .expect("land")
+            .expect("server conn");
+
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(3), server_conn.stream.read())
+                .await
+                .expect("read timeout")
+                .expect("read ok")
+                .expect("payload");
+        assert_eq!(received.as_slice(), b"hello over birthday socket");
+
+        let _client_ss = client_task.await.expect("client task");
         dht.destroy().await.expect("destroy");
     }
 
