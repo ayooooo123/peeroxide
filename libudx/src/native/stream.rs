@@ -2911,6 +2911,39 @@ impl UdxStreamRemote {
             .remote_addr
     }
 
+    /// Also receive on `socket` while the firewall hook is armed, so a
+    /// holepunch socket opened after `set_firewall_hook` (including after a
+    /// relay already landed) can still deliver packets to this stream.
+    pub fn listen_on(&self, socket: &super::socket::UdxSocket) -> Result<()> {
+        let (local_id, tx, registrations) = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.terminated {
+                return Err(UdxError::StreamClosed);
+            }
+            if inner.firewall_hook.is_none() {
+                return Err(UdxError::Io(std::io::Error::other(
+                    "stream has no firewall hook",
+                )));
+            }
+            let tx = inner
+                .incoming_tx
+                .as_ref()
+                .ok_or_else(|| UdxError::Io(std::io::Error::other("stream already consumed")))?
+                .clone();
+            (inner.local_id, tx, Arc::clone(&inner.registrations))
+        };
+        socket.register_stream(local_id, tx)?;
+        let streams_ref = socket.streams_ref();
+        let mut reg = registrations.lock().unwrap_or_else(|e| e.into_inner());
+        if !reg
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &streams_ref))
+        {
+            reg.push(streams_ref);
+        }
+        Ok(())
+    }
+
     /// Send to `remote_id` at `remote_addr` over `socket` from now on
     /// (C `udx_stream_change_remote`, udx.c:2582).
     ///
